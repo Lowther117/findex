@@ -115,6 +115,9 @@ your system setting; the Appearance menu switches them manually.
 - *Auto re-index every N minutes* re-runs the same folders on a timer while the
   app is open.
 - *Optimise + compact* merges the FTS index and vacuums the database.
+- *Clear index...* deletes findex's database and starts fresh - after a
+  confirmation, and never touching the files on your disk. Also available as
+  `findex clear` on the command line.
 
 ## CLI
 
@@ -126,6 +129,7 @@ findex name "*.mp4" -n 100             filename search - any file type
 findex name "*budget*" -e pdf
 findex stats                           what is indexed
 findex vacuum                          optimise and compact
+findex clear                           delete the index, start fresh
 findex gui                             open the desktop app
 ```
 

@@ -8,6 +8,7 @@ Commands:
     findex name "PATTERN"       Filename search (substring or *wildcard*)
     findex stats                Index statistics
     findex vacuum               Compact the database
+    findex clear                Delete the index and start fresh
     findex gui                  Open the desktop app (findex_gui.py)
 
 EVERY file under the indexed folders is recorded by name, size and date, so
@@ -974,6 +975,43 @@ def cmd_gui(args):
     return findex_gui.main(["--db", args.db])
 
 
+def clear_index(path):
+    """Start fresh: delete the index - every recorded file, all extracted
+    text, and the run history. The files on your disk are untouched."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+        for suffix in ("-wal", "-shm"):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
+        return "index deleted - the next run starts from scratch"
+    except OSError:
+        pass
+    # something still has the file open: empty it in place instead
+    conn = open_db(path)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM docs")
+    cur.execute("DELETE FROM files")
+    cur.execute("DELETE FROM meta")
+    conn.commit()
+    conn.execute("VACUUM")
+    conn.close()
+    return "index emptied - the next run starts from scratch"
+
+
+def cmd_clear(args):
+    if not getattr(args, "yes", False):
+        answer = input("Delete the ENTIRE index at {}?\nYour files on disk "
+                       "are untouched. [y/N] ".format(args.db)).strip().lower()
+        if answer not in ("y", "yes"):
+            print("Nothing done.")
+            return 0
+    print(clear_index(args.db))
+    return 0
+
+
 def cmd_vacuum(args):
     conn = open_db(args.db)
     print("Optimising FTS index...")
@@ -1026,6 +1064,11 @@ def main(argv=None):
 
     p = sub.add_parser("gui", help="open the desktop app")
     p.set_defaults(func=cmd_gui)
+
+    p = sub.add_parser("clear", help="delete the index and start fresh")
+    p.add_argument("--yes", action="store_true",
+                   help="skip the confirmation prompt")
+    p.set_defaults(func=cmd_clear)
 
     p = sub.add_parser("stats", help="index statistics")
     p.set_defaults(func=cmd_stats)

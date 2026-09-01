@@ -1070,6 +1070,13 @@ class FindexApp:
         b = ttk.Button(foot, text="Refresh", command=self.refresh_stats)
         b.pack(side="right", padx=6)
         self.tip(b, "Re-read the figures shown on the left.")
+        b = ttk.Button(foot, text="Clear index...",
+                       command=self.clear_index_ui)
+        b.pack(side="right", padx=(0, 6))
+        self.tip(b, "Start fresh: delete findex's entire database - every "
+                    "recorded file name and all extracted text. Your actual "
+                    "files on disk are never touched. Asks before doing "
+                    "anything.")
 
         self.update_auto_label()
 
@@ -1535,6 +1542,35 @@ class FindexApp:
         if code != 0:
             self._pending_index = False
         return False
+
+    def clear_index_ui(self):
+        """Wipe the index and start fresh. Files on disk are untouched."""
+        if self.proc is not None:
+            messagebox.showinfo("Busy", "Stop the current run first.")
+            return
+        total = 0
+        try:
+            conn = findex.open_db_ro(self.var_db.get())
+            total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            conn.close()
+        except sqlite3.Error:
+            pass
+        if not messagebox.askyesno(
+                "Clear the index?",
+                "Delete the entire index ({:,} files recorded)?\n\n"
+                "Only findex's own database is deleted - the files on your "
+                "disk are untouched. The next indexing run starts from "
+                "scratch.".format(total)):
+            return
+        try:
+            result = findex.clear_index(self.var_db.get())
+        except Exception as exc:                               # noqa: BLE001
+            messagebox.showerror("Could not clear", str(exc))
+            return
+        self.log_line("-- " + result + " --")
+        self.var_status.set("Index cleared - ready to start fresh")
+        self.refresh_stats()
+        self.run_search(live=False)
 
     def run_vacuum(self):
         if self.proc is not None:
