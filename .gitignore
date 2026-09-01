@@ -13,3 +13,10 @@ __pycache__/
 *.bak
 .DS_Store
 .fuse_hidden*
+
+# optional standalone builds (build-exe.bat / build-app.command)
+.venv-build/
+.venv-build-mac/
+build/
+dist/
+*.spec

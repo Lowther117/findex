@@ -29,7 +29,10 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-HERE = os.path.dirname(os.path.realpath(__file__))
+if getattr(sys, "frozen", False):     # standalone .exe build
+    HERE = os.path.dirname(os.path.realpath(sys.executable))
+else:
+    HERE = os.path.dirname(os.path.realpath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
@@ -185,6 +188,8 @@ def system_dark():
 
 def missing_packages():
     """Python components the app wants but this environment lacks."""
+    if getattr(sys, "frozen", False):
+        return []       # a standalone build ships with everything baked in
     import importlib.util as iu
     missing = []
     if iu.find_spec("pymupdf") is None and iu.find_spec("fitz") is None:
@@ -230,6 +235,14 @@ def child_python():
             if os.path.exists(twin):
                 return twin
     return exe
+
+
+def engine_command():
+    """How to start the engine as a child process: the script through the
+    venv's python normally, or this same executable in a frozen build."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "engine"]
+    return [child_python(), "-u", FINDEX_PY]
 
 
 def no_window():
@@ -1459,8 +1472,8 @@ class FindexApp:
             conn.close()
         except sqlite3.Error:
             pass
-        cmd = [child_python(), "-u", FINDEX_PY, "--db", self.var_db.get(),
-               "index"] + roots + ["--progress"]
+        cmd = engine_command() + ["--db", self.var_db.get(),
+                                  "index"] + roots + ["--progress"]
         if self.var_rebuild.get():
             cmd.append("--rebuild")
         if self.var_cloud.get():
@@ -1576,8 +1589,7 @@ class FindexApp:
         if self.proc is not None:
             messagebox.showinfo("Busy", "Something is already running.")
             return
-        cmd = [child_python(), "-u", FINDEX_PY, "--db", self.var_db.get(),
-               "vacuum"]
+        cmd = engine_command() + ["--db", self.var_db.get(), "vacuum"]
         self.launch(cmd, "vacuum", "Optimising the index...")
 
     def launch(self, cmd, kind, status):

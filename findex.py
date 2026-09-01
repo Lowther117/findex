@@ -36,7 +36,11 @@ from concurrent.futures import ProcessPoolExecutor
 
 # realpath, not abspath: the folder must work when launched through a
 # symlink, a shortcut, or from a drive mounted under a different letter.
-HERE = os.path.dirname(os.path.realpath(__file__))
+# In a standalone (.exe) build, "the folder" is wherever the exe lives.
+if getattr(sys, "frozen", False):
+    HERE = os.path.dirname(os.path.realpath(sys.executable))
+else:
+    HERE = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_DB = os.path.join(HERE, "findex.db")
 
 # Per-file cap on extracted text. 400k chars is roughly a 150-page book.
@@ -574,6 +578,28 @@ CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
 );
 """
 
+# Instant filename search: a trigram index over names (SQLite 3.34+), kept in
+# sync by triggers so every write path - extraction, name-only batches,
+# pruning, the GUI's deletes - maintains it automatically.
+NAMES_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS names USING fts5(
+    name,
+    content='files', content_rowid='id',
+    tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS files_names_ai AFTER INSERT ON files BEGIN
+    INSERT INTO names(rowid, name) VALUES (new.id, new.name);
+END;
+CREATE TRIGGER IF NOT EXISTS files_names_ad AFTER DELETE ON files BEGIN
+    INSERT INTO names(names, rowid, name) VALUES('delete', old.id, old.name);
+END;
+CREATE TRIGGER IF NOT EXISTS files_names_au AFTER UPDATE OF name ON files
+BEGIN
+    INSERT INTO names(names, rowid, name) VALUES('delete', old.id, old.name);
+    INSERT INTO names(rowid, name) VALUES (new.id, new.name);
+END;
+"""
+
 
 def get_meta(conn, key, default=None):
     try:
@@ -610,6 +636,10 @@ def open_db(path):
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute("PRAGMA cache_size=-262144")   # 256 MB page cache
     conn.executescript(SCHEMA)
+    try:
+        conn.executescript(NAMES_SCHEMA)
+    except sqlite3.OperationalError:
+        pass    # SQLite too old for trigram - the plain scan still works
     return conn
 
 
@@ -737,6 +767,16 @@ def cmd_index(args):
 
     roots = args.roots or [os.path.expanduser("~")]
     conn = open_db(args.db)
+
+    if get_meta(conn, "names_ready") != "1":
+        try:
+            print("Building the instant filename index (one-off)...",
+                  flush=True)
+            conn.execute("INSERT INTO names(names) VALUES('rebuild')")
+            conn.commit()
+            set_meta(conn, "names_ready", "1")
+        except sqlite3.OperationalError:
+            pass    # no trigram support - plain filename search continues
 
     print("Loading existing index...", flush=True)
     known = {}
@@ -880,22 +920,36 @@ def search_rows(conn, query, limit=25, exts=None, snippet_len=14):
 
 
 def name_rows(conn, pattern, limit=50, exts=None):
-    """Filename search over every recorded file. Returns [(path, size, mtime)]."""
+    """Filename search over every recorded file: [(path, size, mtime)].
+    Uses the trigram filename index when the database has one - instant even
+    at hundreds of thousands of files - and falls back to a plain scan."""
     if "*" in pattern or "?" in pattern:
         like = pattern.replace("*", "%").replace("?", "_")
     else:
         like = "%" + pattern + "%"
-    sql = "SELECT path, size, mtime FROM files WHERE name LIKE ?"
-    params = [like]
+    where_ext, ext_params = "", []
     if exts:
         norm = ["." + e.lstrip(".").lower() for e in exts]
-        sql += " AND ext IN (" + ",".join("?" * len(norm)) + ")"
-        params += norm
-    sql += " ORDER BY mtime DESC"
+        where_ext = " AND f.ext IN (" + ",".join("?" * len(norm)) + ")"
+        ext_params = norm
+    tail, tail_params = " ORDER BY f.mtime DESC", []
     if int(limit) > 0:
-        sql += " LIMIT ?"
-        params.append(int(limit))
-    return conn.execute(sql, params).fetchall()
+        tail += " LIMIT ?"
+        tail_params = [int(limit)]
+    # a match-everything pattern gains nothing from the index
+    if like.strip("%_") and get_meta(conn, "names_ready") == "1":
+        try:
+            return conn.execute(
+                "SELECT f.path, f.size, f.mtime FROM names "
+                "JOIN files f ON f.id = names.rowid "
+                "WHERE names.name LIKE ?" + where_ext + tail,
+                [like] + ext_params + tail_params).fetchall()
+        except sqlite3.OperationalError:
+            pass
+    return conn.execute(
+        "SELECT f.path, f.size, f.mtime FROM files f "
+        "WHERE f.name LIKE ?" + where_ext + tail,
+        [like] + ext_params + tail_params).fetchall()
 
 
 def cmd_search(args):

@@ -87,8 +87,9 @@ your system setting; the Appearance menu switches them manually.
 - The list starts full: your indexed files, newest first (capped at 5,000 rows
   so it stays instant), with the status bar showing the true total. Typing
   narrows it live; clearing the box brings the full list back.
-- *Filename* mode searches as you type, across every recorded file of any type.
-  `budget`, or wildcards like `*2024*.pdf`.
+- *Filename* mode searches as you type, across every recorded file of any
+  type - instantly, backed by a trigram index over the names. `budget`, or
+  wildcards like `*2024*.pdf`.
 - *File contents* mode searches extracted text, also live as you type — the
   word being typed matches as a prefix, and half-typed queries quietly fall
   back to a literal word search. FTS5 syntax: `invoice payment`,
@@ -170,11 +171,21 @@ findex gui                             open the desktop app
   and similar. Note this is by folder *name*, so a data folder that happens to
   be called e.g. `recovery` or `env` is also skipped.
 
+## Optional: a standalone app
+
+The normal way to run findex is this folder with its launchers - nothing about
+that changes. But if you want to hand someone a single file that needs no
+Python at all, run **build-exe.bat** (Windows) or **build-app.command** (Mac):
+it produces `dist/findex.exe` / `dist/findex.app` with every component baked
+in. Building needs Python once; the result runs anywhere and keeps its index
+next to itself, so it is just as portable as the folder. Build output stays
+out of the repo.
+
 ## Known limits
 
-- Filename search is a SQL `LIKE`, so a leading-wildcard search scans the file
-  table. Comfortable into the hundreds of thousands of rows (about 12 ms at
-  50k); a trigram index is the fix if it ever drags.
+- The filename index needs three or more consecutive literal characters in a
+  search to be instant; one- or two-character searches fall back to a scan
+  (still fast, just not free).
 - Directory walking, not MFT/USN enumeration — slower to index than Everything,
   but needs no admin rights.
 - Stop (and closing the window) ends the whole worker tree immediately;
