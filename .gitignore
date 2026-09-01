@@ -1,0 +1,15 @@
+# machine-specific - each computer builds/creates its own
+.venv-win/
+.venv-mac/
+.venv-linux/
+.venv/
+findex.db
+findex.db-*
+findex_gui.json
+
+# noise
+__pycache__/
+*.pyc
+*.bak
+.DS_Store
+.fuse_hidden*
