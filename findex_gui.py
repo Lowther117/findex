@@ -441,6 +441,40 @@ def _trash_many(paths):
     return len(paths) - len(failed), failed
 
 
+def connected_drives():
+    """Every storage drive/volume attached to this computer."""
+    drives = []
+    if os.name == "nt":
+        import ctypes
+        DRIVE_REMOVABLE, DRIVE_FIXED = 2, 3
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for i in range(26):
+            if bitmask & (1 << i):
+                root = "{}:\\".format(chr(65 + i))
+                kind = ctypes.windll.kernel32.GetDriveTypeW(root)
+                if kind in (DRIVE_FIXED, DRIVE_REMOVABLE):
+                    drives.append(root)
+    elif sys.platform == "darwin":
+        drives.append("/")
+        try:
+            for name in sorted(os.listdir("/Volumes")):
+                p = os.path.join("/Volumes", name)
+                if (not name.startswith(".") and os.path.isdir(p)
+                        and os.path.realpath(p) != "/"):
+                    drives.append(p)
+        except OSError:
+            pass
+    else:
+        drives.append("/")
+    return drives
+
+
+def _path_under(path, root):
+    p = os.path.normcase(os.path.abspath(path))
+    r = os.path.normcase(os.path.abspath(root))
+    return p == r or p.startswith(r.rstrip(os.sep) + os.sep)
+
+
 def parse_exts(text):
     """'pdf, docx' -> ['pdf', 'docx']. Blank or 'All types' -> no filter.
     Dropdown entries like 'pdf (12,430)' work too."""
@@ -959,6 +993,14 @@ class FindexApp:
         b.pack(pady=2)
         self.tip(b, "Choose a folder - or a whole drive such as D:\\ - to add "
                     "to the list.")
+        b = ttk.Button(btns, text="Add all drives", width=14,
+                       command=self.add_all_drives)
+        b.pack(pady=2)
+        self.tip(b, "Add every drive connected to this computer - internal "
+                    "and removable. Network drives are left out; add those "
+                    "with Add folder if you want them. Folders already listed "
+                    "that live on an added drive are folded in, so nothing "
+                    "gets indexed twice.")
         b = ttk.Button(btns, text="Remove", width=14, command=self.remove_root)
         b.pack(pady=2)
         self.tip(b, "Take the selected folder off the list. Files already in "
@@ -1424,6 +1466,29 @@ class FindexApp:
 
     def clear_roots(self):
         self.roots_list.delete(0, "end")
+
+    def add_all_drives(self):
+        """List every connected drive, folding in any existing roots that an
+        added drive already covers."""
+        drives = connected_drives()
+        if not drives:
+            self.var_status.set("No drives found")
+            return
+        current = self.current_roots()
+        new = [d for d in drives if d not in current]
+        extras = [r for r in current if r not in drives]
+        surviving = [r for r in extras
+                     if not any(_path_under(r, d) for d in drives)]
+        folded = len(extras) - len(surviving)
+        self.roots_list.delete(0, "end")
+        for r in drives + surviving:
+            self.roots_list.insert("end", r)
+        msg = ("Added {:,} drive(s)".format(len(new)) if new
+               else "All connected drives were already listed")
+        if folded > 0:
+            msg += " - {:,} folder(s) folded in (already covered)".format(
+                folded)
+        self.var_status.set(msg)
 
     def start_index(self):
         if self.proc is not None:

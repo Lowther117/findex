@@ -108,9 +108,11 @@ your system setting; the Appearance menu switches them manually.
 
 **Index tab**
 
-- Add the folders or drives you want covered, then **Start indexing**. Progress
-  updates live and **Stop** always works — indexing runs as a separate process,
-  so the window never freezes.
+- Add the folders or drives you want covered - or hit **Add all drives** to
+  list every internal and removable drive on the computer in one click
+  (network drives stay out unless you add them yourself) - then
+  **Start indexing**. Progress updates live and **Stop** always works —
+  indexing runs as a separate process, so the window never freezes.
 - *Re-extract everything* forces a full rebuild; normally findex only touches
   files whose size or timestamp changed, which is why repeat runs are quick.
 - *Auto re-index every N minutes* re-runs the same folders on a timer while the
