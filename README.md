@@ -173,8 +173,9 @@ findex gui                             open the desktop app
   50k); a trigram index is the fix if it ever drags.
 - Directory walking, not MFT/USN enumeration — slower to index than Everything,
   but needs no admin rights.
-- Stopping an index kills the parent process; pool workers can take a second
-  or two to exit behind it.
+- Stop (and closing the window) ends the whole worker tree immediately;
+  everything indexed up to that point is kept, and the stats and list refresh
+  on stop.
 - The index stores absolute file paths, so results from a machine you are not
   currently on will not open until you are back on it.
 

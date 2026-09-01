@@ -487,6 +487,7 @@ class FindexApp:
         self.pal = LIGHT_PALETTE
         self._clip = {"paths": [], "move": False}
         self._render_gen = 0
+        self._progress_est = 0
 
         root.title("findex")
         root.geometry(self.cfg.get("geometry") or DEFAULTS["geometry"])
@@ -705,7 +706,8 @@ class FindexApp:
         widget.bind("<ButtonPress>", lambda e: self._tip_leave(), add="+")
 
     def _tip_enter(self, widget, text, popup):
-        self.var_hint.set(text)
+        flat = " ".join(text.split())    # one fixed line - no layout jumping
+        self.var_hint.set(flat if len(flat) <= 110 else flat[:107] + "...")
         self._tip_cancel()
         if popup:
             self._tip_after = self.root.after(
@@ -781,8 +783,8 @@ class FindexApp:
         bar = ttk.Frame(self.root)
         bar.pack(fill="x", side="bottom", padx=12, pady=8)
         ttk.Label(bar, textvariable=self.var_status).pack(side="left")
-        ttk.Label(bar, textvariable=self.var_hint, style="Hint.TLabel",
-                  wraplength=680, justify="left").pack(side="left", padx=14)
+        ttk.Label(bar, textvariable=self.var_hint,
+                  style="Hint.TLabel").pack(side="left", padx=14)
         self.busy = ttk.Progressbar(bar, mode="indeterminate", length=140)
         self.busy.pack(side="right")
 
@@ -844,10 +846,10 @@ class FindexApp:
                         "the full list streams in behind the first screenful. "
                         "Set a number to cap very broad searches.")
 
-        pane = ttk.PanedWindow(self.tab_search, orient="vertical")
-        pane.pack(fill="both", expand=True, padx=12, pady=(8, 10))
+        body = ttk.Frame(self.tab_search)
+        body.pack(fill="both", expand=True, padx=12, pady=(8, 10))
 
-        holder = ttk.Frame(pane)
+        holder = ttk.Frame(body)
         cols = ("name", "size", "modified", "folder")
         self.tree = ttk.Treeview(holder, columns=cols, show="headings",
                                  selectmode="extended")
@@ -890,14 +892,15 @@ class FindexApp:
                  "Finder, Ctrl/Cmd+X cuts, Ctrl/Cmd+V pastes into a folder "
                  "you pick, and Delete sends to the Recycle Bin. Right-click "
                  "for the menu; double-click opens.", popup=False)
-        pane.add(holder, weight=3)
+        prev = ttk.Frame(body)
+        prev.pack(side="bottom", fill="x", pady=(6, 0))
+        holder.pack(side="top", fill="both", expand=True)
 
-        prev = ttk.Frame(pane)
-        self.preview = tk.Text(prev, height=7, wrap="word", relief="flat",
+        self.preview = tk.Text(prev, height=2, wrap="word", relief="flat",
                                background="#ffffff", padx=8, pady=6)
         pvsb = ttk.Scrollbar(prev, orient="vertical", command=self.preview.yview)
         self.preview.configure(yscrollcommand=pvsb.set, state="disabled")
-        self.preview.pack(side="left", fill="both", expand=True)
+        self.preview.pack(side="left", fill="x", expand=True)
         pvsb.pack(side="right", fill="y")
         self.preview.tag_configure("hit", background="#ffe680")
         self.preview.tag_configure("path", foreground="#20558a")
@@ -905,7 +908,6 @@ class FindexApp:
                  "The full path of the selected file, and in contents mode the "
                  "matching text with your search terms highlighted.",
                  popup=False)
-        pane.add(prev, weight=1)
 
         self.ctx = tk.Menu(self.root, tearoff=0)
         self.ctx.add_command(label="Open file", command=self.open_selected)
@@ -1216,6 +1218,14 @@ class FindexApp:
                                 "first. Both search modes narrow it live as "
                                 "you type.")
         self.preview.configure(state="disabled")
+        # grow or shrink with the content: a short path takes one line, a long
+        # path or a text snippet takes more, capped so the list keeps the room
+        try:
+            shown = int(self.preview.count("1.0", "end-1c",
+                                           "displaylines")[0])
+        except (tk.TclError, TypeError, IndexError):
+            shown = 2
+        self.preview.configure(height=max(2, min(8, shown)))
 
     def _focus_results(self, _event):
         kids = self.tree.get_children()
@@ -1434,6 +1444,14 @@ class FindexApp:
                 return    # tesseract is installing; indexing follows by itself
             self.log_line("-- tesseract not installed: OCR will be skipped "
                           "this run --")
+        self._progress_est = 0
+        try:                # last known file count = a solid progress estimate
+            conn = findex.open_db_ro(self.var_db.get())
+            self._progress_est = conn.execute(
+                "SELECT COUNT(*) FROM files").fetchone()[0]
+            conn.close()
+        except sqlite3.Error:
+            pass
         cmd = [child_python(), "-u", FINDEX_PY, "--db", self.var_db.get(),
                "index"] + roots + ["--progress"]
         if self.var_rebuild.get():
@@ -1529,10 +1547,13 @@ class FindexApp:
     def launch(self, cmd, kind, status):
         self.log_line("$ " + " ".join(cmd))
         try:
+            kwargs = no_window()
+            if os.name != "nt":
+                kwargs["start_new_session"] = True   # own process group
             self.proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                errors="replace", bufsize=1, cwd=HERE, **no_window())
+                errors="replace", bufsize=1, cwd=HERE, **kwargs)
         except Exception as exc:                               # noqa: BLE001
             self.proc = None
             messagebox.showerror("Could not start", str(exc))
@@ -1564,9 +1585,48 @@ class FindexApp:
     def stop_index(self):
         if self.proc is None:
             return
-        self.log_line("-- stopping --")
+        self.log_line("-- stopping: ending the run and all of its worker "
+                      "processes --")
+        self._kill_tree()
+        self.root.after(3000, self._ensure_stopped)
+
+    def _kill_tree(self):
+        """End the background run AND every worker process it started.
+        Terminating only the parent left the workers running - which is why
+        Stop used to say 'stopping' and nothing happened."""
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return
         try:
-            self.proc.terminate()
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(proc.pid),
+                                "/T", "/F"],
+                               capture_output=True, **no_window())
+            else:
+                import signal
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    proc.terminate()
+        except Exception:                                      # noqa: BLE001
+            try:
+                proc.terminate()
+            except Exception:                                  # noqa: BLE001
+                pass
+
+    def _ensure_stopped(self):
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return
+        self.log_line("-- still running: force-killing the worker tree --")
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(proc.pid),
+                                "/T", "/F"],
+                               capture_output=True, **no_window())
+            else:
+                import signal
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except Exception:                                      # noqa: BLE001
             pass
 
@@ -1604,7 +1664,18 @@ class FindexApp:
                     self.log_line(msg[1])
                 elif kind == "progress":
                     p = msg[1]
+                    pct_txt = ""
+                    est = self._progress_est
+                    if est > 0:
+                        if str(self.bar.cget("mode")) != "determinate":
+                            self.bar.stop()
+                            self.bar.configure(mode="determinate",
+                                               maximum=100)
+                        pct = min(99.0, 100.0 * p.get("seen", 0) / est)
+                        self.bar.configure(value=pct)
+                        pct_txt = "{:.0f}%  |  ".format(pct)
                     self.var_counts.set(
+                        pct_txt +
                         "{:,} seen | {:,} unchanged | {:,} updated | "
                         "{:,} with text | {:,} errors | {:.0f}s".format(
                             p.get("seen", 0), p.get("unchanged", 0),
@@ -1619,6 +1690,8 @@ class FindexApp:
     def _finish(self, code):
         self.proc = None
         self.bar.stop()
+        self.bar.configure(mode="indeterminate", value=0)
+        self._progress_est = 0
         self.busy.stop()
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
@@ -1759,10 +1832,7 @@ class FindexApp:
                     "Still running",
                     "Indexing is still running. Stop it and quit?"):
                 return
-            try:
-                self.proc.terminate()
-            except Exception:                                  # noqa: BLE001
-                pass
+            self._kill_tree()
         self.cfg.update({
             "db": portable(self.var_db.get()),
             "roots": [portable(r) for r in self.current_roots()],

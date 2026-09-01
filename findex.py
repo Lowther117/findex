@@ -103,6 +103,14 @@ except ImportError:
     except ImportError:
         HAVE_FITZ = False
 
+if HAVE_FITZ:
+    try:    # corrupt PDFs otherwise spam stderr with raw "MuPDF error" lines;
+            # real failures are still raised and recorded per file
+        fitz.TOOLS.mupdf_display_errors(False)
+        fitz.TOOLS.mupdf_display_warnings(False)
+    except Exception:
+        pass
+
 try:
     import mutagen                     # audio/video tags (optional)
     HAVE_MUTAGEN = True
@@ -643,6 +651,10 @@ def walk(roots):
 # Index command
 # ----------------------------------------------------------------------------
 
+# SQLite 3.35+ can hand back the row id from the upsert itself, halving the
+# statements on the extraction write path.
+USE_RETURNING = sqlite3.sqlite_version_info >= (3, 35, 0)
+
 UPSERT = """
 INSERT INTO files (path, name, ext, size, mtime, indexed, chars, status, error)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -663,10 +675,14 @@ def flush(conn, executor, batch, stats):
     cur.execute("BEGIN")
     for path, status, error, text in executor.map(extract_one, paths, chunksize=8):
         _, name, ext, size, mtime = meta[path]
-        cur.execute(UPSERT, (path, name, ext, size, mtime, now,
-                             len(text), status, error or None))
-        row = cur.execute("SELECT id FROM files WHERE path=?", (path,)).fetchone()
-        fid = row[0]
+        values = (path, name, ext, size, mtime, now,
+                  len(text), status, error or None)
+        if USE_RETURNING:
+            fid = cur.execute(UPSERT + " RETURNING id", values).fetchone()[0]
+        else:
+            cur.execute(UPSERT, values)
+            fid = cur.execute("SELECT id FROM files WHERE path=?",
+                              (path,)).fetchone()[0]
         cur.execute("DELETE FROM docs WHERE rowid=?", (fid,))
         if text:
             cur.execute("INSERT INTO docs(rowid, body) VALUES (?, ?)", (fid, text))
