@@ -6,8 +6,11 @@ Run it:
     Windows   double-click findex-gui.bat
     Any OS    python findex_gui.py        or        python findex.py gui
 
-Search tab  filename search (live as you type) and full-text content search.
-Index tab   pick folders, run an index, watch progress, auto re-index on a timer.
+Search tab  one Everything-style box, live as you type: names by default,
+            content:word for text inside files, C:\\ path scopes, ext: filters,
+            ! exclusions - plus a duplicate-file finder.
+Index tab   pick folders, run an index, watch progress, auto re-index on a
+            timer, or turn on live updates (real-time watching).
 
 Settings are kept in findex_gui.json next to this script. Indexing runs as a
 separate findex.py process so the window never freezes and Stop always works.
@@ -60,8 +63,8 @@ DEFAULTS = {
     "theme": "system",
     "auto_index": False,
     "auto_minutes": 60,
+    "watch": False,
     "limit": 0,
-    "mode": "name",
     "exts": "",
     "geometry": "1060x700",
 }
@@ -198,6 +201,8 @@ def missing_packages():
         missing.append("mutagen")          # music/video tags
     if iu.find_spec("extract_msg") is None:
         missing.append("extract-msg")      # Outlook .msg emails
+    if iu.find_spec("watchdog") is None:
+        missing.append("watchdog")         # live index updates
     if sys.platform == "darwin" and iu.find_spec("Vision") is None:
         missing.append("pyobjc-framework-Vision")   # macOS built-in OCR
     if os.name == "nt":
@@ -523,6 +528,8 @@ class FindexApp:
         self.search_after = None
         self.proc = None
         self.proc_kind = ""
+        self.watch_proc = None
+        self._watch_refresh = 0.0
         self.last_index_finished = time.time()
         self.sort_col = None
         self.sort_desc = False
@@ -559,12 +566,22 @@ class FindexApp:
         self._native_theme = ttk.Style().theme_use()
         self.apply_theme()
 
+        self._ensure_schema()            # older index gains the new columns
         self.root.after(POLL_MS, self._pump)
         self.root.after(AUTO_CHECK_MS, self._auto_tick)
         self.refresh_stats()
         self.run_search(live=False)      # fill the list on launch
         self.root.after(800, self._auto_setup)
+        self.root.after(2500, self._maybe_start_watch)
         self.query_entry.focus_set()
+
+    def _ensure_schema(self):
+        """Open the index read-write once, so a database built by an older
+        findex gains the new columns before any search touches them."""
+        try:
+            findex.open_db(self.var_db.get()).close()
+        except Exception:                                      # noqa: BLE001
+            pass
 
     # -- variables ---------------------------------------------------------
 
@@ -572,7 +589,6 @@ class FindexApp:
         c = self.cfg
         self.var_db = tk.StringVar(value=c["db"])
         self.var_query = tk.StringVar()
-        self.var_mode = tk.StringVar(value=c.get("mode", "name"))
         self.var_exts = tk.StringVar(value=c.get("exts", ""))
         self.var_exts.trace_add("write", lambda *_: self.on_query_changed())
         self.var_limit = tk.IntVar(value=int(c.get("limit", 0)))
@@ -586,11 +602,12 @@ class FindexApp:
         self.var_auto = tk.BooleanVar(value=bool(c.get("auto_index", False)))
         self.var_auto_mins = tk.IntVar(value=int(c.get("auto_minutes", 60)))
         self.var_auto_next = tk.StringVar(value="")
+        self.var_watch = tk.BooleanVar(value=bool(c.get("watch", False)))
+        self.var_watch_note = tk.StringVar(value="")
         self.var_counts = tk.StringVar(value="Idle")
         self.var_stats = tk.StringVar(value="")
 
         self.var_query.trace_add("write", lambda *_: self.on_query_changed())
-        self.var_mode.trace_add("write", lambda *_: self.run_search(live=False))
 
     # -- menu --------------------------------------------------------------
 
@@ -847,8 +864,12 @@ class FindexApp:
         self.query_entry.bind("<Escape>", lambda e: self.var_query.set(""))
         self.query_entry.bind("<Down>", self._focus_results)
         self.tip(self.query_entry,
-                 "What to look for. Esc clears the box; the down arrow jumps "
-                 "into the results list.", popup=False)
+                 "One box searches everything, live as you type. Bare words "
+                 "match file and folder names; content:word searches inside "
+                 "files; C:\\ limits to a drive or folder; ext:pdf limits the "
+                 "type; !word leaves results out. Help > Search syntax has "
+                 "the full list. Esc clears; the down arrow jumps into the "
+                 "results.", popup=False)
 
         btn = ttk.Button(top, text="Search", width=10,
                          style="Accent.TButton",
@@ -856,21 +877,27 @@ class FindexApp:
         btn.pack(side="left", padx=(8, 0))
         self.tip(btn, "Run the search now - the same as pressing Enter.")
 
+        btn = ttk.Button(top, text="Duplicates", width=11,
+                         command=self.find_dupes)
+        btn.pack(side="left", padx=(6, 0))
+        self.tip(btn, "List files that share the same name AND size - the "
+                      "classic duplicate candidates - grouped together, "
+                      "biggest first, with a total of the space you could "
+                      "get back. The Type box narrows it; any search brings "
+                      "the normal list back.")
+
         opts = ttk.Frame(self.tab_search)
         opts.pack(fill="x", padx=12, pady=(0, 4))
 
-        rb = ttk.Radiobutton(opts, text="Filename", value="name",
-                             variable=self.var_mode)
-        rb.pack(side="left")
-        self.tip(rb, "Search file names only. Results appear as you type. "
-                     "Use * and ? as wildcards, e.g. *budget*2024*.pdf")
-
-        rb = ttk.Radiobutton(opts, text="File contents", value="content",
-                             variable=self.var_mode)
-        rb.pack(side="left", padx=(10, 20))
-        self.tip(rb, "Search the text inside PDFs, Word, Excel, PowerPoint "
-                     "and plain-text files - results appear as you type. See "
-                     "Help > Search syntax for AND / OR / \"phrases\".")
+        hint = ttk.Label(opts, style="Hint.TLabel",
+                         text="names as you type  ·  content:word  ·  C:\\  ·"
+                              "  ext:pdf  ·  !leave-out  ·  folder:")
+        hint.pack(side="left", padx=(0, 20))
+        self.tip(hint, "The search understands Everything-style filters, "
+                       "combined freely - e.g.  C: content:dan ext:pdf "
+                       "!draft  finds PDFs on C: containing 'dan' whose name "
+                       "doesn't contain 'draft'. Help > Search syntax has "
+                       "the full list.")
 
         lbl = ttk.Label(opts, text="Type:")
         lbl.pack(side="left")
@@ -879,9 +906,10 @@ class FindexApp:
                                      values=["All types"])
         self.type_box.pack(side="left", padx=4)
         for w in (lbl, self.type_box):
-            self.tip(w, "Every file type actually in your index, with counts. "
-                        "Pick one, or type your own list like: pdf, docx, "
-                        "xlsx. 'All types' or an empty box means everything.")
+            self.tip(w, "Every file type actually in your index, with counts "
+                        "- plus a 'folders' entry. Pick one, or type your own "
+                        "list like: pdf, docx, xlsx. 'All types' or an empty "
+                        "box means everything.")
 
         lbl = ttk.Label(opts, text="Max results:")
         lbl.pack(side="left", padx=(20, 4))
@@ -1073,6 +1101,22 @@ class FindexApp:
         ttk.Label(auto, textvariable=self.var_auto_next,
                   style="Accent.TLabel").pack(side="left", padx=12)
 
+        live = ttk.Frame(opts)
+        live.pack(fill="x", padx=8, pady=(0, 8))
+        chk = ttk.Checkbutton(live, text="Live updates - watch these folders "
+                                         "and index changes as they happen",
+                              variable=self.var_watch,
+                              command=self.toggle_watch)
+        chk.pack(side="left")
+        self.tip(chk, "Everything-style real-time indexing: while the app is "
+                      "open, new, changed, renamed and deleted files show up "
+                      "in search within seconds - no waiting for the next "
+                      "indexing run. Uses the folder list above. Runs "
+                      "quietly alongside normal indexing and stops when the "
+                      "app closes.")
+        ttk.Label(live, textvariable=self.var_watch_note,
+                  style="Accent.TLabel").pack(side="left", padx=12)
+
         run = ttk.Frame(self.tab_index)
         run.pack(fill="x", padx=8, pady=8)
         self.btn_start = ttk.Button(run, text="Start indexing", width=16,
@@ -1144,69 +1188,100 @@ class FindexApp:
         self.search_after = self.root.after(LIVE_SEARCH_MS,
                                             lambda: self.run_search(live=True))
 
+    def _type_filter(self):
+        """The Type box: extensions, plus the special 'folders' entry which
+        becomes a kind filter rather than an extension."""
+        exts = parse_exts(self.var_exts.get())
+        kind = None
+        if exts:
+            rest = [e for e in exts if e not in ("folder", "folders", "dir")]
+            if len(rest) != len(exts):
+                kind = "folder"
+            exts = rest or None
+        return exts, kind
+
     def run_search(self, live=False):
         text = self.var_query.get().strip()
         self.search_gen += 1
         gen = self.search_gen
-        mode = self.var_mode.get()
         db = self.var_db.get()
         try:
             limit = max(0, int(self.var_limit.get()))
         except (tk.TclError, ValueError):
             limit = 0
-        exts = parse_exts(self.var_exts.get())
+        exts, kind = self._type_filter()
         self.var_status.set("Searching...")
         threading.Thread(target=self._search_worker,
-                         args=(gen, db, mode, text, limit, exts, live),
+                         args=(gen, db, text, limit, exts, kind, live),
                          daemon=True).start()
 
-    def _search_worker(self, gen, db, mode, text, limit, exts,
-                       live=False):
+    def _search_worker(self, gen, db, text, limit, exts, kind, live=False):
         conn = None
         try:
             try:
                 conn = findex.open_db_ro(db)
             except sqlite3.Error:
                 conn = findex.open_db(db)   # index file not created yet
+            total = None
             if not text:
-                # Empty box = browse the whole index, newest first, capped so
-                # the list stays instant. Typing narrows it down.
-                total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-                raw = findex.name_rows(conn, "*", limit, exts)
-                rows = [{"path": r[0], "name": os.path.basename(r[0]),
-                         "size": r[1], "mtime": r[2], "snippet": ""}
-                        for r in raw]
-                self.msgs.put(("results", gen, rows, total))
-            elif mode == "content":
-                attempt = text
-                if live and text and (text[-1].isalnum() or text[-1] == "_"):
-                    attempt = text + "*"    # the word being typed matches
-                                            # as a prefix while you type
-                try:
-                    raw = findex.search_rows(conn, attempt, limit, exts,
-                                             snippet_len=18)
-                except sqlite3.OperationalError:
-                    # mid-typing syntax (an unclosed quote, a lone AND):
-                    # search the real words literally as prefixes, ignoring
-                    # operators and stray punctuation
-                    words = [w for w in re.findall(r"\w+", text)
-                             if w.upper() not in ("AND", "OR", "NOT", "NEAR")]
-                    safe = " ".join('"{}"*'.format(w) for w in words)
-                    if not safe:
-                        raise
-                    raw = findex.search_rows(conn, safe, limit, exts,
-                                             snippet_len=18)
-                rows = [{"path": r[0], "name": os.path.basename(r[0]),
-                         "size": r[1], "mtime": r[2], "snippet": r[3]}
-                        for r in raw]
-            else:
-                raw = findex.name_rows(conn, text, limit, exts)
-                rows = [{"path": r[0], "name": os.path.basename(r[0]),
-                         "size": r[1], "mtime": r[2], "snippet": ""}
-                        for r in raw]
-            self.msgs.put(("results", gen, rows, None))
+                # Empty box = browse the whole index, newest first. Typing
+                # narrows it down; the status bar shows the true total.
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM files").fetchone()[0]
+            raw = findex.query_rows(conn, text, limit, exts=exts, kind=kind,
+                                    live=live)
+            rows = [{"path": r[0], "name": os.path.basename(r[0]),
+                     "size": r[1], "mtime": r[2], "snippet": r[3],
+                     "is_dir": bool(r[4])} for r in raw]
+            self.msgs.put(("results", gen, rows, total))
         except sqlite3.OperationalError as exc:
             self.msgs.put(("search_error", gen, str(exc)))
+        except Exception as exc:                               # noqa: BLE001
+            self.msgs.put(("search_error", gen,
+                           "{}: {}".format(type(exc).__name__, exc)))
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def find_dupes(self):
+        """Fill the list with duplicate candidates: files sharing name AND
+        size, grouped together, biggest first."""
+        self.search_gen += 1
+        gen = self.search_gen
+        db = self.var_db.get()
+        try:
+            limit = max(0, int(self.var_limit.get()))
+        except (tk.TclError, ValueError):
+            limit = 0
+        exts, _kind = self._type_filter()
+        self.var_status.set("Looking for duplicates...")
+        threading.Thread(target=self._dupes_worker,
+                         args=(gen, db, limit, exts), daemon=True).start()
+
+    def _dupes_worker(self, gen, db, limit, exts):
+        conn = None
+        try:
+            try:
+                conn = findex.open_db_ro(db)
+            except sqlite3.Error:
+                conn = findex.open_db(db)
+            groups, files, wasted = findex.dupe_summary(conn, exts)
+            raw = findex.dupe_rows(conn, limit, exts)
+            rows = [{"path": r[0], "name": os.path.basename(r[0]),
+                     "size": r[1], "mtime": r[2], "is_dir": False,
+                     "snippet": "{:,} files share this name and size - keep "
+                                "the one you want, the rest are duplicate "
+                                "candidates".format(r[3])}
+                    for r in raw]
+            self.msgs.put(("results", gen, rows, None))
+            if groups:
+                self.msgs.put(("status",
+                               "{:,} duplicate set(s) - {:,} files, {} to be "
+                               "had back if each set kept one copy".format(
+                                   groups, files, findex.human(wasted))))
+            else:
+                self.msgs.put(("status",
+                               "No duplicates found (matched by name + size)"))
         except Exception as exc:                               # noqa: BLE001
             self.msgs.put(("search_error", gen,
                            "{}: {}".format(type(exc).__name__, exc)))
@@ -1233,7 +1308,9 @@ class FindexApp:
             row = self.rows[i]
             insert("", "end", iid=str(i),
                    tags=("odd",) if i % 2 else (),
-                   values=(row["name"], human(row["size"]),
+                   values=(row["name"],
+                           "folder" if row.get("is_dir")
+                           else human(row["size"]),
                            fmt_time(row["mtime"]),
                            os.path.dirname(row["path"])))
         if end < len(self.rows):
@@ -1276,9 +1353,11 @@ class FindexApp:
                 self.preview.insert("end", part, ("hit",) if i % 2 else ())
         elif not path:
             self.preview.insert("end",
-                                "The list shows your indexed files, newest "
-                                "first. Both search modes narrow it live as "
-                                "you type.")
+                                "The list shows your indexed files and "
+                                "folders, newest first. Type to narrow it - "
+                                "names by default, content:word for text "
+                                "inside files, C:\\ for a drive, !word to "
+                                "leave things out.")
         self.preview.configure(state="disabled")
         # grow or shrink with the content: a short path takes one line, a long
         # path or a text snippet takes more, capped so the list keeps the room
@@ -1412,11 +1491,14 @@ class FindexApp:
             conn = sqlite3.connect(self.var_db.get(), timeout=3)
             cur = conn.cursor()
             for p in paths:
-                row = cur.execute("SELECT id FROM files WHERE path=?",
-                                  (p,)).fetchone()
-                if row:
-                    cur.execute("DELETE FROM docs WHERE rowid=?", (row[0],))
-                    cur.execute("DELETE FROM files WHERE id=?", (row[0],))
+                # the row itself - and, if it was a folder, everything the
+                # index holds underneath it
+                like = p.rstrip("\\/") + os.sep + "%"
+                for (fid,) in cur.execute(
+                        "SELECT id FROM files WHERE path=? OR path LIKE ?",
+                        (p, like)).fetchall():
+                    cur.execute("DELETE FROM docs WHERE rowid=?", (fid,))
+                    cur.execute("DELETE FROM files WHERE id=?", (fid,))
             conn.commit()
             conn.close()
         except Exception:                                      # noqa: BLE001
@@ -1700,14 +1782,13 @@ class FindexApp:
             return
         self.log_line("-- stopping: ending the run and all of its worker "
                       "processes --")
-        self._kill_tree()
+        self._kill_proc_tree(self.proc)
         self.root.after(3000, self._ensure_stopped)
 
-    def _kill_tree(self):
-        """End the background run AND every worker process it started.
+    def _kill_proc_tree(self, proc, force=False):
+        """End a background run AND every worker process it started.
         Terminating only the parent left the workers running - which is why
         Stop used to say 'stopping' and nothing happened."""
-        proc = self.proc
         if proc is None or proc.poll() is not None:
             return
         try:
@@ -1717,8 +1798,9 @@ class FindexApp:
                                capture_output=True, **no_window())
             else:
                 import signal
+                sig = signal.SIGKILL if force else signal.SIGTERM
                 try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    os.killpg(os.getpgid(proc.pid), sig)
                 except (ProcessLookupError, PermissionError):
                     proc.terminate()
         except Exception:                                      # noqa: BLE001
@@ -1732,16 +1814,66 @@ class FindexApp:
         if proc is None or proc.poll() is not None:
             return
         self.log_line("-- still running: force-killing the worker tree --")
+        self._kill_proc_tree(proc, force=True)
+
+    # -- live updates (watch) ----------------------------------------------
+
+    def toggle_watch(self):
+        if self.var_watch.get():
+            self._maybe_start_watch()
+        else:
+            self.stop_watch()
+
+    def _maybe_start_watch(self):
+        """Start the live-updates process when it should be running and
+        is not: the box is ticked, folders exist, nothing is installing."""
+        if not self.var_watch.get() or self.watch_proc is not None:
+            return
+        if self.proc_kind == "setup":
+            return          # watchdog may still be installing - retried after
+        roots = [r for r in self.current_roots() if os.path.isdir(r)]
+        if not roots:
+            return
+        cmd = engine_command() + ["--db", self.var_db.get(), "watch"] + roots
+        if self.var_cloud.get():
+            cmd.append("--include-cloud")
+        if self.var_ocr.get() and findex.have_ocr_backend():
+            cmd.append("--ocr")
         try:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(proc.pid),
-                                "/T", "/F"],
-                               capture_output=True, **no_window())
-            else:
-                import signal
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            kwargs = no_window()
+            if os.name != "nt":
+                kwargs["start_new_session"] = True   # own process group
+            self.watch_proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                errors="replace", bufsize=1, cwd=HERE, **kwargs)
+        except Exception as exc:                               # noqa: BLE001
+            self.watch_proc = None
+            self.log_line("could not start live updates: {}".format(exc))
+            return
+        self.var_watch_note.set("watching for changes")
+        threading.Thread(target=self._watch_reader,
+                         args=(self.watch_proc,), daemon=True).start()
+
+    def _watch_reader(self, proc):
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    self.msgs.put(("watch", line))
         except Exception:                                      # noqa: BLE001
             pass
+        finally:
+            code = proc.wait()
+            self.msgs.put(("watch_end", proc, code))
+
+    def stop_watch(self):
+        proc = self.watch_proc
+        self.watch_proc = None
+        self.var_watch_note.set("")
+        if proc is not None and proc.poll() is None:
+            self._kill_proc_tree(proc)
+            self.log_line("-- live updates off --")
 
     # -- queue pump --------------------------------------------------------
 
@@ -1773,8 +1905,24 @@ class FindexApp:
                         self.rows = []
                         self.render_rows()
                         self.var_status.set("Query error: " + err)
+                elif kind == "status":
+                    self.var_status.set(msg[1])
                 elif kind == "log":
                     self.log_line(msg[1])
+                elif kind == "watch":
+                    self.log_line("watch: " + msg[1])
+                    if time.time() - self._watch_refresh > 15:
+                        self._watch_refresh = time.time()
+                        self.refresh_stats()
+                        self.run_search(live=True)
+                elif kind == "watch_end":
+                    _, proc, code = msg
+                    if self.watch_proc is proc:
+                        # it stopped on its own (missing component, bad root)
+                        self.watch_proc = None
+                        self.var_watch_note.set("")
+                        self.log_line("-- live updates stopped "
+                                      "(exit {}) --".format(code))
                 elif kind == "progress":
                     p = msg[1]
                     pct_txt = ""
@@ -1819,6 +1967,7 @@ class FindexApp:
         self.proc_kind = ""
         self.refresh_stats()
         self.run_search(live=False)      # refresh the visible list
+        self._maybe_start_watch()        # live updates waiting on setup/run
 
     def log_line(self, text):
         self.log.configure(state="normal")
@@ -1869,6 +2018,12 @@ class FindexApp:
                 "SELECT COUNT(*), COALESCE(SUM(chars),0) FROM files").fetchone()
             errs = conn.execute(
                 "SELECT COUNT(*) FROM files WHERE status='error'").fetchone()[0]
+            dirs = 0
+            try:
+                dirs = conn.execute("SELECT COUNT(*) FROM files "
+                                    "WHERE is_dir=1").fetchone()[0]
+            except sqlite3.OperationalError:
+                pass    # index from an older findex - healed on next open
             last = findex.get_meta(conn, "last_index")
             summary = findex.get_meta(conn, "last_summary")
             kinds = conn.execute(
@@ -1876,12 +2031,17 @@ class FindexApp:
                 "WHERE ext IS NOT NULL AND ext != '' "
                 "GROUP BY ext ORDER BY COUNT(*) DESC LIMIT 500").fetchall()
             conn.close()
-            self.type_box["values"] = ["All types"] + [
-                "{} ({:,})".format(e.lstrip("."), n) for e, n in kinds]
+            values = ["All types"]
+            if dirs:
+                values.append("folders ({:,})".format(dirs))
+            values += ["{} ({:,})".format(e.lstrip("."), n) for e, n in kinds]
+            self.type_box["values"] = values
             size = os.path.getsize(db) if os.path.exists(db) else 0
-            text = ("{:,} files indexed   |   {} of text   |   database {}   |  "
-                    " {:,} errors".format(total, findex.human(chars),
-                                          findex.human(size), errs))
+            text = ("{:,} files{} indexed   |   {} of text   |   database {}  "
+                    " |   {:,} errors".format(
+                        total - dirs,
+                        " + {:,} folders".format(dirs) if dirs else "",
+                        findex.human(chars), findex.human(size), errs))
             if last:
                 try:
                     when = time.strftime("%a %d %b %H:%M",
@@ -1904,6 +2064,7 @@ class FindexApp:
             confirmoverwrite=False)
         if path:
             self.var_db.set(path)
+            self._ensure_schema()
             self.refresh_stats()
             self.run_search(live=False)
 
@@ -1914,17 +2075,24 @@ class FindexApp:
     def show_syntax(self):
         messagebox.showinfo(
             "Search syntax",
-            "Filename mode\n"
-            "  budget          matches anywhere in the name\n"
-            "  *2024*.pdf      * and ? wildcards\n\n"
-            "File contents mode (SQLite FTS5)\n"
-            "  invoice payment       both words\n"
-            '  "exact phrase"        quoted phrase\n'
-            "  quarterly AND revenue\n"
-            "  contract NOT draft\n"
-            "  budg*                 prefix match\n"
-            "  NEAR(risk policy, 10) within 10 words\n\n"
-            "Types box: pdf, docx, xlsx, txt  (blank = every indexed type)")
+            "One box does it all - combine anything, in any order:\n\n"
+            "  budget report     both words in the file/folder NAME\n"
+            "  *2024*.pdf        * and ? wildcards in the name\n"
+            '  "two words"       a name term with the space kept\n'
+            "  content:invoice   word inside the file's text\n"
+            '  content:"exact phrase"\n'
+            "  C:   D:\\Photos    only results under that drive/folder\n"
+            "  ext:pdf;docx      only those types\n"
+            "  folder:   file:   only folders / only files\n"
+            "  !draft            leave out names containing draft\n"
+            "  !ext:tmp  !C:\\Windows   ...works on filters too\n\n"
+            "Example:  C: content:dan ext:pdf !draft\n\n"
+            "content: accepts full FTS5 syntax when quoted at the box level:\n"
+            "  content:budg*   prefix    |   content:\"risk policy\"  phrase\n\n"
+            "Name results come back best first: exact name, then names\n"
+            "starting with the term, then newest. Content results are\n"
+            "relevance-ranked.\n\n"
+            "Types box: pdf, docx, xlsx - or the folders entry. Blank = all.")
 
     def show_about(self):
         messagebox.showinfo(
@@ -1945,7 +2113,14 @@ class FindexApp:
                     "Still running",
                     "Indexing is still running. Stop it and quit?"):
                 return
-            self._kill_tree()
+            self._kill_proc_tree(self.proc)
+        if self.watch_proc is not None:
+            self._kill_proc_tree(self.watch_proc)
+            self.watch_proc = None
+        try:
+            limit = max(0, int(self.var_limit.get()))
+        except (tk.TclError, ValueError):
+            limit = 0
         self.cfg.update({
             "db": portable(self.var_db.get()),
             "roots": [portable(r) for r in self.current_roots()],
@@ -1955,8 +2130,8 @@ class FindexApp:
             "theme": self.var_theme.get(),
             "auto_index": bool(self.var_auto.get()),
             "auto_minutes": int(self.var_auto_mins.get() or 60),
-            "limit": int(self.var_limit.get() or 200),
-            "mode": self.var_mode.get(),
+            "watch": bool(self.var_watch.get()),
+            "limit": limit,
             "exts": self.var_exts.get(),
             "geometry": self.root.geometry(),
         })

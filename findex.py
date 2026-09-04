@@ -4,16 +4,19 @@ findex - local filename + full-text index for Windows.
 
 Commands:
     findex index [ROOT ...]     Build or update the index
+    findex watch [ROOT ...]     Live updates: index changes as they happen
+    findex find "QUERY"         Everything-style search (content:, C:\\, ext:, !)
     findex search "QUERY"       Full-text search of file contents
     findex name "PATTERN"       Filename search (substring or *wildcard*)
+    findex dupes                Duplicate files (same name and size)
     findex stats                Index statistics
     findex vacuum               Compact the database
     findex clear                Delete the index and start fresh
     findex gui                  Open the desktop app (findex_gui.py)
 
-EVERY file under the indexed folders is recorded by name, size and date, so
-filename search covers the whole drive - like Everything does. Text extraction
-on top of that is limited to the document types listed in DOC_EXTS/TEXT_EXTS.
+EVERY file AND folder under the indexed roots is recorded by name, size and
+date, so filename search covers the whole drive - like Everything does. Text
+extraction on top of that is limited to the types in DOC_EXTS/TEXT_EXTS.
 
 The database lives next to this script as findex.db unless --db is given.
 """
@@ -560,7 +563,8 @@ CREATE TABLE IF NOT EXISTS files (
     indexed REAL,
     chars   INTEGER DEFAULT 0,
     status  TEXT,
-    error   TEXT
+    error   TEXT,
+    is_dir  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
 CREATE INDEX IF NOT EXISTS idx_files_ext  ON files(ext);
@@ -636,6 +640,13 @@ def open_db(path):
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute("PRAGMA cache_size=-262144")   # 256 MB page cache
     conn.executescript(SCHEMA)
+    # An index built by an older findex predates folder indexing: add the
+    # column in place, keeping every row. New databases have it from SCHEMA.
+    have = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+    if "is_dir" not in have:
+        conn.execute("ALTER TABLE files ADD COLUMN "
+                     "is_dir INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
     try:
         conn.executescript(NAMES_SCHEMA)
     except sqlite3.OperationalError:
@@ -648,9 +659,10 @@ def open_db(path):
 # ----------------------------------------------------------------------------
 
 def walk(roots):
-    """Yield (path, name, ext, size, mtime, is_cloud_placeholder) for EVERY
-    file under the roots, whatever its type. What to do with each file is the
-    caller's decision."""
+    """Yield (path, name, ext, size, mtime, is_cloud_placeholder, is_dir) for
+    EVERY file AND folder under the roots. Folders are yielded too - ext ''
+    and size 0 - so folder names are searchable, the way Everything mixes
+    files and folders. What to do with each entry is the caller's decision."""
     stack = [os.path.abspath(r) for r in roots]
     while stack:
         d = stack.pop()
@@ -666,6 +678,12 @@ def walk(roots):
                         if low in SKIP_DIRS or low.startswith("$"):
                             continue
                         stack.append(entry.path)
+                        try:
+                            st = entry.stat()
+                            yield (entry.path, entry.name, "", 0,
+                                   st.st_mtime, False, True)
+                        except OSError:
+                            pass
                         continue
                     if not entry.is_file(follow_symlinks=False):
                         continue
@@ -673,7 +691,7 @@ def walk(roots):
                     st = entry.stat()
                     attrs = getattr(st, "st_file_attributes", 0)
                     yield (entry.path, entry.name, ext, st.st_size,
-                           st.st_mtime, bool(attrs & CLOUD_MASK))
+                           st.st_mtime, bool(attrs & CLOUD_MASK), False)
                 except OSError:
                     continue
 
@@ -687,11 +705,13 @@ def walk(roots):
 USE_RETURNING = sqlite3.sqlite_version_info >= (3, 35, 0)
 
 UPSERT = """
-INSERT INTO files (path, name, ext, size, mtime, indexed, chars, status, error)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO files (path, name, ext, size, mtime, indexed, chars, status, error,
+                   is_dir)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(path) DO UPDATE SET
     size=excluded.size, mtime=excluded.mtime, indexed=excluded.indexed,
-    chars=excluded.chars, status=excluded.status, error=excluded.error
+    chars=excluded.chars, status=excluded.status, error=excluded.error,
+    is_dir=excluded.is_dir
 """
 
 
@@ -707,7 +727,7 @@ def flush(conn, executor, batch, stats):
     for path, status, error, text in executor.map(extract_one, paths, chunksize=8):
         _, name, ext, size, mtime = meta[path]
         values = (path, name, ext, size, mtime, now,
-                  len(text), status, error or None)
+                  len(text), status, error or None, 0)
         if USE_RETURNING:
             fid = cur.execute(UPSERT + " RETURNING id", values).fetchone()[0]
         else:
@@ -723,15 +743,17 @@ def flush(conn, executor, batch, stats):
 
 
 def flush_names(conn, batch, stats):
-    """Record name/size/date for files whose contents are not extracted, so
-    filename search covers everything on the drive - like Everything does."""
+    """Record name/size/date for folders and for files whose contents are not
+    extracted, so filename search covers everything on the drive - like
+    Everything does."""
     now = time.time()
     cur = conn.cursor()
     cur.execute("BEGIN")
     cur.executemany(
         UPSERT,
-        [(path, name, ext, size, mtime, now, 0, "listed", None)
-         for path, name, ext, size, mtime in batch])
+        [(path, name, ext, size, mtime, now, 0,
+          "folder" if is_dir else "listed", None, 1 if is_dir else 0)
+         for path, name, ext, size, mtime, is_dir in batch])
     conn.commit()
     stats["listed"] += len(batch)
 
@@ -797,13 +819,13 @@ def cmd_index(args):
     last_emit = 0.0
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        for path, name, ext, size, mtime, cloud in walk(roots):
+        for path, name, ext, size, mtime, cloud, is_dir in walk(roots):
             stats["seen"] += 1
             if progress and time.time() - last_emit > 0.4:
                 last_emit = time.time()
                 emit_progress(stats, start)
 
-            wants_text = (can_extract(ext)
+            wants_text = (not is_dir and can_extract(ext)
                           and (size <= MAX_FILE_BYTES or ext in AUDIO_EXTS)
                           and (args.include_cloud or not cloud))
 
@@ -817,9 +839,9 @@ def cmd_index(args):
                 continue
 
             if not wants_text:
-                if ext in INDEXABLE and size > MAX_FILE_BYTES:
+                if not is_dir and ext in INDEXABLE and size > MAX_FILE_BYTES:
                     stats["skipped"] += 1
-                name_batch.append((path, name, ext, size, mtime))
+                name_batch.append((path, name, ext, size, mtime, is_dir))
                 if len(name_batch) >= NAME_CHUNK:
                     flush_names(conn, name_batch, stats)
                     name_batch = []
@@ -888,6 +910,204 @@ def cmd_index(args):
 
 
 # ----------------------------------------------------------------------------
+# Watch command - live index updates
+# ----------------------------------------------------------------------------
+
+def _watch_skip(path):
+    """Is this path inside a folder that indexing skips (SKIP_DIRS)?"""
+    parts = path.replace("\\", "/").lower().split("/")
+    return any(p in SKIP_DIRS or p.startswith("$") for p in parts[:-1])
+
+
+def cmd_watch(args):
+    """Live updates: watch the roots and fold filesystem changes into the
+    index within seconds - new and modified files are (re)extracted,
+    deletions pruned, renames and new folders handled. Runs until stopped
+    (Ctrl+C, or the app's Live updates tick box)."""
+    try:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+        from watchdog.observers.polling import PollingObserver
+    except ImportError:
+        sys.stderr.write(
+            "Live updates need the 'watchdog' package:\n"
+            "    pip install watchdog\n"
+            "(the desktop app installs it automatically on launch)\n")
+        return 1
+
+    global OCR_ENABLED
+    if getattr(args, "ocr", False) and have_ocr_backend():
+        OCR_ENABLED = True
+        os.environ["FINDEX_OCR"] = "1"
+    include_cloud = getattr(args, "include_cloud", False)
+
+    roots = [os.path.abspath(r) for r in (args.roots or [])
+             if os.path.isdir(r)]
+    if not roots:
+        sys.stderr.write("watch: none of the given folders exist here\n")
+        return 1
+
+    import stat as statmod
+    import threading
+    lock = threading.Lock()
+    pending = {}          # path -> arrived-as-directory (walk it if so)
+    gone = set()
+
+    class Handler(FileSystemEventHandler):
+        def on_created(self, e):
+            with lock:
+                pending[e.src_path] = e.is_directory
+
+        def on_modified(self, e):
+            if not e.is_directory:      # folders "modify" constantly - noise
+                with lock:
+                    pending[e.src_path] = False
+
+        def on_moved(self, e):
+            with lock:
+                gone.add(e.src_path)
+                pending[e.dest_path] = e.is_directory
+
+        def on_deleted(self, e):
+            with lock:
+                gone.add(e.src_path)
+
+    handler = Handler()
+    observer = None
+    for maker in (Observer, lambda: PollingObserver(timeout=30)):
+        candidate = maker()
+        ok = 0
+        for r in roots:
+            try:
+                candidate.schedule(handler, r, recursive=True)
+                ok += 1
+            except OSError as exc:
+                sys.stderr.write("watch: cannot watch {}: {}\n".format(r, exc))
+        if ok:
+            observer = candidate
+            break
+    if observer is None:
+        return 1
+    observer.daemon = True
+    observer.start()
+
+    conn = open_db(args.db)
+    print("Watching {} - changes land in the index within seconds."
+          .format(", ".join(roots)), flush=True)
+
+    def upsert_one(cur, path):
+        """Stat + record one path; extract text when the type qualifies.
+        Returns 1 when a row was written."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return 0
+        name = os.path.basename(path)
+        now = time.time()
+        if statmod.S_ISDIR(st.st_mode):
+            cur.execute(UPSERT, (path, name, "", 0, st.st_mtime, now, 0,
+                                 "folder", None, 1))
+            return 1
+        if not statmod.S_ISREG(st.st_mode):
+            return 0
+        ext = os.path.splitext(name)[1].lower()
+        attrs = getattr(st, "st_file_attributes", 0)
+        cloud = bool(attrs & CLOUD_MASK)
+        wants = (can_extract(ext)
+                 and (st.st_size <= MAX_FILE_BYTES or ext in AUDIO_EXTS)
+                 and (include_cloud or not cloud))
+        if not wants:
+            cur.execute(UPSERT, (path, name, ext, st.st_size, st.st_mtime,
+                                 now, 0, "listed", None, 0))
+            return 1
+        _, status, error, text = extract_one(path)
+        values = (path, name, ext, st.st_size, st.st_mtime, now,
+                  len(text), status, error or None, 0)
+        if USE_RETURNING:
+            fid = cur.execute(UPSERT + " RETURNING id", values).fetchone()[0]
+        else:
+            cur.execute(UPSERT, values)
+            fid = cur.execute("SELECT id FROM files WHERE path=?",
+                              (path,)).fetchone()[0]
+        cur.execute("DELETE FROM docs WHERE rowid=?", (fid,))
+        if text:
+            cur.execute("INSERT INTO docs(rowid, body) VALUES (?, ?)",
+                        (fid, text))
+        return 1
+
+    def drop_gone(cur, path):
+        """Remove a vanished path - and, if it was a folder, everything the
+        index holds underneath it. Returns rows removed."""
+        sep = "\\" if "\\" in path or (len(path) > 1 and path[1] == ":") \
+            else "/"
+        rows = cur.execute(
+            "SELECT id FROM files WHERE path = ? OR path LIKE ?",
+            (path, path.rstrip("\\/") + sep + "%")).fetchall()
+        for (fid,) in rows:
+            cur.execute("DELETE FROM docs WHERE rowid=?", (fid,))
+            cur.execute("DELETE FROM files WHERE id=?", (fid,))
+        return len(rows)
+
+    try:
+        while True:
+            time.sleep(2)
+            with lock:
+                todo = dict(pending)
+                pending.clear()
+                dead = set(gone)
+                gone.clear()
+            if not todo and not dead:
+                continue
+            updated = removed = 0
+            try:
+                cur = conn.cursor()
+                cur.execute("BEGIN")
+                for path in dead:
+                    if not _watch_skip(path) and not os.path.exists(path):
+                        removed += drop_gone(cur, path)
+                for path, was_dir in todo.items():
+                    if _watch_skip(path):
+                        continue
+                    if was_dir and os.path.isdir(path):
+                        # a whole folder appeared (created or moved in): its
+                        # contents may never get events of their own - walk it
+                        updated += upsert_one(cur, path)
+                        for tup in walk([path]):
+                            updated += upsert_one(cur, tup[0])
+                    else:
+                        updated += upsert_one(cur, path)
+                conn.commit()
+            except sqlite3.OperationalError:
+                # database busy (an index run is writing): put everything
+                # back and try again on the next tick
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                with lock:
+                    for k, v in todo.items():
+                        pending.setdefault(k, v)
+                    gone.update(dead)
+                continue
+            if updated or removed:
+                try:
+                    set_meta(conn, "last_index", int(time.time()))
+                except sqlite3.OperationalError:
+                    pass
+                print("  live: {:,} updated, {:,} removed".format(
+                    updated, removed), flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            observer.stop()
+        except Exception:
+            pass
+        conn.close()
+    return 0
+
+
+# ----------------------------------------------------------------------------
 # Search commands
 # ----------------------------------------------------------------------------
 
@@ -952,6 +1172,244 @@ def name_rows(conn, pattern, limit=50, exts=None):
         [like] + ext_params + tail_params).fetchall()
 
 
+# ----------------------------------------------------------------------------
+# Everything-style unified search
+# ----------------------------------------------------------------------------
+
+# A token is either plain, or carries one double-quoted section (so
+# content:"exact phrase" and "two words" survive as single tokens).
+_TOKEN = re.compile(r'[^\s"]*"[^"]*"|[^\s"]+')
+
+
+def _is_pathish(tok):
+    """Does this token look like a path scope? C:  C:\\Users  /home  \\\\nas"""
+    if len(tok) >= 2 and tok[1] == ":" and tok[0].isalpha():
+        return len(tok) == 2 or tok[2] in "\\/"
+    return tok.startswith(("/", "\\\\", "~"))
+
+
+def parse_query(text):
+    """Everything-style query -> filter dict. One box does it all:
+
+        bare word         must appear in the file/folder NAME (* ? wildcards)
+        "two words"       one name term with the space kept
+        content:word      must appear in the file's extracted text
+        content:"a b"     exact phrase in the text
+        C:   C:\\Users     only results under that drive/folder
+        ext:pdf;docx      only those types
+        file:  folder:    only files / only folders
+        !anything         the same, negated: !draft  !ext:tmp  !C:\\Windows
+    """
+    q = {"name": [], "name_not": [], "content": [], "content_not": [],
+         "paths": [], "paths_not": [], "exts": [], "exts_not": [],
+         "kind": None}
+    for tok in _TOKEN.findall(text or ""):
+        neg = tok.startswith("!")
+        if neg:
+            tok = tok[1:]
+        if not tok:
+            continue
+        low = tok.lower()
+        if low.startswith("content:"):
+            term = tok[8:].strip()
+            if term:
+                q["content_not" if neg else "content"].append(term)
+            continue
+        if low.startswith("ext:"):
+            for e in re.split(r"[;,]", tok[4:]):
+                e = e.strip().lstrip(".").lower()
+                if e:
+                    q["exts_not" if neg else "exts"].append("." + e)
+            continue
+        if low.startswith("path:"):
+            rest = tok[5:].strip('"')
+            if rest:
+                q["paths_not" if neg else "paths"].append(rest)
+            continue
+        if low.startswith(("file:", "folder:", "folders:", "dir:")):
+            q["kind"] = "file" if low.startswith("file:") else "folder"
+            tok = tok.split(":", 1)[1]
+            if not tok:
+                continue
+        if _is_pathish(tok):
+            q["paths_not" if neg else "paths"].append(tok.strip('"'))
+            continue
+        q["name_not" if neg else "name"].append(tok.strip('"'))
+    return q
+
+
+def _name_like(term):
+    if "*" in term or "?" in term:
+        return term.replace("*", "%").replace("?", "_")
+    return "%" + term + "%"
+
+
+def _path_prefix(p):
+    """'C:' -> 'C:\\%', '/Users/x/' -> '/Users/x/%' - everything under it."""
+    if p.startswith("~"):
+        p = os.path.expanduser(p)
+    sep = "\\" if (len(p) >= 2 and p[1] == ":") or p.startswith("\\\\") \
+        else "/"
+    return p.rstrip("\\/") + sep + "%"
+
+
+def _safe_content(terms):
+    """Mid-typing fallback for broken FTS syntax: the real words, each as a
+    quoted prefix, operators dropped."""
+    words = []
+    for t in terms:
+        words += [w for w in re.findall(r"\w+", t)
+                  if w.upper() not in ("AND", "OR", "NOT", "NEAR")]
+    return " ".join('"{}"*'.format(w) for w in words)
+
+
+def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
+               snippet_len=18):
+    """One Everything-style query over the whole index.
+
+    Returns [(path, size, mtime, snippet, is_dir)]. snippet is '' unless the
+    query has content: terms. Results are weighted: content matches come back
+    best-first (bm25), name matches exact-name first, then names starting
+    with the term, then newest; a browse (no terms) is newest-first.
+    """
+    q = parse_query(text)
+    if exts:
+        q["exts"] += ["." + e.lstrip(".").lower() for e in exts]
+    if kind and not q["kind"]:
+        q["kind"] = kind
+    if live and q["content"]:
+        last = q["content"][-1]
+        if last and (last[-1].isalnum() or last[-1] == "_"):
+            q["content"][-1] = last + "*"   # the word being typed matches
+                                            # as a prefix while you type
+
+    conds, params = [], []
+    for t in q["name"]:
+        conds.append("f.name LIKE ?")
+        params.append(_name_like(t))
+    for t in q["name_not"]:
+        conds.append("f.name NOT LIKE ?")
+        params.append(_name_like(t))
+    if q["paths"]:
+        conds.append("(" + " OR ".join(["f.path LIKE ?"] * len(q["paths"]))
+                     + ")")
+        params += [_path_prefix(p) for p in q["paths"]]
+    for p in q["paths_not"]:
+        conds.append("f.path NOT LIKE ?")
+        params.append(_path_prefix(p))
+    if q["exts"]:
+        conds.append("f.ext IN (" + ",".join("?" * len(q["exts"])) + ")")
+        params += q["exts"]
+    if q["exts_not"]:
+        conds.append("f.ext NOT IN (" + ",".join("?" * len(q["exts_not"]))
+                     + ")")
+        params += q["exts_not"]
+    if q["kind"] == "file":
+        conds.append("f.is_dir=0")
+    elif q["kind"] == "folder":
+        conds.append("f.is_dir=1")
+
+    not_params = []
+    if q["content_not"]:
+        conds.append("f.id NOT IN (SELECT rowid FROM docs WHERE docs MATCH ?)")
+        not_params = [" ".join(q["content_not"])]
+
+    lim, lim_params = "", []
+    if int(limit) > 0:
+        lim = " LIMIT ?"
+        lim_params = [int(limit)]
+
+    if q["content"]:
+        # content search: join through the FTS table for snippets and rank
+        sql = ("SELECT f.path, f.size, f.mtime, "
+               "snippet(docs, 0, '>>', '<<', ' ... ', {}), f.is_dir "
+               "FROM docs JOIN files f ON f.id = docs.rowid "
+               "WHERE ".format(int(snippet_len))
+               + " AND ".join(["docs MATCH ?"] + conds)
+               + " ORDER BY bm25(docs)" + lim)
+        try:
+            return conn.execute(
+                sql, [" ".join(q["content"])] + params + not_params
+                + lim_params).fetchall()
+        except sqlite3.OperationalError:
+            safe = _safe_content(q["content"])
+            if not safe:
+                raise
+            safe_not = ([_safe_content(q["content_not"])]
+                        if q["content_not"] else [])
+            if q["content_not"] and not safe_not[0]:
+                safe_not = ['"findex0nomatch0"']   # valid, matches nothing
+            return conn.execute(
+                sql, [safe] + params + safe_not + lim_params).fetchall()
+
+    # name / filter search - weighted: exact name, then starts-with, then
+    # newest first. A browse with no terms at all is just newest first.
+    order, order_params = " ORDER BY f.mtime DESC", []
+    if q["name"]:
+        first = q["name"][0].strip("*?").lower()
+        if first:
+            order = (" ORDER BY (lower(f.name) = ? OR lower(f.name) LIKE ?) "
+                     "DESC, (f.name LIKE ?) DESC, f.mtime DESC")
+            order_params = [first, first + ".%", first + "%"]
+
+    tail_params = params + not_params + order_params + lim_params
+    if q["name"] and get_meta(conn, "names_ready") == "1" \
+            and _name_like(q["name"][0]).strip("%_"):
+        tri = list(conds)
+        tri[0] = tri[0].replace("f.name", "names.name", 1)
+        try:
+            return conn.execute(
+                "SELECT f.path, f.size, f.mtime, '', f.is_dir FROM names "
+                "JOIN files f ON f.id = names.rowid WHERE "
+                + " AND ".join(tri) + order + lim, tail_params).fetchall()
+        except sqlite3.OperationalError:
+            pass    # no trigram support - the plain scan below still works
+    sql = "SELECT f.path, f.size, f.mtime, '', f.is_dir FROM files f"
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    return conn.execute(sql + order + lim, tail_params).fetchall()
+
+
+def dupe_rows(conn, limit=0, exts=None):
+    """Duplicate candidates: files sharing NAME and SIZE with at least one
+    other file. Grouped in the output (biggest first) so the copies sit next
+    to each other: [(path, size, mtime, copies_in_group)]."""
+    inner_w, outer_w, params_in, params_out = "", "", [], []
+    if exts:
+        norm = ["." + e.lstrip(".").lower() for e in exts]
+        marks = ",".join("?" * len(norm))
+        inner_w = " AND ext IN ({})".format(marks)
+        outer_w = " AND f.ext IN ({})".format(marks)
+        params_in, params_out = norm, norm
+    sql = ("SELECT f.path, f.size, f.mtime, d.n FROM files f JOIN "
+           "(SELECT name, size, COUNT(*) AS n FROM files "
+           "WHERE is_dir=0 AND size>0{} GROUP BY name, size "
+           "HAVING COUNT(*) > 1) d "
+           "ON f.name = d.name AND f.size = d.size "
+           "WHERE f.is_dir=0{} "
+           "ORDER BY f.size DESC, f.name, f.path".format(inner_w, outer_w))
+    params = params_in + params_out
+    if int(limit) > 0:
+        sql += " LIMIT ?"
+        params = params + [int(limit)]
+    return conn.execute(sql, params).fetchall()
+
+
+def dupe_summary(conn, exts=None):
+    """(groups, files, wasted_bytes) for the same-name-same-size duplicates.
+    wasted = what deleting all but one copy of each group would free."""
+    where, params = "", []
+    if exts:
+        norm = ["." + e.lstrip(".").lower() for e in exts]
+        where = " AND ext IN ({})".format(",".join("?" * len(norm)))
+        params = norm
+    return conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(n),0), COALESCE(SUM((n-1)*size),0) "
+        "FROM (SELECT size, COUNT(*) AS n FROM files "
+        "WHERE is_dir=0 AND size>0{} GROUP BY name, size "
+        "HAVING COUNT(*) > 1)".format(where), params).fetchone()
+
+
 def cmd_search(args):
     conn = open_db(args.db)
     try:
@@ -986,11 +1444,52 @@ def cmd_name(args):
     return 0
 
 
+def cmd_find(args):
+    """Everything-style search - one query does names, content, paths,
+    types and exclusions. See parse_query for the syntax."""
+    conn = open_db(args.db)
+    try:
+        rows = query_rows(conn, args.query, args.limit)
+    except sqlite3.OperationalError as exc:
+        sys.stderr.write("Query error: {}\n".format(exc))
+        return 1
+    for i, (path, size, mtime, snip, is_dir) in enumerate(rows, 1):
+        when = time.strftime("%Y-%m-%d", time.localtime(mtime))
+        print("{:>4}. {:>7}  {}  {}".format(
+            i, "folder" if is_dir else human(size), when, path))
+        if snip:
+            print("      {}".format(snip))
+    print("\n{} result(s)".format(len(rows)))
+    return 0
+
+
+def cmd_dupes(args):
+    conn = open_db(args.db)
+    groups, files, wasted = dupe_summary(conn, getattr(args, "ext", None))
+    rows = dupe_rows(conn, args.limit, getattr(args, "ext", None))
+    last = None
+    for path, size, mtime, n in rows:
+        key = (os.path.basename(path), size)
+        if key != last:
+            last = key
+            print("\n{} - {} - {:,} copies:".format(key[0], human(size), n))
+        print("    {}".format(path))
+    if groups:
+        print("\n{:,} duplicate set(s), {:,} files - {} reclaimable if each "
+              "set kept one copy".format(groups, files, human(wasted)))
+    else:
+        print("No duplicates found (matched by name + size).")
+    return 0
+
+
 def cmd_stats(args):
     conn = open_db(args.db)
     total, chars = conn.execute(
         "SELECT COUNT(*), COALESCE(SUM(chars),0) FROM files").fetchone()
-    print("Files indexed : {:,}".format(total))
+    dirs = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE is_dir=1").fetchone()[0]
+    print("Files indexed : {:,}".format(total - dirs))
+    print("Folders       : {:,}".format(dirs))
     print("Text captured : {}".format(human(chars)))
     db_size = os.path.getsize(args.db) if os.path.exists(args.db) else 0
     print("Database size : {}".format(human(db_size)))
@@ -1103,6 +1602,24 @@ def main(argv=None):
     p.add_argument("--progress", action="store_true",
                    help="emit machine-readable @P progress lines (used by the GUI)")
     p.set_defaults(func=cmd_index)
+
+    p = sub.add_parser("watch", help="live updates: index changes as they "
+                                     "happen (until stopped)")
+    p.add_argument("roots", nargs="*", help="folders or drives to watch")
+    p.add_argument("--include-cloud", action="store_true")
+    p.add_argument("--ocr", action="store_true")
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("find", help="Everything-style search: bare words = "
+                       "names, content:word, C:\\ paths, ext:pdf, !not")
+    p.add_argument("query")
+    p.add_argument("-n", "--limit", type=int, default=50)
+    p.set_defaults(func=cmd_find)
+
+    p = sub.add_parser("dupes", help="duplicate files (same name and size)")
+    p.add_argument("-n", "--limit", type=int, default=0)
+    p.add_argument("-e", "--ext", nargs="+", help="restrict to extensions")
+    p.set_defaults(func=cmd_dupes)
 
     p = sub.add_parser("search", help="full-text search of file contents")
     p.add_argument("query")

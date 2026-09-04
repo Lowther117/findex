@@ -25,7 +25,7 @@ if errorlevel 1 (
     exit /b 1
 )
 echo Installing components to bake in...
-"%PY%" -m pip install --only-binary :all: pymupdf mutagen extract-msg
+"%PY%" -m pip install --only-binary :all: pymupdf mutagen extract-msg watchdog
 if errorlevel 1 echo WARNING: some components missing - exe builds without them.
 "%PY%" -m pip install --only-binary :all: winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Globalization winrt-Windows.Graphics.Imaging winrt-Windows.Media.Ocr winrt-Windows.Storage.Streams
 if errorlevel 1 echo WARNING: Windows OCR components missing - exe builds without OCR.
@@ -34,7 +34,7 @@ set "WINRT="
 "%PY%" -c "import winrt" >nul 2>&1 && set "WINRT=--collect-submodules winrt"
 
 echo Building...
-"%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name findex %WINRT% "%HERE%findex_app.py"
+"%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name findex %WINRT% --collect-submodules watchdog "%HERE%findex_app.py"
 if errorlevel 1 (
     echo Build failed - the messages above say why.
     pause

@@ -7,8 +7,8 @@ PY="$VENV/bin/python"
 [ -x "$PY" ] || python3 -m venv "$VENV" || { echo "Python 3.9+ needed to build"; exit 1; }
 "$PY" -m pip install --upgrade pip --quiet
 "$PY" -m pip install --only-binary :all: pyinstaller || { echo "could not install PyInstaller"; exit 1; }
-"$PY" -m pip install --only-binary :all: pymupdf mutagen extract-msg pyobjc-framework-Vision \
+"$PY" -m pip install --only-binary :all: pymupdf mutagen extract-msg pyobjc-framework-Vision watchdog \
     || echo "WARNING: some components missing - app builds without them."
-"$PY" -m PyInstaller --noconfirm --clean --windowed --name findex findex_app.py \
+"$PY" -m PyInstaller --noconfirm --clean --windowed --name findex --collect-submodules watchdog findex_app.py \
     || { echo "Build failed."; exit 1; }
 echo "Done: dist/findex.app - copy it anywhere; it keeps its index next to itself."

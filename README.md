@@ -3,11 +3,12 @@
 Local filename **and** file-contents search for Windows (runs on macOS/Linux too).
 SQLite FTS5 index kept on disk, not in RAM.
 
-**Every file** under the indexed folders is recorded by name, size and date —
-photos, music, video, executables, the lot — so filename search covers the
-whole drive, like Everything does. On top of that, text is extracted from
-document types (PDF, Word, Excel, PowerPoint, plain text and code) for
-full-content search.
+**Every file and folder** under the indexed roots is recorded by name, size
+and date — photos, music, video, executables, the folders they sit in, the
+lot — so name search covers the whole drive, like Everything does. On top of
+that, text is extracted from document types (PDF, Word, Excel, PowerPoint,
+plain text and code) for full-content search, and one Everything-style search
+box drives it all: `C: content:dan ext:pdf !draft`.
 
 Fully portable: the folder is the app. Move it, rename it, copy it to the other
 PC or run it off a USB stick — nothing outside the folder is read or written,
@@ -37,9 +38,9 @@ Python 3.9+ must be on the machine; everything else takes care of itself:
 - Most components are **built in**: the pure-Python libraries for music/video
   tags and Outlook .msg files ship inside the folder (`vendor/`), so a fresh
   clone can use them immediately - no installs, no network.
-- PyMuPDF (PDF text) is compiled per platform, so it cannot be bundled; the
-  app installs it into its own environment automatically on launch when it is
-  missing, with progress shown in the Output pane.
+- PyMuPDF (PDF text) and watchdog (live updates) are compiled per platform,
+  so they cannot be bundled; the app installs them into its own environment
+  automatically on launch when missing, with progress in the Output pane.
 - OCR uses the engine **built into Windows and macOS** - nothing extra to
   install. Tesseract still works as a fallback on systems without one: the
   app offers to install it and resumes the index run by itself afterwards.
@@ -84,18 +85,29 @@ your system setting; the Appearance menu switches them manually.
 
 **Search tab**
 
-- The list starts full: your indexed files, newest first (capped at 5,000 rows
-  so it stays instant), with the status bar showing the true total. Typing
-  narrows it live; clearing the box brings the full list back.
-- *Filename* mode searches as you type, across every recorded file of any
-  type - instantly, backed by a trigram index over the names. `budget`, or
-  wildcards like `*2024*.pdf`.
-- *File contents* mode searches extracted text, also live as you type — the
-  word being typed matches as a prefix, and half-typed queries quietly fall
-  back to a literal word search. FTS5 syntax: `invoice payment`,
-  `"exact phrase"`, `a AND b`, `a NOT b`, `budg*`, `NEAR(risk policy, 10)`.
+- The list starts full: your indexed files and folders, newest first, with
+  the status bar showing the true total. Typing narrows it live; clearing
+  the box brings the full list back.
+- **One box, Everything-style.** Bare words match names as you type -
+  instantly, backed by a trigram index - with `*`/`?` wildcards. Add filters
+  in any order and combine them freely:
+  - `content:word` searches the text inside files (live, prefix-matching as
+    you type; `content:"exact phrase"` and FTS5 syntax like `content:budg*`
+    work; half-typed queries quietly fall back to a literal word search)
+  - `C:` or `D:\Photos` or `/Users/dan` limits results to that drive/folder
+  - `ext:pdf;docx` limits the type; `folder:` / `file:` limit the kind
+  - `!anything` leaves results out: `!draft`, `!ext:tmp`, `!C:\Windows`
+  - e.g. `C: content:dan ext:pdf !draft`
+- **Weighted results**: name matches come back exact-name first, then names
+  starting with the term, then newest; content matches are relevance-ranked
+  (bm25). Browsing with no terms is newest-first.
+- **Duplicates** lists files sharing the same name AND size, grouped with
+  the biggest first, plus a total of the space you would get back keeping
+  one copy of each - delete the extras straight from the list (Recycle
+  Bin / Bin, as always). The Type box narrows it.
 - The *Type* dropdown lists every file type actually in your index, with
-  counts; pick one or type a list like `pdf, docx`. Everything by default.
+  counts - plus a `folders` entry; pick one or type a list like `pdf, docx`.
+  Everything by default.
 - The list works like a file manager: Ctrl/Cmd-click and Shift-click select
   several files, Ctrl/Cmd+A selects everything shown. Copy or cut the
   selection (Ctrl/Cmd+C / X) and paste it straight into Explorer or Finder -
@@ -117,6 +129,12 @@ your system setting; the Appearance menu switches them manually.
   files whose size or timestamp changed, which is why repeat runs are quick.
 - *Auto re-index every N minutes* re-runs the same folders on a timer while the
   app is open.
+- *Live updates* watches the listed folders while the app is open and folds
+  changes into the index **within seconds** - new, modified, renamed and
+  deleted files and folders, with text extraction included - so search stays
+  current without waiting for the next run. Runs quietly alongside normal
+  indexing and is shut down with the app. (Uses the OS's own change
+  notifications via the `watchdog` component, installed automatically.)
 - *Optimise + compact* merges the FTS index and vacuums the database.
 - *Clear index...* deletes findex's database and starts fresh - after a
   confirmation, and never touching the files on your disk. Also available as
@@ -126,10 +144,12 @@ your system setting; the Appearance menu switches them manually.
 
 ```
 findex index D:\ E:\Documents          build or update the index
-findex search "quarterly AND revenue"  content search
-findex search "invoice" -e pdf docx -n 50
+findex watch D:\                       live updates until stopped (Ctrl+C)
+findex find "C: content:dan ext:pdf"   Everything-style search
+findex find "budget !draft folder:"
+findex search "quarterly AND revenue"  content search (raw FTS5)
 findex name "*.mp4" -n 100             filename search - any file type
-findex name "*budget*" -e pdf
+findex dupes                           duplicate files (same name + size)
 findex stats                           what is indexed
 findex vacuum                          optimise and compact
 findex clear                           delete the index, start fresh
@@ -140,8 +160,10 @@ findex gui                             open the desktop app
 
 ## What gets recorded
 
-- **Names**: every file, whatever its type. OneDrive online-only placeholders
-  are included (their names and sizes are known without downloading anything).
+- **Names**: every file AND folder, whatever the type. OneDrive online-only
+  placeholders are included (their names and sizes are known without
+  downloading anything). An index built by an older findex gains folder
+  support automatically - the next indexing run fills the folders in.
 - **Contents**: extracted from
   - `.pdf` (PyMuPDF) - with optional OCR of scans, see below
   - `.docx/.docm`, `.xlsx/.xlsm`, `.pptx/.pptm`, `.rtf`
@@ -195,7 +217,3 @@ out of the repo.
   on stop.
 - The index stores absolute file paths, so results from a machine you are not
   currently on will not open until you are back on it.
-
----
-
-*Built for my own use, in collaboration with AI (Anthropic's Claude). I described the problems, made the decisions and tested the results; Claude wrote much of the code. Shared as-is — a personal fix, not a product. No support and no warranty.*
