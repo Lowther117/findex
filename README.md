@@ -105,9 +105,13 @@ your system setting; the Appearance menu switches them manually.
   the biggest first, plus a total of the space you would get back keeping
   one copy of each - delete the extras straight from the list (Recycle
   Bin / Bin, as always). The Type box narrows it.
-- The *Type* dropdown lists every file type actually in your index, with
-  counts - plus a `folders` entry; pick one or type a list like `pdf, docx`.
-  Everything by default.
+- The *Type* dropdown sits right of the search bar. **Groups** come first -
+  Images, Videos, Audio, Documents, Compressed, Code, Programs, Emails - each
+  covering its whole family of extensions in one pick, then every file type
+  actually in your index individually, all with live counts, plus a `folders`
+  entry. Type your own list too (`pdf, docx`, or mix in a group: `pdf,
+  images`). The list rebuilds itself every time it opens, so it is never
+  stale or empty. Everything by default.
 - The list works like a file manager: Ctrl/Cmd-click and Shift-click select
   several files, Ctrl/Cmd+A selects everything shown. Copy or cut the
   selection (Ctrl/Cmd+C / X) and paste it straight into Explorer or Finder -

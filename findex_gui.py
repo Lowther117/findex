@@ -148,6 +148,30 @@ WINRT_PACKAGES = [
     "winrt-Windows.Storage.Streams",
 ]
 
+# Type-dropdown groups: pick "Images" and every extension in the family is
+# included. Counts shown against each group come from the index itself.
+TYPE_GROUPS = {
+    "images": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif",
+               ".tiff", ".heic", ".heif", ".svg", ".ico", ".raw", ".cr2",
+               ".nef", ".arw", ".dng", ".psd"],
+    "videos": [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".webm",
+               ".flv", ".mpg", ".mpeg", ".ts", ".3gp", ".vob"],
+    "audio": [".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus",
+              ".wma", ".wav", ".aiff", ".mid", ".midi"],
+    "documents": [".pdf", ".doc", ".docx", ".docm", ".xls", ".xlsx", ".xlsm",
+                  ".ppt", ".pptx", ".pptm", ".odt", ".ods", ".odp", ".rtf",
+                  ".txt", ".md", ".epub", ".pages", ".numbers", ".key",
+                  ".csv"],
+    "compressed": [".zip", ".rar", ".7z", ".gz", ".bz2", ".xz", ".tar",
+                   ".cbz", ".cbr", ".iso", ".dmg"],
+    "code": [".py", ".js", ".ts", ".html", ".htm", ".css", ".c", ".h",
+             ".cpp", ".cs", ".java", ".sql", ".sh", ".bat", ".cmd", ".ps1",
+             ".json", ".xml", ".yml", ".yaml", ".ini", ".cfg", ".lua",
+             ".gd"],
+    "programs": [".exe", ".msi", ".app", ".dll", ".apk", ".deb", ".pkg"],
+    "emails": [".eml", ".msg"],
+}
+
 LIGHT_PALETTE = {
     "bg": "#f5f6f8", "fg": "#16191d", "field": "#ffffff",
     "btn": "#e8eaee", "btn_hi": "#dde0e6",
@@ -886,6 +910,19 @@ class FindexApp:
                       "get back. The Type box narrows it; any search brings "
                       "the normal list back.")
 
+        self.type_box = ttk.Combobox(top, textvariable=self.var_exts,
+                                     width=17, height=28,
+                                     values=["All types"],
+                                     postcommand=self._refresh_types)
+        self.type_box.pack(side="left", padx=(8, 0))
+        self.tip(self.type_box,
+                 "Filter by type. Groups cover a whole family - Images, "
+                 "Videos, Audio, Documents, Compressed... - and below them "
+                 "every file type actually in your index, with counts, plus "
+                 "a 'folders' entry. Pick one or type your own list like: "
+                 "pdf, docx. 'All types' or an empty box means everything. "
+                 "The list refreshes itself each time it opens.")
+
         opts = ttk.Frame(self.tab_search)
         opts.pack(fill="x", padx=12, pady=(0, 4))
 
@@ -898,18 +935,6 @@ class FindexApp:
                        "!draft  finds PDFs on C: containing 'dan' whose name "
                        "doesn't contain 'draft'. Help > Search syntax has "
                        "the full list.")
-
-        lbl = ttk.Label(opts, text="Type:")
-        lbl.pack(side="left")
-        self.type_box = ttk.Combobox(opts, textvariable=self.var_exts,
-                                     width=16, height=25,
-                                     values=["All types"])
-        self.type_box.pack(side="left", padx=4)
-        for w in (lbl, self.type_box):
-            self.tip(w, "Every file type actually in your index, with counts "
-                        "- plus a 'folders' entry. Pick one, or type your own "
-                        "list like: pdf, docx, xlsx. 'All types' or an empty "
-                        "box means everything.")
 
         lbl = ttk.Label(opts, text="Max results:")
         lbl.pack(side="left", padx=(20, 4))
@@ -1189,15 +1214,21 @@ class FindexApp:
                                             lambda: self.run_search(live=True))
 
     def _type_filter(self):
-        """The Type box: extensions, plus the special 'folders' entry which
+        """The Type box: extensions, group names (Images, Videos...) which
+        expand to their whole family, and the special 'folders' entry which
         becomes a kind filter rather than an extension."""
         exts = parse_exts(self.var_exts.get())
         kind = None
         if exts:
-            rest = [e for e in exts if e not in ("folder", "folders", "dir")]
-            if len(rest) != len(exts):
-                kind = "folder"
-            exts = rest or None
+            expanded = []
+            for e in exts:
+                if e in ("folder", "folders", "dir"):
+                    kind = "folder"
+                elif e in TYPE_GROUPS:
+                    expanded += [x.lstrip(".") for x in TYPE_GROUPS[e]]
+                else:
+                    expanded.append(e)
+            exts = expanded or None
         return exts, kind
 
     def run_search(self, live=False):
@@ -2007,6 +2038,40 @@ class FindexApp:
 
     # -- stats + database --------------------------------------------------
 
+    def _build_type_values(self, kinds, dirs):
+        """Dropdown entries: groups with counts first (only those with files
+        in the index), then every indexed type individually."""
+        counts = {e: n for e, n in kinds}
+        values = ["All types"]
+        if dirs:
+            values.append("folders ({:,})".format(dirs))
+        for group, exts in TYPE_GROUPS.items():
+            n = sum(counts.get(e, 0) for e in exts)
+            if n:
+                values.append("{} ({:,})".format(group.capitalize(), n))
+        values += ["{} ({:,})".format(e.lstrip("."), n) for e, n in kinds]
+        return values
+
+    def _refresh_types(self):
+        """Rebuild the Type dropdown from the live index. Runs every time the
+        dropdown opens, so the list can never be stale or empty."""
+        try:
+            conn = findex.open_db_ro(self.var_db.get())
+            kinds = conn.execute(
+                "SELECT ext, COUNT(*) FROM files "
+                "WHERE ext IS NOT NULL AND ext != '' "
+                "GROUP BY ext ORDER BY COUNT(*) DESC LIMIT 500").fetchall()
+            dirs = 0
+            try:
+                dirs = conn.execute("SELECT COUNT(*) FROM files "
+                                    "WHERE is_dir=1").fetchone()[0]
+            except sqlite3.OperationalError:
+                pass
+            conn.close()
+            self.type_box["values"] = self._build_type_values(kinds, dirs)
+        except Exception:                                      # noqa: BLE001
+            pass    # keep whatever the box already lists
+
     def refresh_stats(self):
         db = self.var_db.get()
         try:
@@ -2031,11 +2096,7 @@ class FindexApp:
                 "WHERE ext IS NOT NULL AND ext != '' "
                 "GROUP BY ext ORDER BY COUNT(*) DESC LIMIT 500").fetchall()
             conn.close()
-            values = ["All types"]
-            if dirs:
-                values.append("folders ({:,})".format(dirs))
-            values += ["{} ({:,})".format(e.lstrip("."), n) for e, n in kinds]
-            self.type_box["values"] = values
+            self.type_box["values"] = self._build_type_values(kinds, dirs)
             size = os.path.getsize(db) if os.path.exists(db) else 0
             text = ("{:,} files{} indexed   |   {} of text   |   database {}  "
                     " |   {:,} errors".format(
