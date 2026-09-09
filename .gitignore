@@ -1,0 +1,28 @@
+# machine-specific - each computer builds/creates its own
+.venv-win/
+.venv-mac/
+.venv-linux/
+.venv/
+findex.db
+findex.db-*
+findex_gui.json
+
+# noise
+__pycache__/
+*.pyc
+*.bak
+.DS_Store
+.fuse_hidden*
+
+# optional standalone builds (build-exe.bat / build-app.command)
+.venv-build/
+.venv-build-mac/
+build/
+dist/
+*.spec
+
+# build logs and self-test reports (build-exe.bat / build-app.command)
+build-win-log.txt
+build-mac-log.txt
+findex-selftest.txt
+findex-crash.log
