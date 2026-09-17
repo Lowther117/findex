@@ -291,8 +291,41 @@ _WS = re.compile(r"[ \t\r\f\v\u00a0]+")
 _NL = re.compile(r"\n{3,}")
 
 
+# Word, PowerPoint and Excel cut a word into several "runs" whenever the
+# formatting, the spell-check state or an edit boundary changes part-way
+# through it: "Hello" is stored as <w:t>Hel</w:t>...<w:t>lo</w:t>. Turning
+# every tag into a space then indexed "Hel lo" and a search for the word
+# missed the file. So two text runs with nothing but tags between them are
+# stitched together first - unless one of those tags is a real break (end of
+# paragraph or table cell, tab, line break, the next Excel string).
+_RUN_GAP = re.compile(rb"</((?:w:|a:)?)t>((?:<[^>]+>)*?)<\1t(?:\s[^>]*)?>")
+_RUN_SEP = re.compile(
+    rb"</(?:w:|a:)?p>|<(?:w:|a:)p[ >]|</(?:w:|a:)tc>"
+    rb"|<(?:w:|a:)(?:tab|br|cr|noBreakHyphen|ptab)\b"
+    rb"|</si>|</is>|<rPh\b")
+# OpenDocument keeps the text between the tags instead, so there it is the
+# inline tags themselves that must vanish rather than become a space.
+_ODF_INLINE = re.compile(rb"</?text:(?:span|a)(?:\s[^>]*)?>")
+_HTML_INLINE = re.compile(
+    rb"</?(?:span|b|i|em|strong|u|sub|sup|small|font|mark)(?:\s[^>]*)?>", re.I)
+_ODF_SPACE = re.compile(rb"<text:s(?:\s[^>]*)?/>")
+
+
+def _join_runs(data):
+    if b"</w:t>" in data or b"</a:t>" in data or b"</t>" in data:
+        data = _RUN_GAP.sub(
+            lambda m: m.group(0) if _RUN_SEP.search(m.group(2)) else b"", data)
+    if b"<span" in data or b"</em>" in data or b"</i>" in data or b"</b>" in data:
+        data = _HTML_INLINE.sub(b"", data)       # EPUB: <span class="dropcap">T</span>he
+    if b"<text:" in data:
+        data = _ODF_SPACE.sub(b" ", data)
+        data = _ODF_INLINE.sub(b"", data)
+    return data
+
+
 def _xml_text(data):
     """Strip XML tags, keeping paragraph breaks where the format marks them."""
+    data = _join_runs(data)
     data = data.replace(b"</w:p>", b"\n</w:p>")
     data = data.replace(b"</a:p>", b"\n</a:p>")
     data = data.replace(b"</text:p>", b"\n</text:p>")
@@ -300,6 +333,14 @@ def _xml_text(data):
     data = data.replace(b"<w:br/>", b"\n")
     txt = _TAG.sub(b" ", data).decode("utf-8", "ignore")
     return html.unescape(txt)
+
+
+# Bump when an extractor gets better at the SAME bytes, and list the types it
+# affects: the next full index run re-reads those once, unchanged or not.
+#   2 - Office/OpenDocument/EPUB words split across formatting runs are joined
+EXTRACT_VERSION = 2
+REEXTRACT_EXTS = frozenset((".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm",
+                            ".odt", ".ods", ".odp", ".epub"))
 
 
 # Cap on the bytes inflated from any one member of a zip-based document. A
@@ -1176,6 +1217,14 @@ def cmd_index(args):
 
     conn = open_db(args.db)
     roots = args.roots or saved_roots(conn)
+    # Files read by an older, worse extractor are read once more even though
+    # they have not changed - only the cheap zip-based formats, never PDFs/OCR.
+    try:
+        stale_exts = (REEXTRACT_EXTS if int(get_meta(conn, "extract_version") or 1)
+                      < EXTRACT_VERSION else frozenset())
+    except (TypeError, ValueError):
+        stale_exts = REEXTRACT_EXTS
+    roots_before = [os.path.normcase(os.path.abspath(r)) for r in saved_roots(conn)]
     if not roots:
         sys.stderr.write("No folders given and none remembered - indexing "
                          "your home folder.\n")
@@ -1275,7 +1324,8 @@ def cmd_index(args):
                                 size, int(is_dir), "index"))
             if (prev and not args.rebuild
                     and prev[1] == size and abs(prev[2] - mtime) < 1e-6
-                    and not (wants_text and prev[3] == "listed")):
+                    and not (wants_text and prev[3] == "listed")
+                    and not (wants_text and ext in stale_exts)):
                 # Unchanged - and not a name-only row that newly qualifies for
                 # extraction (e.g. --include-cloud turned on).
                 stats["unchanged"] += 1
@@ -1341,6 +1391,11 @@ def cmd_index(args):
     elapsed = time.time() - start
     set_meta(conn, "last_index", int(time.time()))
     set_meta(conn, "last_roots", "\n".join(os.path.abspath(r) for r in roots))
+    walked = [os.path.normcase(os.path.abspath(r)).rstrip(os.sep) + os.sep for r in roots]
+    if all(any((r.rstrip(os.sep) + os.sep).startswith(w) for w in walked)
+           for r in roots_before):
+        # every remembered location was covered, so nothing old is left behind
+        set_meta(conn, "extract_version", EXTRACT_VERSION)
     remember_roots(conn, all_roots, indexed=True)
     set_meta(conn, "last_summary",
              "{:,} seen, {:,} updated, {:,} unchanged".format(

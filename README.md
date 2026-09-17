@@ -104,6 +104,13 @@ statistics line tells you when the index was last updated and what that run
 did. *Re-extract everything* is the only thing that forces a full re-read; it
 asks for confirmation and is never remembered between sessions.
 
+The one exception is automatic and small: when a findex update improves how a
+file type is read, the next index run re-reads just those types once, changed
+or not. (The current one: Word, PowerPoint, Excel, LibreOffice and EPUB store
+a word in pieces whenever the formatting changes part-way through it - "safe"
++ "guarding" - and those pieces are now joined, so the whole word is found.
+PDFs and OCR are not re-run for this.)
+
 ## The app
 
 Every control describes itself: hover over it and the description appears
