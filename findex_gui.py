@@ -1315,6 +1315,7 @@ class FindexApp:
         if sys.platform == "darwin":
             self.jtree.bind("<Control-Button-1>", self._journal_popup)
         self.jctx = tk.Menu(self.root, tearoff=0)
+        self._menus.append(self.jctx)
         self.jctx.add_command(label="Open", command=self._journal_open)
         self.jctx.add_command(label="Show in folder",
                               command=self._journal_reveal)
@@ -1903,6 +1904,8 @@ class FindexApp:
                 if move:
                     shutil.move(p, target)
                     moved_from.append(p)
+                elif os.path.isdir(p):      # folders are results too
+                    shutil.copytree(p, target)
                 else:
                     shutil.copy2(p, target)
                 done += 1

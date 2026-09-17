@@ -302,6 +302,17 @@ def _xml_text(data):
     return html.unescape(txt)
 
 
+# Cap on the bytes inflated from any one member of a zip-based document. A
+# few MB of zip can declare gigabytes of XML; reading it whole took a worker
+# (and with a full pool, the machine) out of memory.
+MAX_PART_BYTES = 32 * 1024 * 1024
+
+
+def _zread(z, name):
+    with z.open(name) as fh:
+        return fh.read(MAX_PART_BYTES)
+
+
 def _zip_parts(path, wanted):
     """Pull the named XML parts out of an OOXML package and flatten to text."""
     out = []
@@ -310,7 +321,7 @@ def _zip_parts(path, wanted):
         names = [n for n in z.namelist() if wanted(n)]
         names.sort(key=lambda n: (len(n), n))
         for n in names:
-            chunk = _xml_text(z.read(n))
+            chunk = _xml_text(_zread(z, n))
             out.append(chunk)
             total += len(chunk)
             if total > MAX_TEXT_CHARS:
@@ -672,7 +683,7 @@ def _xlsx(path):
         for n in names:
             if total > MAX_TEXT_CHARS:
                 break
-            for m in _XL_INLINE.finditer(z.read(n)):
+            for m in _XL_INLINE.finditer(_zread(z, n)):
                 chunk = _xml_text(m.group(1))
                 out.append(chunk)
                 total += len(chunk)
@@ -1030,6 +1041,11 @@ def walk(roots):
             for entry in it:
                 try:
                     path = os.path.join(d, entry.name)
+                    try:    # a name that is not valid Unicode cannot be
+                            # stored in SQLite - it used to end the whole run
+                        entry.name.encode("utf-8")
+                    except UnicodeEncodeError:
+                        continue
                     if entry.is_dir(follow_symlinks=False):
                         low = entry.name.lower()
                         if low in SKIP_DIRS or low.startswith("$"):
@@ -1070,6 +1086,10 @@ ON CONFLICT(path) DO UPDATE SET
     chars=excluded.chars, status=excluded.status, error=excluded.error,
     is_dir=excluded.is_dir
 """
+
+
+DROP_TEXT = ("DELETE FROM docs WHERE rowid IN "
+             "(SELECT id FROM files WHERE path=? AND chars>0)")
 
 
 def flush(conn, executor, batch, stats):
@@ -1113,6 +1133,9 @@ def flush_names(conn, batch, stats):
     now = time.time()
     cur = conn.cursor()
     cur.execute("BEGIN")
+    # a file that HAD text and is now name-only (grew past the size cap,
+    # became a cloud placeholder): its old text must not stay searchable
+    cur.executemany(DROP_TEXT, [(rec[0],) for rec in batch])
     cur.executemany(
         UPSERT,
         [(path, name, ext, size, mtime, now, 0,
@@ -1157,6 +1180,27 @@ def cmd_index(args):
         sys.stderr.write("No folders given and none remembered - indexing "
                          "your home folder.\n")
         roots = [os.path.expanduser("~")]
+
+    # A location that is not there right now - an unplugged drive, a share
+    # that is offline - must be left out, not walked: the walk would find
+    # nothing, and every row under it would then be pruned as "deleted".
+    absent = [r for r in roots if not os.path.isdir(lp(os.path.abspath(r)))]
+    if absent:
+        sys.stderr.write("Not found, left alone: {}\n".format(
+            ", ".join(absent)))
+        roots = [r for r in roots if r not in absent]
+        if not roots:
+            conn.close()
+            return 1
+
+    # A root inside another root would be walked twice: the second pass saw
+    # every file as new, so each run re-read them and journaled them "added".
+    all_roots, roots, seen_pfx = roots, [], []
+    for r in sorted(all_roots, key=lambda r: len(os.path.abspath(r))):
+        pfx = os.path.normcase(os.path.abspath(r)).rstrip(os.sep) + os.sep
+        if not any(pfx.startswith(k) for k in seen_pfx):
+            roots.append(r)
+            seen_pfx.append(pfx)
 
     if get_meta(conn, "names_ready") != "1":
         try:
@@ -1279,7 +1323,7 @@ def cmd_index(args):
                 cur.execute("DELETE FROM docs WHERE rowid=?", (meta[0],))
                 cur.execute("DELETE FROM files WHERE id=?", (meta[0],))
                 journal.append((now, "deleted", path, None, meta[1],
-                                0, "index"))
+                                int(meta[3] == "folder"), "index"))
             conn.commit()
         print("\nPruned {:,} files that no longer exist".format(len(stale)))
         kept = len(known) - len(stale)
@@ -1297,7 +1341,7 @@ def cmd_index(args):
     elapsed = time.time() - start
     set_meta(conn, "last_index", int(time.time()))
     set_meta(conn, "last_roots", "\n".join(os.path.abspath(r) for r in roots))
-    remember_roots(conn, roots, indexed=True)
+    remember_roots(conn, all_roots, indexed=True)
     set_meta(conn, "last_summary",
              "{:,} seen, {:,} updated, {:,} unchanged".format(
                  stats["seen"], stats["done"] + stats["listed"],
@@ -1370,6 +1414,10 @@ def journal_from_events(raw):
 
 def _watch_skip(path):
     """Is this path inside a folder that indexing skips (SKIP_DIRS)?"""
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return True                # walk() leaves these out too
     parts = path.replace("\\", "/").lower().split("/")
     return any(p in SKIP_DIRS or p.startswith("$") for p in parts[:-1])
 
@@ -1472,7 +1520,7 @@ def cmd_watch(args):
         """Stat + record one path; extract text when the type qualifies.
         Returns 1 when a row was written."""
         try:
-            st = os.stat(lp(path))
+            st = os.lstat(lp(path))     # like walk(): links are not followed
         except OSError:
             return 0
         name = os.path.basename(path)
@@ -1490,6 +1538,7 @@ def cmd_watch(args):
                  and (st.st_size <= MAX_FILE_BYTES or ext in AUDIO_EXTS)
                  and (include_cloud or not cloud))
         if not wants:
+            cur.execute(DROP_TEXT, (path,))
             cur.execute(UPSERT, (path, name, ext, st.st_size, st.st_mtime,
                                  now, 0, "listed", None, 0))
             return 1
@@ -1544,7 +1593,8 @@ def cmd_watch(args):
                 for path, was_dir in todo.items():
                     if _watch_skip(path):
                         continue
-                    if was_dir and os.path.isdir(lp(path)):
+                    if (was_dir and os.path.isdir(lp(path))
+                            and not os.path.islink(lp(path))):
                         # a whole folder appeared (created or moved in): its
                         # contents may never get events of their own - walk it
                         updated += upsert_one(cur, path)
@@ -1792,6 +1842,13 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
     if q["content_not"]:
         conds.append("f.id NOT IN (SELECT rowid FROM docs WHERE docs MATCH ?)")
         not_params = [" ".join(q["content_not"])]
+        try:    # !content:don't - broken FTS syntax gets the same fallback
+                # as content: does, instead of a bare "Query error"
+            conn.execute("SELECT rowid FROM docs WHERE docs MATCH ? LIMIT 1",
+                         not_params).fetchone()
+        except sqlite3.OperationalError:
+            not_params = [_safe_content(q["content_not"])
+                          or '"findex0nomatch0"']
 
     lim, lim_params = "", []
     if int(limit) > 0:
