@@ -384,3 +384,7 @@ Explorer, which has its own opinions about long paths.)
   on stop.
 - The index stores absolute file paths, so results from a machine you are not
   currently on will not open until you are back on it.
+
+## Licence
+
+MIT No Attribution (MIT-0): do whatever you like with it - no credit needed, no warranty. See `LICENSE`.
