@@ -8,9 +8,17 @@ Run it:
 
 Search tab  one Everything-style box, live as you type: names by default,
             content:word for text inside files, C:\\ path scopes, ext: filters,
-            ! exclusions - plus a duplicate-file finder.
+            ! exclusions.
 Index tab   pick folders, run an index, watch progress, auto re-index on a
             timer, or turn on live updates (real-time watching).
+Changes     the journal of everything that changed in the indexed folders.
+Health      what is wrong with the tree: empty folders, bad names, long
+            paths, stale/zero-byte/temp files, corrupt files, mismatched
+            types, secrets in documents - and an exportable report.
+Duplicates  same name+size, byte-identical, or near-identical text.
+Rename      bulk renaming from a search, with a preview and an undo.
+Verify      snapshots of a tree and proof that a copy or later state matches.
+The last four live in findex_tabs.py.
 
 Settings are kept in findex_gui.json next to this script. Indexing runs as a
 separate findex.py process so the window never freezes and Stop always works.
@@ -41,6 +49,7 @@ if not getattr(sys, "frozen", False) and _SCRIPT_DIR not in sys.path:
 
 import findex  # noqa: E402
 import theme   # noqa: E402  - the shared light/dark palettes + ttk styling
+import findex_tabs  # noqa: E402  - the Health / Duplicates / Rename / Verify tabs
 
 # One source of truth for "the folder findex owns" - beside the scripts, or
 # beside findex.exe / findex.app in a standalone build. See findex._app_dir.
@@ -682,7 +691,7 @@ def fmt_time(mtime):
 # Application
 # ---------------------------------------------------------------------------
 
-class FindexApp:
+class FindexApp(findex_tabs.ToolTabs):
 
     def __init__(self, root, settings):
         self.root = root
@@ -864,6 +873,11 @@ class FindexApp:
                       command=self.select_all)
         m.add_command(label="Delete...", accelerator="Del",
                       command=self.delete_files)
+        m.add_separator()
+        m.add_command(label="Rename selected...",
+                      command=self.rename_from_search)
+        m.add_command(label="Undo last rename batch...",
+                      command=self.rename_undo)
         bar.add_cascade(label="Edit", menu=m)
 
         m = tk.Menu(bar, tearoff=0)
@@ -947,6 +961,7 @@ class FindexApp:
                                    foreground=pal["hit_fg"])
         self.preview.tag_configure("path", foreground=c["accent"])
         self.tree.tag_configure("odd", background=pal["row_alt"])
+        self._theme_tools(c, pal)
         self.roots_list.configure(background=c["field"],
                                   foreground=c["field_text"],
                                   selectbackground=c["accent"],
@@ -1072,6 +1087,7 @@ class FindexApp:
         self._build_search_tab()
         self._build_index_tab()
         self._build_changes_tab()
+        self._build_tool_tabs()          # Health, Duplicates, Rename, Verify
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         bar = ttk.Frame(self.root)
@@ -1118,15 +1134,6 @@ class FindexApp:
                          command=lambda: self.run_search(live=False))
         btn.pack(side="left", padx=(8, 0))
         self.tip(btn, "Run the search now - the same as pressing Enter.")
-
-        btn = ttk.Button(top, text="Duplicates", width=11,
-                         command=self.find_dupes)
-        btn.pack(side="left", padx=(6, 0))
-        self.tip(btn, "List files that share the same name AND size - the "
-                      "classic duplicate candidates - grouped together, "
-                      "biggest first, with a total of the space you could "
-                      "get back. The Type box narrows it; any search brings "
-                      "the normal list back.")
 
         self.type_box = ttk.Combobox(top, textvariable=self.var_exts,
                                      width=17, height=28,
@@ -1241,6 +1248,9 @@ class FindexApp:
         self.ctx.add_command(label="Copy full path", command=self.copy_selected)
         self.ctx.add_command(label="Select all", command=self.select_all)
         self.ctx.add_separator()
+        self.ctx.add_command(label="Rename these...",
+                             command=self.rename_from_search)
+        self.ctx.add_separator()
         self.ctx.add_command(label="Delete...", command=self.delete_files)
 
     # -- Changes tab: the journal ------------------------------------------
@@ -1330,10 +1340,13 @@ class FindexApp:
 
     def _on_tab_changed(self, _event=None):
         try:
-            if self.nb.tab(self.nb.select(), "text").strip() == "Changes":
-                self.refresh_journal()
+            name = self.nb.tab(self.nb.select(), "text").strip()
         except tk.TclError:
-            pass
+            return
+        if name == "Changes":
+            self.refresh_journal()
+        else:
+            self._tool_tab_shown(name)
 
     def _journal_debounce(self):
         if self._jafter:
@@ -1696,52 +1709,6 @@ class FindexApp:
             self.msgs.put(("results", gen, rows, total))
         except sqlite3.OperationalError as exc:
             self.msgs.put(("search_error", gen, str(exc)))
-        except Exception as exc:                               # noqa: BLE001
-            self.msgs.put(("search_error", gen,
-                           "{}: {}".format(type(exc).__name__, exc)))
-        finally:
-            if conn is not None:
-                conn.close()
-
-    def find_dupes(self):
-        """Fill the list with duplicate candidates: files sharing name AND
-        size, grouped together, biggest first."""
-        self.search_gen += 1
-        gen = self.search_gen
-        db = self.var_db.get()
-        try:
-            limit = max(0, int(self.var_limit.get()))
-        except (tk.TclError, ValueError):
-            limit = 0
-        exts, _kind = self._type_filter()
-        self.var_status.set("Looking for duplicates...")
-        threading.Thread(target=self._dupes_worker,
-                         args=(gen, db, limit, exts), daemon=True).start()
-
-    def _dupes_worker(self, gen, db, limit, exts):
-        conn = None
-        try:
-            try:
-                conn = findex.open_db_ro(db)
-            except sqlite3.Error:
-                conn = findex.open_db(db)
-            groups, files, wasted = findex.dupe_summary(conn, exts)
-            raw = findex.dupe_rows(conn, limit, exts)
-            rows = [{"path": r[0], "name": os.path.basename(r[0]),
-                     "size": r[1], "mtime": r[2], "is_dir": False,
-                     "snippet": "{:,} files share this name and size - keep "
-                                "the one you want, the rest are duplicate "
-                                "candidates".format(r[3])}
-                    for r in raw]
-            self.msgs.put(("results", gen, rows, None))
-            if groups:
-                self.msgs.put(("status",
-                               "{:,} duplicate set(s) - {:,} files, {} to be "
-                               "had back if each set kept one copy".format(
-                                   groups, files, findex.human(wasted))))
-            else:
-                self.msgs.put(("status",
-                               "No duplicates found (matched by name + size)"))
         except Exception as exc:                               # noqa: BLE001
             self.msgs.put(("search_error", gen,
                            "{}: {}".format(type(exc).__name__, exc)))
@@ -2407,6 +2374,13 @@ class FindexApp:
                         self.var_status.set("Query error: " + err)
                 elif kind == "status":
                     self.var_status.set(msg[1])
+                elif kind == "call":           # run fn(*args) on the Tk thread
+                    _, fn, args = msg
+                    try:
+                        fn(*args)
+                    except Exception as exc:                   # noqa: BLE001
+                        self.log_line("ui error: {}: {}".format(
+                            type(exc).__name__, exc))
                 elif kind == "log":
                     self.log_line(msg[1])
                 elif kind == "watch":
@@ -2427,6 +2401,9 @@ class FindexApp:
                                       "(exit {}) --".format(code))
                 elif kind == "progress":
                     p = msg[1]
+                    if self.proc_kind in findex_tabs.TOOL_KINDS:
+                        self._tool_progress(p)
+                        continue
                     pct_txt = ""
                     est = self._progress_est
                     if est > 0:
@@ -2465,11 +2442,14 @@ class FindexApp:
             self.var_status.set("File tree exported to " + self._tree_out)
             reveal_path(self._tree_out)
         self.log_line("-- {} {} --\n".format(self.proc_kind, word))
+        kind = self.proc_kind
         self.proc_kind = ""
         self.refresh_stats()
         self.run_search(live=False)      # refresh the visible list
         if getattr(self, "_jloaded", False):
             self.refresh_journal()
+        if kind in findex_tabs.TOOL_KINDS:
+            self._tool_finished(kind, code)
         self._maybe_start_watch()        # live updates waiting on setup/run
 
     def log_line(self, text):

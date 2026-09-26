@@ -27,6 +27,12 @@ and no machine-specific path is ever stored.
 | `findex_gui.py` | the app | the app | The Tkinter window. The launchers run it; `python findex_gui.py` works too. |
 | `findex_app.py` | build only | build only | Entry point compiled into the standalone exe/app. Not run directly. |
 | `theme.py` | the app | the app | The shared light/dark palette and ttk styling the window uses. Not run directly. |
+| `findex_tabs.py` | the app | the app | The Health, Duplicates, Rename and Verify tabs. Part of the app; not run directly. |
+| `findex_hash.py` | engine | engine | Content fingerprints and type detection: `findex hash`, `findex dupes --exact / --near`. |
+| `findex_report.py` | engine | engine | The health report: `findex report`. |
+| `findex_secrets.py` | engine | engine | Passwords, keys and tokens in indexed text: `findex secrets`. |
+| `findex_verify.py` | engine | engine | Snapshots and verification: `findex snapshot`, `findex verify`. |
+| `findex_rename.py` | engine | engine | Bulk rename with preview and undo: `findex rename`. |
 | `build-exe.bat` | optional | - | Builds `dist\findex\findex.exe` - a standalone app folder that needs no Python. Only if you want findex as an ordinary app. |
 | `build-app.command` | - | optional | Builds `dist/findex.app` - the same thing for the Mac. |
 | `ensure_python.ps1` | helper | - | Used by `build-exe.bat` to find (or install) a real Python. Not run directly. |
@@ -39,8 +45,14 @@ indexing run starts from scratch.
 
 ```
 Findex/
-  findex.py           engine + CLI
-  findex_gui.py       Tkinter desktop app
+  findex.py           engine + CLI (indexing, search, watch, journal, tree)
+  findex_hash.py      } tools built on the index - each adds its own
+  findex_report.py    } commands to the CLI: hash, report, secrets,
+  findex_secrets.py   } snapshot, verify, rename. findex.py imports
+  findex_verify.py    } them when present; a missing one just means
+  findex_rename.py    } its commands are absent
+  findex_gui.py       Tkinter desktop app (Search, Index, Changes tabs)
+  findex_tabs.py      the Health, Duplicates, Rename and Verify tabs
   theme.py            light/dark palette + styling for the app
   findex_app.py       entry point for the optional standalone build
   findex.bat          CLI launcher (Windows)
@@ -137,10 +149,8 @@ is remembered in `findex_gui.json`.
 - **Weighted results**: name matches come back exact-name first, then names
   starting with the term, then newest; content matches are relevance-ranked
   (bm25). Browsing with no terms is newest-first.
-- **Duplicates** lists files sharing the same name AND size, grouped with
-  the biggest first, plus a total of the space you would get back keeping
-  one copy of each - delete the extras straight from the list (Recycle
-  Bin / Bin, as always). The Type box narrows it.
+- Right-click > **Rename these...** hands the selected files to the Rename
+  tab as a hand-picked selection.
 - The *Type* dropdown sits right of the search bar. **Groups** come first -
   Images, Videos, Audio, Documents, Compressed, Code, Programs, Emails - each
   covering its whole family of extensions in one pick, then every file type
@@ -216,6 +226,95 @@ is remembered in `findex_gui.json`.
   0 = forever); older ones are pruned at the end of each index run.
   **Clear journal...** empties it; the index is untouched.
 
+**Health tab** - what is wrong with the tree, read from the index
+
+- **Scan** works every category out from the index alone - nothing on disk
+  is opened - so a 500,000-file tree takes seconds. Pick a category on the
+  left and its files list on the right; the list works like the Search
+  list (open, show in folder, copy path, Delete to the Recycle Bin).
+  Categories: empty folders; zero-byte files; paths over the 260-character
+  Windows limit; names Windows refuses (`< > : " | ? *`, trailing spaces or
+  dots, `CON`/`NUL`/`COM1`, macOS-style non-NFC Unicode); case clashes (two
+  names in one folder differing only by case - fine on a Mac, a collision
+  on Windows, OneDrive and SharePoint); temp and lock files (`~$doc.docx`,
+  `*.tmp`, `Thumbs.db`, `.DS_Store`, `*.crdownload`...); stale files
+  (untouched for N years - the spinner sets N); the largest files; the
+  deepest paths; unreadable or corrupt files (extraction failed, or the
+  file could not be opened); type mismatches; possible secrets.
+- **Fingerprint types** reads the first 16 KB of every file to learn what it
+  actually is - a PDF, a Word document, a JPEG, an executable - so the
+  *Type does not match name* category can be filled in: the `.pdf` that is
+  really an HTML error page, the `.docx` that is 1 byte of nothing, the
+  `.jpg` that is a PNG. Runs in the background with progress; Stop on the
+  Index tab cancels; a re-run only reads files not yet fingerprinted.
+- **Possible secrets** runs the extracted text through patterns for cloud
+  API keys, private key blocks, connection strings with passwords, tokens
+  and `password = ...` lines. Values are shown masked - the point is to find
+  the file, not to copy the secret into a report.
+- **Export report...** writes the lot: `.html` is a self-contained page with
+  the summary cards, age and type breakdowns, space by location and every
+  category; `.csv` is one finding per row; `.txt` and `.json` too.
+- Scope limits the report to one folder or drive.
+
+**Duplicates tab** - three answers to "is this a copy of that?"
+
+- **Same name and size** is the instant classic; no files are read. A
+  renamed copy is missed and two different files can share both.
+- **Identical contents** is proof: byte-for-byte equal files, whatever they
+  are called or where they live. Only files whose size matches another
+  file's are read at all, and only fingerprint matches (first 16 KB) are
+  hashed in full, so on a real tree it reads a fraction of the data. Hashes
+  are stored in the index and dropped the moment a file changes, so a
+  re-run only reads what is new. Progress in the status bar; Stop cancels.
+- **Near-identical text** finds documents whose extracted text is nearly
+  the same - the draft and the final, the same report saved twice under
+  different names. It works on text findex already extracted (nothing is
+  opened); the first run fingerprints every document once.
+- Results are sets you can expand, with the copies underneath. **Keep
+  newest, select the rest** (also oldest / first, on the right-click menu)
+  selects every copy but one in each set - then Delete sends the selection
+  to the Recycle Bin. Nothing is deleted until you do that. **Use stored
+  hashes only** skips reading files and lists what earlier runs proved.
+
+**Rename tab** - bulk renaming from a search, previewed first, undoable
+
+- The selection is a findex search (`D:\Photos ext:jpg`, `content:invoice
+  !draft`...) or a hand-picked set sent over from the Search tab. Every
+  result is a candidate.
+- Operations, applied in order: find/replace (plain or regex with `\1`
+  groups, optionally ignoring case); case (lower / upper / title /
+  sentence); **Normalise** - safe everywhere: NFC Unicode, illegal
+  characters to `_`, single spaces, no leading/trailing spaces or dots,
+  reserved names prefixed; a date prefix from the modified date (any
+  strftime format); a maximum length; `.EXT` to `.ext`. Folders are
+  included only when asked, and renaming one re-points everything beneath.
+- The preview shows every file's new name and whether it is safe.
+  Collisions - two files landing on one name, or a name already taken on
+  disk or in the index - are skipped, never overwritten. Nothing changes
+  until **Apply renames...**, which renames on disk and in the index as one
+  batch, recorded in the journal.
+- **Undo last batch...** reverses it in the opposite order (children were
+  renamed before parents, so they are undone parents-first). A file that
+  has since moved on is reported, not guessed at. `findex rename --history`
+  lists batches; any batch can be undone from the command line.
+
+**Verify tab** - prove a copy or a later state matches
+
+- **Save snapshot...** writes a manifest of a folder (or the whole index):
+  relative path, type, size, timestamp and, with **Hash every file first**,
+  a content hash per file. Slow with hashing on a big tree, but it lets
+  verify prove bytes rather than sizes and dates, and recognise moved files.
+- **Verify** compares a snapshot with: *the same place as the index has it
+  now* (what changed since - run an index first); *a copy at* another
+  folder - after a server move, a SharePoint migration, a backup to USB -
+  walked and hashed directly from disk so it need not be indexed; or
+  *another snapshot*. Results: changed, missing, added, **moved** (identical
+  content at a new path), likely moved (same name, size and time), touched
+  (same bytes, new timestamp), folders missing/added. Save the result as
+  a page, CSV, text or JSON.
+- Snapshots are small gzip files (a 500,000-file tree is a few MB); a
+  `.tsv` name writes them uncompressed.
+
 **Status strip** (along the bottom, on all tabs)
 
 - The progress bar mirrors the one on the Index tab, so you can start a run,
@@ -242,6 +341,22 @@ findex find "budget !draft folder:"
 findex search "quarterly AND revenue"  content search (raw FTS5)
 findex name "*.mp4" -n 100             filename search - any file type
 findex dupes                           duplicate files (same name + size)
+findex dupes --exact                   byte-identical files (hashes first)
+findex dupes --near                    near-identical documents (by text)
+findex hash                            fingerprints for exact duplicates
+findex hash --all                      + detected type of every file
+findex hash --full                     full hash of every file
+findex report                          health summary on the console
+findex report -o health.html           the full report (.html/.csv/.txt/.json)
+findex report --list bad-names         one category in full
+findex secrets                         passwords, keys, tokens in documents
+findex snapshot --under D:\Work --hash  manifest of a tree, with hashes
+findex verify before.fxsnap            what changed since (index now)
+findex verify before.fxsnap --folder E:\Work-copy --disk   check a copy
+findex verify before.fxsnap --against after.fxsnap
+findex rename "D:\Photos ext:jpg" --find IMG_ --replace ""   dry run
+findex rename "D:\Shared" --normalise --apply
+findex rename --undo                   reverse the last batch
 findex tree                            export the index as a tree (Downloads)
 findex tree -o C:\out.csv --under D:\Work
 findex journal                         what changed, newest first
@@ -254,6 +369,12 @@ findex gui                             open the desktop app
 ```
 
 `--db PATH` puts the index somewhere other than next to the script.
+`findex report --help` and friends list every option; the tool modules'
+docstrings (top of each `findex_*.py`) explain the reasoning.
+
+`findex verify` exits 0 when nothing differs and 1 when something does, so it
+can end a migration script. `findex rename` is a dry run unless `--apply` is
+given.
 
 The locations you index are remembered **in the index itself** - a `roots`
 table in `findex.db` - not in a settings file beside whichever copy of findex
@@ -300,6 +421,14 @@ the settings file the first time the app opens it, and keeps it from then on.
   ProgramData, AppData, $Recycle.Bin, node_modules, .git, virtual environments
   and similar. Note this is by folder *name*, so a data folder that happens to
   be called e.g. `recovery` or `env` is also skipped.
+- **Fingerprints** (only when asked - `findex hash`, the Duplicates tab's
+  identical mode, the Health tab's *Fingerprint types*, a hashed snapshot):
+  a quick BLAKE2b of the first 16 KB, the detected type from those bytes,
+  and a full-file BLAKE2b hash; plus a 64-bit text fingerprint (simhash) of
+  the extracted text for near-duplicate detection. All four live in the
+  `files` table and are dropped automatically the moment a file's size or
+  timestamp changes, so they can never go stale; the next hashing pass reads
+  only what is new. Indexing itself never reads a byte more than before.
 
 ## Optional: a standalone app
 

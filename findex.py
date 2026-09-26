@@ -8,11 +8,18 @@ Commands:
     findex find "QUERY"         Everything-style search (content:, C:\\, ext:, !)
     findex search "QUERY"       Full-text search of file contents
     findex name "PATTERN"       Filename search (substring or *wildcard*)
-    findex dupes                Duplicate files (same name and size)
+    findex dupes                Duplicate files (same name and size, or --exact)
     findex stats                Index statistics
     findex vacuum               Compact the database
     findex clear                Delete the index and start fresh
     findex gui                  Open the desktop app (findex_gui.py)
+
+Tools built on the index (each lives in its own module beside this one):
+    findex hash                 Hash files for exact duplicates / verification
+    findex report               Health report: empty folders, bad names, stale...
+    findex secrets              Passwords, keys and tokens sitting in files
+    findex snapshot / verify    Manifest of a tree; later prove nothing changed
+    findex rename               Bulk rename with a dry-run preview and undo
 
 EVERY file AND folder under the indexed roots is recorded by name, size and
 date, so filename search covers the whole drive - like Everything does. Text
@@ -818,7 +825,11 @@ CREATE TABLE IF NOT EXISTS files (
     chars   INTEGER DEFAULT 0,
     status  TEXT,
     error   TEXT,
-    is_dir  INTEGER NOT NULL DEFAULT 0
+    is_dir  INTEGER NOT NULL DEFAULT 0,
+    phash   TEXT,
+    fhash   TEXT,
+    kind    TEXT,
+    simhash INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
 CREATE INDEX IF NOT EXISTS idx_files_ext  ON files(ext);
@@ -1046,13 +1057,19 @@ def open_db(path, timeout=60):
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute("PRAGMA cache_size=-262144")   # 256 MB page cache
     conn.executescript(SCHEMA)
-    # An index built by an older findex predates folder indexing: add the
-    # column in place, keeping every row. New databases have it from SCHEMA.
+    # An index built by an older findex predates some columns: add them in
+    # place, keeping every row. New databases have them from SCHEMA.
     have = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
-    if "is_dir" not in have:
-        conn.execute("ALTER TABLE files ADD COLUMN "
-                     "is_dir INTEGER NOT NULL DEFAULT 0")
-        conn.commit()
+    for col, decl in (("is_dir", "INTEGER NOT NULL DEFAULT 0"),
+                      ("phash", "TEXT"), ("fhash", "TEXT"),
+                      ("kind", "TEXT"), ("simhash", "INTEGER")):
+        if col not in have:
+            conn.execute("ALTER TABLE files ADD COLUMN {} {}".format(col, decl))
+    # Indexes over columns the migration may only just have added.
+    conn.executescript(
+        "CREATE INDEX IF NOT EXISTS idx_files_size ON files(size);"
+        "CREATE INDEX IF NOT EXISTS idx_files_fhash ON files(fhash);")
+    conn.commit()
     try:
         conn.executescript(NAMES_SCHEMA)
     except sqlite3.OperationalError:
@@ -1125,8 +1142,19 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(path) DO UPDATE SET
     size=excluded.size, mtime=excluded.mtime, indexed=excluded.indexed,
     chars=excluded.chars, status=excluded.status, error=excluded.error,
-    is_dir=excluded.is_dir
+    is_dir=excluded.is_dir,
+    phash=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime
+               THEN files.phash END,
+    fhash=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime
+               THEN files.fhash END,
+    kind=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime
+              THEN files.kind END,
+    simhash=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime
+                 AND files.chars=excluded.chars THEN files.simhash END
 """
+# The hashes and detected type (findex_hash.py) describe the file's BYTES, so
+# they are dropped the moment a rewrite changes its size or timestamp and
+# recomputed on the next hashing pass. The CASE has no ELSE: it yields NULL.
 
 
 DROP_TEXT = ("DELETE FROM docs WHERE rowid IN "
@@ -2055,6 +2083,9 @@ def cmd_find(args):
 
 
 def cmd_dupes(args):
+    if getattr(args, "exact", False) or getattr(args, "near", False):
+        import findex_hash
+        return findex_hash.cmd_dupes(args)
     conn = open_db(args.db)
     groups, files, wasted = dupe_summary(conn, getattr(args, "ext", None))
     rows = dupe_rows(conn, args.limit, getattr(args, "ext", None))
@@ -2380,6 +2411,42 @@ def cmd_vacuum(args):
 # CLI
 # ----------------------------------------------------------------------------
 
+def tool_modules():
+    """The optional tool modules that sit beside this file and add their own
+    subcommands (each has an add_commands(subparsers) function). Imported
+    here rather than at the top because they import findex themselves.
+    Plain `import` statements on purpose - PyInstaller reads them, so the
+    modules are compiled into the standalone builds without being listed.
+    A missing module just means its commands are absent."""
+    mods = []
+    try:
+        import findex_hash
+        mods.append(findex_hash)
+    except ImportError:
+        pass
+    try:
+        import findex_report
+        mods.append(findex_report)
+    except ImportError:
+        pass
+    try:
+        import findex_secrets
+        mods.append(findex_secrets)
+    except ImportError:
+        pass
+    try:
+        import findex_verify
+        mods.append(findex_verify)
+    except ImportError:
+        pass
+    try:
+        import findex_rename
+        mods.append(findex_rename)
+    except ImportError:
+        pass
+    return mods
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="findex", description=__doc__,
@@ -2418,9 +2485,19 @@ def main(argv=None):
     p.add_argument("-n", "--limit", type=int, default=50)
     p.set_defaults(func=cmd_find)
 
-    p = sub.add_parser("dupes", help="duplicate files (same name and size)")
+    p = sub.add_parser("dupes", help="duplicate files: same name and size "
+                       "(instant), --exact identical bytes, --near similar text")
     p.add_argument("-n", "--limit", type=int, default=0)
     p.add_argument("-e", "--ext", nargs="+", help="restrict to extensions")
+    p.add_argument("--exact", action="store_true",
+                   help="byte-identical files, whatever they are called "
+                        "(hashes size-collision candidates first)")
+    p.add_argument("--near", action="store_true",
+                   help="documents whose extracted text is nearly the same - "
+                        "revisions of one document under different names")
+    p.add_argument("--under", metavar="FOLDER", help="only beneath this folder")
+    p.add_argument("--no-hash", action="store_true",
+                   help="use the hashes already stored; do not read any file")
     p.set_defaults(func=cmd_dupes)
 
     p = sub.add_parser("search", help="full-text search of file contents")
@@ -2476,6 +2553,9 @@ def main(argv=None):
     p = sub.add_parser("vacuum", help="optimise and compact the database")
     p.set_defaults(func=cmd_vacuum)
 
+    for mod in tool_modules():
+        mod.add_commands(sub)
+
     # A file name the console/pipe encoding cannot represent must never
     # kill a run (Windows pipes default to cp1252): replace, don't raise.
     for stream in (sys.stdout, sys.stderr):
@@ -2485,7 +2565,14 @@ def main(argv=None):
             pass    # no stream at all (windowed build), or not a text stream
 
     args = ap.parse_args(argv)
-    return args.func(args) or 0
+    try:
+        return args.func(args) or 0
+    except BrokenPipeError:          # `findex stats | head` - not an error
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
+        return 0
 
 
 if __name__ == "__main__":

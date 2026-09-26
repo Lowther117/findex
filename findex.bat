@@ -43,6 +43,10 @@ if "%~1"=="" (
     echo   findex search "quarterly AND revenue"
     echo   findex search "invoice" -e pdf docx -n 50
     echo   findex name "*budget*"
+    echo   findex dupes --exact
+    echo   findex report -o health.html
+    echo   findex snapshot --under D:\Work --hash
+    echo   findex rename "D:\Photos ext:jpg" --find IMG_ --replace ""
     echo   findex stats
     echo   findex gui
     echo.
