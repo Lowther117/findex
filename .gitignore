@@ -34,3 +34,6 @@ findex-crash.log
 
 # scratch file the Verify tab writes beside the app while a comparison runs
 .findex-verify.json
+
+# index lock (findex index / background refresh)
+findex.db.lock

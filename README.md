@@ -7,8 +7,9 @@ SQLite FTS5 index kept on disk, not in RAM.
 and date — photos, music, video, executables, the folders they sit in, the
 lot — so name search covers the whole drive, like Everything does. On top of
 that, text is extracted from document types (PDF, Word, Excel, PowerPoint,
-plain text and code) for full-content search, and one Everything-style search
-box drives it all: `C: content:dan ext:pdf !draft`.
+plain text and code - and, with OCR on, scans and photos of text) for
+full-content search, and one Everything-style search box drives it all:
+`C: content:dan ext:pdf !draft`.
 
 Fully portable: the folder is the app. Move it, rename it, copy it to the other
 PC or run it off a USB stick — nothing outside the folder is read or written,
@@ -30,11 +31,12 @@ and no machine-specific path is ever stored.
 | `findex_tabs.py` | the app | the app | The Health, Duplicates, Rename and Verify tabs. Part of the app; not run directly. |
 | `findex_tabs_organise.py` | the app | the app | The Organise tab. Part of the app; not run directly. |
 | `findex_organise.py` | engine | engine | Sort a folder into subfolders by rules, with suggestions, a rule check, preview and undo: `findex organise`. |
-| `findex_hash.py` | engine | engine | Content fingerprints and type detection: `findex hash`, `findex dupes --exact / --near`. |
+| `findex_hash.py` | engine | engine | Content fingerprints and type detection: `findex hash`, `findex dupes --exact / --near / --images`. |
 | `findex_report.py` | engine | engine | The health report: `findex report`. |
 | `findex_secrets.py` | engine | engine | Passwords, keys and tokens in indexed text: `findex secrets`. |
 | `findex_verify.py` | engine | engine | Snapshots and verification: `findex snapshot`, `findex verify`. |
 | `findex_rename.py` | engine | engine | Bulk rename with preview and undo: `findex rename`. |
+| `findex_schedule.py` | engine | engine | The background index refresh - registers and removes the OS scheduler job: `findex schedule`. |
 | `build-exe.bat` | optional | - | Builds `dist\findex\findex.exe` - a standalone app folder that needs no Python. Only if you want findex as an ordinary app. |
 | `build-app.command` | - | optional | Builds `dist/findex.app` - the same thing for the Mac. |
 | `ensure_python.ps1` | helper | - | Used by `build-exe.bat` to find (or install) a real Python. Not run directly. |
@@ -54,6 +56,7 @@ Findex/
   findex_verify.py    } them when present; a missing one just means
   findex_rename.py    } its commands are absent
   findex_organise.py  }
+  findex_schedule.py  }
   findex_gui.py       Tkinter desktop app (Search, Index, Changes tabs)
   findex_tabs.py      the Health, Duplicates, Rename and Verify tabs
   findex_tabs_organise.py   the Organise tab
@@ -155,6 +158,15 @@ is remembered in `findex_gui.json`.
   (bm25). Browsing with no terms is newest-first.
 - Right-click > **Rename these...** hands the selected files to the Rename
   tab as a hand-picked selection.
+- Right-click > **Export this list...** (also File > Export this list...)
+  saves exactly what is on screen - the current search, type filter and
+  sort order - to a file. Pick the type in the save dialog: `.csv` has
+  one row per result with path, name, extension, size, modified date and
+  kind (file/folder), plus the matching snippet when the search used
+  `content:`; `.txt` is one full path per line, ready for another tool;
+  `.json` is the same records as an array. The dialog opens in the default
+  save folder. The command line has the same: `--json` / `--csv` on `find`,
+  `name`, `search` and `dupes` write to stdout.
 - The *Type* dropdown sits right of the search bar. **Groups** come first -
   Images, Videos, Audio, Documents, Compressed, Code, Programs, Emails - each
   covering its whole family of extensions in one pick, then every file type
@@ -185,8 +197,16 @@ is remembered in `findex_gui.json`.
   the window never freezes.
 - *Re-extract everything* forces a full rebuild; normally findex only touches
   files whose size or timestamp changed, which is why repeat runs are quick.
+- *OCR scanned PDFs and images* makes the words in scans and pictures
+  searchable - see OCR under *What gets recorded*.
 - *Auto re-index every N minutes* re-runs the same folders on a timer while the
   app is open.
+- *Keep the index fresh in the background, every N hours* does the same
+  **whether or not the app is open**, by registering a job with the
+  operating system's own scheduler - and removing it again when unticked.
+  Nothing to set up by hand; the *Background refresh* section below says
+  exactly what it creates and where. The note beside it shows the current
+  state ("every 6 h, index last updated 03:12").
 - *Live updates* watches the listed folders while the app is open and folds
   changes into the index **within seconds** - new, modified, renamed and
   deleted files and folders, with text extraction included - so search stays
@@ -260,7 +280,7 @@ is remembered in `findex_gui.json`.
   category; `.csv` is one finding per row; `.txt` and `.json` too.
 - Scope limits the report to one folder or drive.
 
-**Duplicates tab** - three answers to "is this a copy of that?"
+**Duplicates tab** - four answers to "is this a copy of that?"
 
 - **Same name and size** is the instant classic; no files are read. A
   renamed copy is missed and two different files can share both.
@@ -274,6 +294,20 @@ is remembered in `findex_gui.json`.
   the same - the draft and the final, the same report saved twice under
   different names. It works on text findex already extracted (nothing is
   opened); the first run fingerprints every document once.
+- **Similar images** finds pictures that *look* the same whatever the file
+  says: the same photo saved as PNG and as JPEG, the original and the copy
+  shrunk for email or a phone, a screenshot re-saved with different
+  compression. Each image is decoded once (small - it is reduced to a
+  thumbnail on the way in) and given a 64-bit picture fingerprint (a
+  difference hash, stored in the index like the others and dropped when
+  the file changes); two fingerprints within **Image distance** bits of
+  each other count as the same picture. The default of 10 catches resizes,
+  re-saves and light edits without pairing merely similar photos; 0 asks
+  for near-pixel-identical; above 16 gets loose. Featureless images - a
+  solid colour, a blank page - all fingerprint alike and are left out
+  rather than reported as one huge set. Cropped or rotated copies are not
+  found (the fingerprint describes the whole frame). Formats: png, jpg,
+  tiff, bmp, gif, webp, and heic/heif where PyMuPDF can open them.
 - Results are sets you can expand, with the copies underneath. **Keep
   newest, select the rest** (also oldest / first, on the right-click menu)
   selects every copy but one in each set - then Delete sends the selection
@@ -399,14 +433,20 @@ findex roots --add F:\ --forget E:\Documents
 findex watch D:\                       live updates until stopped (Ctrl+C)
 findex find "C: content:dan ext:pdf"   Everything-style search
 findex find "budget !draft folder:"
+findex find "ext:pdf" --json           results as JSON on stdout (or --csv)
 findex search "quarterly AND revenue"  content search (raw FTS5)
 findex name "*.mp4" -n 100             filename search - any file type
+findex name "*.mp4" --csv > list.csv   ...as CSV for a spreadsheet
 findex dupes                           duplicate files (same name + size)
 findex dupes --exact                   byte-identical files (hashes first)
 findex dupes --near                    near-identical documents (by text)
+findex dupes --images                  look-alike pictures (resized, re-saved)
+findex dupes --images --distance 6     ...stricter (bits of 64 that may differ)
+findex dupes --exact --json            any of the above as JSON / --csv
 findex hash                            fingerprints for exact duplicates
 findex hash --all                      + detected type of every file
 findex hash --full                     full hash of every file
+findex hash --images                   picture fingerprints for --images dupes
 findex report                          health summary on the console
 findex report -o health.html           the full report (.html/.csv/.txt/.json)
 findex report --list bad-names         one category in full
@@ -428,6 +468,9 @@ findex tree -o C:\out.csv --under D:\Work
 findex journal                         what changed, newest first
 findex journal --since 24h --type deleted
 findex journal invoice --under D:\Work -n 50
+findex schedule --every 6h             background refresh every 6 hours
+findex schedule --status               is it registered, how often, last run
+findex schedule --off                  remove it
 findex stats                           what is indexed
 findex vacuum                          optimise and compact
 findex clear                           delete the index, start fresh
@@ -438,8 +481,16 @@ findex gui                             open the desktop app
 `findex report --help` and friends list every option; the tool modules'
 docstrings (top of each `findex_*.py`) explain the reasoning.
 
+`--json` and `--csv` on `find`, `name`, `search` and `dupes` write the
+results to stdout as UTF-8 - a JSON array of objects, or CSV with a header
+row - with the fields path, name, ext, size, modified, kind, plus snippet
+for a content search and a set number for duplicates. Nothing else is
+printed, so `findex find "ext:pdf" --json | jq` and
+`findex dupes --exact --csv > dupes.csv` just work.
+
 `findex verify` exits 0 when nothing differs and 1 when something does, so it
-can end a migration script. `findex rename` and `findex organise` are dry runs
+can end a migration script. `findex index` exits 3 when another index run
+already holds the database (see *Background refresh*). `findex rename` and `findex organise` are dry runs
 unless `--apply` is given; `organise` refuses to apply while the rules have
 errors (`--force` applies the rows that can be placed).
 
@@ -475,12 +526,23 @@ the settings file the first time the app opens it, and keeps it from then on.
   read with *Include OneDrive online-only files* ticked, which forces
   downloads. A file indexed name-only is picked up for extraction
   automatically once it qualifies - including types that gain support later.
-- **OCR** (*OCR scanned PDFs* in the app, `--ocr` on the CLI): a PDF with no
-  real text layer gets its first 20 pages rendered and read. The reading is
-  done by the OCR engine already built into Windows (Windows.Media.Ocr) or
-  macOS (Apple Vision) - no extra programs to install. Tesseract is used as
-  a fallback when neither is available. Much slower than normal indexing, so
-  leave it off for huge image-heavy collections.
+- **OCR** (*OCR scanned PDFs and images* in the app, `--ocr` on the CLI):
+  a PDF with no real text layer gets its first 20 pages rendered and read,
+  and **image files** - `.png .jpg .jpeg .tif .tiff .bmp .gif .webp`, plus
+  `.heic/.heif` where PyMuPDF can open them - are read the same way, so a
+  photo of a letter, a screenshot of an email or a scan someone saved as a
+  JPEG turns up in `content:` searches like any document. Images are decoded
+  with PyMuPDF and shrunk to at most 2,500 px on the long side before
+  reading (enough for text, kinder to the engine); anything under 64 px on
+  a side - icons, buttons - is skipped, and a multi-page TIFF gets its
+  first 20 frames. The reading is done by the OCR engine already built into
+  Windows (Windows.Media.Ocr) or macOS (Apple Vision) - no extra programs
+  to install. Tesseract is used as a fallback when neither is available.
+  Much slower than normal indexing, so leave it off for huge photo
+  collections. With OCR off, images are recorded by name only, as ever;
+  turn it on and the next run picks up every image already in the index
+  (no re-extract needed); turn it off again and the text already read is
+  kept until the file changes, exactly as it is for PDFs.
 - **Self-contained**: tag and .msg support is bundled in `vendor/`; PyMuPDF
   is installed automatically by the app when missing. Until a component is
   available, the affected files simply stay name-only - no errors.
@@ -489,13 +551,61 @@ the settings file the first time the app opens it, and keeps it from then on.
   and similar. Note this is by folder *name*, so a data folder that happens to
   be called e.g. `recovery` or `env` is also skipped.
 - **Fingerprints** (only when asked - `findex hash`, the Duplicates tab's
-  identical mode, the Health tab's *Fingerprint types*, a hashed snapshot):
-  a quick BLAKE2b of the first 16 KB, the detected type from those bytes,
-  and a full-file BLAKE2b hash; plus a 64-bit text fingerprint (simhash) of
-  the extracted text for near-duplicate detection. All four live in the
-  `files` table and are dropped automatically the moment a file's size or
-  timestamp changes, so they can never go stale; the next hashing pass reads
-  only what is new. Indexing itself never reads a byte more than before.
+  identical / similar modes, the Health tab's *Fingerprint types*, a hashed
+  snapshot): a quick BLAKE2b of the first 16 KB, the detected type from
+  those bytes, and a full-file BLAKE2b hash; plus a 64-bit text fingerprint
+  (simhash) of the extracted text for near-duplicate documents, and a
+  64-bit picture fingerprint (dhash) of image files for look-alike images.
+  All five live in the `files` table and are dropped automatically the
+  moment a file's size or timestamp changes, so they can never go stale;
+  the next hashing pass reads only what is new. Indexing itself never reads
+  a byte more than before.
+
+## Background refresh
+
+*Keep the index fresh in the background* on the Index tab (or
+`findex schedule --every 6h`) makes the operating system run `findex index`
+on a timer - every 1, 3, 6, 12 or 24 hours - whether or not the app is open.
+Each run covers the folders remembered in the index, touches only new and
+changed files, and carries the OCR / OneDrive / worker settings the app had
+when the box was ticked (they are re-registered if you change them). The
+first run is one interval after ticking; `--status` shows what is
+registered, and the note beside the tick box shows when the index was last
+updated by any run.
+
+findex registers and removes the job itself - you never open Task Scheduler
+or write a plist - but there is nothing hidden about it:
+
+- **Windows**: a per-user task called **findex index refresh** at the top
+  level of the Task Scheduler Library, created with `schtasks` from an XML
+  definition (no admin rights; it runs as you, at below-normal priority,
+  never two at once, and a run missed because the PC was off happens at the
+  next chance). It runs **while you are logged in** - running while logged
+  out would mean storing your account password with the task, which findex
+  does not do. The command is `pythonw.exe findex.py index` from this
+  folder's environment (no console window), or `findex.exe engine index`
+  for the standalone build. Removed by unticking, by `findex schedule
+  --off`, or by hand with `schtasks /Delete /TN "findex index refresh" /F`
+  (or in Task Scheduler) if the folder has already been deleted.
+- **macOS**: a LaunchAgent,
+  `~/Library/LaunchAgents/uk.lowther.findex.refresh.plist`, with a
+  `StartInterval`, loaded with `launchctl bootstrap` (it runs while you are
+  logged in, at background priority). Removed by
+  unticking, by `findex schedule --off`, or by hand with
+  `launchctl bootout gui/$(id -u)/uk.lowther.findex.refresh` and deleting
+  the plist if findex itself is gone.
+- **Linux**: not offered; the tick box says so.
+
+The scheduled run's output goes to `findex-refresh.log` beside the index
+(the last run only). Two index runs can never overlap: every `findex index`
+takes a lock file beside the database (`findex.db.lock`, holding its
+process id) and a second run started while it is held - the app's Start
+button during a background run, say - stops at once with exit code 3 and
+says so; a lock left by a crashed run is recognised as stale and taken over.
+`findex schedule --show` prints the exact command and task definition
+without registering anything, which is the thing to look at if a run is not
+happening. One refresh job per user account: it points at whichever
+database it was registered from.
 
 ## Optional: a standalone app
 

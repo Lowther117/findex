@@ -6,10 +6,12 @@ findex_hash - content fingerprints for the findex index.
     findex hash --all           quick fingerprint + detected type of EVERY file
     findex hash --full          full hash of every file (for snapshot/verify)
     findex hash --near          text fingerprints for near-duplicate documents
+    findex hash --images        picture fingerprints for look-alike images
     findex dupes --exact        byte-identical files, whatever they are named
     findex dupes --near         documents whose text is nearly the same
+    findex dupes --images       pictures that look the same (resized, re-saved)
 
-Three things are stored per file, all in the `files` table findex.py owns:
+Five things are stored per file, all in the `files` table findex.py owns:
 
     phash    BLAKE2b of the first 16 KB - a quick fingerprint that costs one
              short read. Two files with different phash are different files.
@@ -18,6 +20,9 @@ Three things are stored per file, all in the `files` table findex.py owns:
              docx, jpg, exe, text...) - as opposed to what its name claims.
     simhash  64-bit fingerprint of the extracted TEXT, so two documents
              that are the same apart from a few edits fingerprint alike.
+    dhash    64-bit fingerprint of what an image LOOKS like (a difference
+             hash), so the same picture saved as PNG and JPEG, shrunk for
+             email or lightly edited fingerprints alike.
 
 Hashing reads every byte of every file it covers, which on a big drive is
 hours, so by default nothing is read that the question does not need: for
@@ -43,6 +48,14 @@ WRITE_EVERY = 500            # rows per transaction while hashing
 SIMHASH_MIN_CHARS = 200      # shorter texts fingerprint as noise
 SIMHASH_MAX_CHARS = 100000   # more than this adds nothing to the fingerprint
 NEAR_DISTANCE = 3            # simhash bits that may differ and still be "near"
+IMAGE_DISTANCE = 10          # dhash bits that may differ and still "look alike"
+DHASH_SIDE = 256             # images are decoded no larger than this first
+DHASH_NONE = -(1 << 63)      # stored for an image that could not be decoded,
+                             # so it is not tried again on every run
+DHASH_FLAT_BITS = 2          # a fingerprint with this few bits set (or this
+                             # few clear) is a featureless image: a solid
+                             # colour, a plain gradient - and looks like
+                             # every other featureless image; never grouped
 
 
 # ----------------------------------------------------------------------------
@@ -306,6 +319,98 @@ def hamming(a, b):
 
 
 # ----------------------------------------------------------------------------
+# Picture fingerprints (dhash) for look-alike images
+# ----------------------------------------------------------------------------
+
+def _decode_grey(path, max_side=DHASH_SIDE):
+    """Decode an image to 8-bit greyscale no larger than max_side on its
+    longest side: (width, height, bytes), or None when nothing here can
+    read it. PyMuPDF does the work, as everywhere else in findex; Pillow is
+    tried only when PyMuPDF is missing (it never is in a findex
+    environment - this keeps the fingerprint testable without it).
+    Neither is a hard dependency."""
+    p = findex.lp(path)
+    if findex.HAVE_FITZ:
+        fitz = findex.fitz
+        with findex._fitz_open(p) as doc:
+            page = doc[0]
+            w, h = page.rect.width, page.rect.height
+            if w < 1 or h < 1:
+                return None
+            scale = min(1.0, float(max_side) / max(w, h))
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
+                                  colorspace=fitz.csGRAY, alpha=False)
+            return pix.width, pix.height, bytes(pix.samples)
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    with Image.open(p) as im:
+        im = im.convert("L")
+        w, h = im.size
+        scale = min(1.0, float(max_side) / max(w, h))
+        if scale < 1.0:
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        return im.width, im.height, im.tobytes()
+
+
+def _grid_means(w, h, data, cols, rows):
+    """Shrink a greyscale buffer to cols x rows by averaging the pixels that
+    fall in each cell (a box filter). Done here rather than left to the
+    decoder so every decoder gives the same fingerprint for the same
+    picture; the buffer is at most DHASH_SIDE square, so it is quick."""
+    out = []
+    for r in range(rows):
+        y0, y1 = h * r // rows, max(h * (r + 1) // rows, h * r // rows + 1)
+        y1 = min(y1, h)
+        for c in range(cols):
+            x0, x1 = w * c // cols, max(w * (c + 1) // cols, w * c // cols + 1)
+            x1 = min(x1, w)
+            total = 0
+            for y in range(y0, y1):
+                total += sum(data[y * w + x0:y * w + x1])
+            out.append(total / float((y1 - y0) * (x1 - x0)))
+    return out
+
+
+def dhash_grey(w, h, data):
+    """The difference hash of a greyscale image: shrink to 9 wide by 8
+    high, then one bit per pair of horizontal neighbours - is the left
+    pixel brighter than the right? 64 bits that describe the picture's
+    gradients rather than its pixels, so resizing, re-encoding and small
+    edits leave most of them alone. Signed 64-bit for SQLite."""
+    if w < 2 or h < 1:
+        return None
+    cells = _grid_means(w, h, data, 9, 8)
+    out = 0
+    bit = 0
+    for r in range(8):
+        for c in range(8):
+            if cells[r * 9 + c] > cells[r * 9 + c + 1]:
+                out |= 1 << bit
+            bit += 1
+    if out >= 1 << 63:
+        out -= 1 << 64
+    return out
+
+
+def dhash_file(job):
+    """Worker: (id, path) -> (id, dhash, error). An image nothing can
+    decode gets DHASH_NONE, so it is not reopened on every run."""
+    fid, path = job
+    try:
+        decoded = _decode_grey(path)
+    except FileNotFoundError:
+        return fid, None, "gone"
+    except Exception as exc:                                   # noqa: BLE001
+        return fid, DHASH_NONE, str(exc)[:160]
+    if decoded is None:
+        return fid, DHASH_NONE, "no decoder"
+    h = dhash_grey(*decoded)
+    return fid, (DHASH_NONE if h is None else h), None
+
+
+# ----------------------------------------------------------------------------
 # Choosing what to hash, and doing it
 # ----------------------------------------------------------------------------
 
@@ -469,6 +574,72 @@ def run_simhash(conn, under=None, exts=None, workers=None, progress=False,
     return stats
 
 
+def run_dhash(conn, under=None, exts=None, workers=None, progress=False,
+              log=print, allow_cloud=False):
+    """Picture fingerprints for every image file without one. Each image
+    is opened and decoded (small - the longest side is reduced to
+    DHASH_SIDE px on the way in), so this is a real read of every picture
+    once; findex.py's UPSERT drops the fingerprint when the file changes."""
+    workers = workers or min(8, max(2, (os.cpu_count() or 4) // 2))
+    where, params = _scope(under, exts)
+    image_exts = sorted(findex.IMAGE_EXTS)
+    sql = ("SELECT f.id, f.path FROM files f WHERE f.is_dir=0 AND f.size>0 "
+           "AND f.dhash IS NULL AND f.ext IN ({})".format(
+               ",".join("?" * len(image_exts)))
+           + "".join(" AND " + w for w in where))
+    jobs = conn.execute(sql, image_exts + params).fetchall()
+    if os.name == "nt" and not allow_cloud:
+        kept = []
+        for fid, path in jobs:
+            try:
+                attrs = getattr(os.stat(findex.lp(path)),
+                                "st_file_attributes", 0)
+            except OSError:
+                attrs = 0
+            if not attrs & findex.CLOUD_MASK:
+                kept.append((fid, path))
+        jobs = kept
+    stats = {"images": len(jobs), "fingerprinted": 0, "errors": 0, "gone": 0}
+    if not jobs:
+        return stats
+    log("picture-fingerprinting {:,} images...".format(len(jobs)))
+    start = time.time()
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+    pending = 0
+    last_emit = 0.0
+    done = 0
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for fid, dh, err in ex.map(dhash_file, jobs, chunksize=16):
+            done += 1
+            if err == "gone":
+                stats["gone"] += 1
+            else:
+                if err:
+                    stats["errors"] += 1
+                else:
+                    stats["fingerprinted"] += 1
+                cur.execute("UPDATE files SET dhash=? WHERE id=?", (dh, fid))
+            pending += 1
+            if pending >= WRITE_EVERY:
+                conn.commit()
+                cur.execute("BEGIN")
+                pending = 0
+            if progress and time.time() - last_emit > 0.4:
+                last_emit = time.time()
+                print("@P seen={} done={} total={} error={} elapsed={:.1f}"
+                      .format(done, stats["fingerprinted"], len(jobs),
+                              stats["errors"], time.time() - start),
+                      flush=True)
+    conn.commit()
+    if progress:
+        print("@P seen={} done={} total={} error={} elapsed={:.1f}".format(
+            done, stats["fingerprinted"], len(jobs), stats["errors"],
+            time.time() - start), flush=True)
+    stats["elapsed"] = time.time() - start
+    return stats
+
+
 # ----------------------------------------------------------------------------
 # Duplicate queries (read-only)
 # ----------------------------------------------------------------------------
@@ -501,23 +672,21 @@ def exact_dupe_summary(conn, exts=None, under=None):
         "GROUP BY f.fhash HAVING COUNT(*)>1)".format(extra), params).fetchone()
 
 
-def near_dupe_groups(conn, exts=None, under=None, distance=NEAR_DISTANCE):
-    """Documents whose text fingerprints are within `distance` bits.
-    Returns [[(path, size, mtime, chars, fhash), ...], ...] - each inner
-    list one group, largest groups first. Exact duplicates (same fhash)
-    fall into the same group, naturally."""
-    where, params = _scope(under, exts)
-    extra = "".join(" AND " + w for w in where)
-    rows = conn.execute(
-        "SELECT f.id, f.path, f.size, f.mtime, f.chars, f.fhash, f.simhash "
-        "FROM files f WHERE f.is_dir=0 AND f.simhash IS NOT NULL{}"
-        .format(extra), params).fetchall()
-    if len(rows) < 2:
+def hamming_groups(hashes, distance, bands=4):
+    """Group 64-bit fingerprints that lie within `distance` bits of each
+    other (transitively). Returns [[index, ...], ...] for groups of two or
+    more, in no particular order.
+
+    Candidates must share at least one of `bands` equal slices of the hash
+    (with 4 slices of 16 bits, a distance of up to 3 is guaranteed to leave
+    one slice untouched; with 8 slices of 8 bits, up to 7), so only rows in
+    a shared bucket are compared - not all n^2 pairs. Beyond that guarantee
+    the odds of a genuine pair touching every band are small; a 2000-strong
+    bucket is boilerplate, not nearness, and is left alone."""
+    n = len(hashes)
+    if n < 2:
         return []
-    # Candidates share at least one of four 16-bit bands (a Hamming
-    # distance of at most 3 leaves at least one band untouched), so only
-    # rows in a shared bucket are compared - not all n^2 pairs.
-    parent = list(range(len(rows)))
+    parent = list(range(n))
 
     def find(i):
         while parent[i] != i:
@@ -530,25 +699,68 @@ def near_dupe_groups(conn, exts=None, under=None, distance=NEAR_DISTANCE):
         if ra != rb:
             parent[rb] = ra
 
-    sh = [r[6] & 0xFFFFFFFFFFFFFFFF for r in rows]
-    for band in range(4):
+    sh = [h & 0xFFFFFFFFFFFFFFFF for h in hashes]
+    width = 64 // bands
+    mask = (1 << width) - 1
+    for band in range(bands):
         buckets = {}
-        shift = band * 16
+        shift = band * width
         for i, h in enumerate(sh):
-            buckets.setdefault((h >> shift) & 0xFFFF, []).append(i)
+            buckets.setdefault((h >> shift) & mask, []).append(i)
         for members in buckets.values():
             if len(members) < 2 or len(members) > 2000:
-                continue    # a 2000-strong bucket is boilerplate, not near
+                continue
             for x in range(len(members)):
                 for y in range(x + 1, len(members)):
                     i, j = members[x], members[y]
                     if find(i) != find(j) and hamming(sh[i], sh[j]) <= distance:
                         union(i, j)
     groups = {}
-    for i, r in enumerate(rows):
-        groups.setdefault(find(i), []).append(r[1:6])
-    out = [sorted(g, key=lambda t: (-(t[1] or 0), t[0]))
-           for g in groups.values() if len(g) > 1]
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return [g for g in groups.values() if len(g) > 1]
+
+
+def near_dupe_groups(conn, exts=None, under=None, distance=NEAR_DISTANCE):
+    """Documents whose text fingerprints are within `distance` bits.
+    Returns [[(path, size, mtime, chars, fhash), ...], ...] - each inner
+    list one group, largest groups first. Exact duplicates (same fhash)
+    fall into the same group, naturally."""
+    where, params = _scope(under, exts)
+    extra = "".join(" AND " + w for w in where)
+    rows = conn.execute(
+        "SELECT f.id, f.path, f.size, f.mtime, f.chars, f.fhash, f.simhash "
+        "FROM files f WHERE f.is_dir=0 AND f.simhash IS NOT NULL{}"
+        .format(extra), params).fetchall()
+    out = [sorted((rows[i][1:6] for i in g), key=lambda t: (-(t[1] or 0), t[0]))
+           for g in hamming_groups([r[6] for r in rows], distance, bands=4)]
+    out.sort(key=lambda g: (-len(g), -(g[0][1] or 0)))
+    return out
+
+
+def similar_image_groups(conn, exts=None, under=None, distance=IMAGE_DISTANCE):
+    """Images whose picture fingerprints are within `distance` bits: the
+    same photo as PNG and JPEG, the original and the copy shrunk for email,
+    a screenshot and its crop-free re-save. Returns [[(path, size, mtime,
+    dhash), ...], ...], largest groups first. 8 bands of 8 bits, so any
+    pair up to 7 bits apart is found for certain and the default 10 almost
+    always; images that could not be decoded (DHASH_NONE) and featureless
+    ones (DHASH_FLAT_BITS) are left out."""
+    where, params = _scope(under, exts)
+    extra = "".join(" AND " + w for w in where)
+    rows = conn.execute(
+        "SELECT f.id, f.path, f.size, f.mtime, f.dhash FROM files f "
+        "WHERE f.is_dir=0 AND f.dhash IS NOT NULL AND f.dhash != ?{}"
+        .format(extra), [DHASH_NONE] + params).fetchall()
+    # A blank page, a solid swatch and a smooth gradient all fingerprint as
+    # (nearly) all-zero or all-one bits, and would be reported as one huge
+    # set of "similar images" - true in a useless way. Leave them out.
+    rows = [r for r in rows
+            if DHASH_FLAT_BITS < bin(r[4] & 0xFFFFFFFFFFFFFFFF).count("1")
+            < 64 - DHASH_FLAT_BITS]
+    bands = 8 if distance > NEAR_DISTANCE else 4
+    out = [sorted((rows[i][1:5] for i in g), key=lambda t: (-(t[1] or 0), t[0]))
+           for g in hamming_groups([r[4] for r in rows], distance, bands)]
     out.sort(key=lambda g: (-len(g), -(g[0][1] or 0)))
     return out
 
@@ -565,7 +777,8 @@ def cmd_hash(args):
     elif args.all:
         mode = "all"
     log = (lambda *a: None) if args.quiet else print
-    if not args.near_only:
+    only = args.near_only or args.images_only
+    if not only:
         stats = run_hash(conn, mode, under=args.under, exts=args.ext,
                          workers=args.workers, allow_cloud=args.include_cloud,
                          progress=args.progress, log=log)
@@ -578,47 +791,103 @@ def cmd_hash(args):
                         workers=args.workers, progress=args.progress, log=log)
         log("text-fingerprinted {:,} of {:,} documents, {:.1f}s".format(
             s["fingerprinted"], s["documents"], s.get("elapsed", 0)))
+    if args.images or args.images_only:
+        s = run_dhash(conn, under=args.under, exts=args.ext,
+                      workers=args.workers, progress=args.progress, log=log,
+                      allow_cloud=args.include_cloud)
+        log("picture-fingerprinted {:,} of {:,} images, {:,} unreadable, "
+            "{:.1f}s".format(s["fingerprinted"], s["images"], s["errors"],
+                             s.get("elapsed", 0)))
     conn.close()
     return 0
 
 
+def _group_records(groups, mode):
+    """Duplicate sets as result records with a `set` number, for --json /
+    --csv (findex.write_results)."""
+    out = []
+    for n, g in enumerate(groups, 1):
+        for row in g:
+            rec = findex.result_record(row[0], row[1], row[2])
+            rec["set"] = n
+            rec["match"] = mode
+            out.append(rec)
+    return out
+
+
 def cmd_dupes(args):
-    """`findex dupes --exact` / `--near` land here (findex.cmd_dupes hands
-    them over)."""
+    """`findex dupes --exact` / `--near` / `--images` land here
+    (findex.cmd_dupes hands them over)."""
     conn = findex.open_db(args.db)
+    fmt = findex._machine_out(args)
+    quiet = (lambda *a: None) if fmt else print
     if not getattr(args, "no_hash", False):
         if args.exact:
-            run_hash(conn, "dupes", under=args.under, exts=args.ext)
+            run_hash(conn, "dupes", under=args.under, exts=args.ext, log=quiet)
         if args.near:
-            run_simhash(conn, under=args.under, exts=args.ext)
+            run_simhash(conn, under=args.under, exts=args.ext, log=quiet)
+        if getattr(args, "images", False):
+            run_dhash(conn, under=args.under, exts=args.ext, log=quiet)
+    distance = getattr(args, "distance", None)
+    records = []
     if args.exact:
         groups, files, wasted = exact_dupe_summary(conn, args.ext, args.under)
         rows = exact_dupe_rows(conn, args.limit, args.ext, args.under)
+        if fmt:
+            sets, last = [], None
+            for path, size, mtime, n, fh in rows:
+                if fh != last:
+                    last = fh
+                    sets.append([])
+                sets[-1].append((path, size, mtime))
+            records += _group_records(sets, "identical")
         last = None
         for path, size, mtime, n, fh in rows:
             if fh != last:
                 last = fh
-                print("\n{} - {:,} identical copies:".format(
+                quiet("\n{} - {:,} identical copies:".format(
                     findex.human(size), n))
-            print("    {}".format(path))
+            quiet("    {}".format(path))
         if groups:
-            print("\n{:,} set(s) of identical files, {:,} files - {} "
+            quiet("\n{:,} set(s) of identical files, {:,} files - {} "
                   "reclaimable if each set kept one copy".format(
                       groups, files, findex.human(wasted)))
         else:
-            print("No byte-identical duplicates found.")
+            quiet("No byte-identical duplicates found.")
     if args.near:
-        groups = near_dupe_groups(conn, args.ext, args.under)
-        for g in groups[:args.limit or None]:
-            print("\n{} similar documents:".format(len(g)))
+        groups = near_dupe_groups(conn, args.ext, args.under,
+                                  distance if distance is not None
+                                  else NEAR_DISTANCE)
+        groups = groups[:args.limit or None]
+        records += _group_records(groups, "near-text")
+        for g in groups:
+            quiet("\n{} similar documents:".format(len(g)))
             for path, size, mtime, chars, fh in g:
-                print("    {:>8}  {}  {}".format(
+                quiet("    {:>8}  {}  {}".format(
                     findex.human(size or 0),
                     time.strftime("%Y-%m-%d", time.localtime(mtime or 0)), path))
-        print("\n{:,} group(s) of near-identical documents".format(len(groups))
+        quiet("\n{:,} group(s) of near-identical documents".format(len(groups))
               if groups else "No near-duplicate documents found (run "
               "`findex hash --near` first if the index has never been "
               "text-fingerprinted).")
+    if getattr(args, "images", False):
+        groups = similar_image_groups(conn, args.ext, args.under,
+                                      distance if distance is not None
+                                      else IMAGE_DISTANCE)
+        groups = groups[:args.limit or None]
+        records += _group_records(groups, "similar-image")
+        for g in groups:
+            quiet("\n{} similar images:".format(len(g)))
+            for path, size, mtime, dh in g:
+                quiet("    {:>8}  {}  {}".format(
+                    findex.human(size or 0),
+                    time.strftime("%Y-%m-%d", time.localtime(mtime or 0)), path))
+        quiet("\n{:,} group(s) of look-alike images".format(len(groups))
+              if groups else "No look-alike images found (run `findex hash "
+              "--images` first if the index has never been "
+              "picture-fingerprinted).")
+    if fmt:
+        findex.write_results(records, sys.stdout, fmt, group_key="set")
     conn.close()
     return 0
 
@@ -626,7 +895,8 @@ def cmd_dupes(args):
 def add_commands(sub):
     p = sub.add_parser("hash", help="content fingerprints: for exact "
                        "duplicates (default), --all types, --full hashes, "
-                       "--near text fingerprints")
+                       "--near text fingerprints, --images picture "
+                       "fingerprints")
     p.add_argument("--all", action="store_true",
                    help="quick fingerprint + detected type of every file "
                         "(reads 16 KB each; feeds the type-mismatch report)")
@@ -637,6 +907,11 @@ def add_commands(sub):
                    help="also text-fingerprint documents for --near dupes")
     p.add_argument("--near-only", action="store_true",
                    help="only the text fingerprints - open no files")
+    p.add_argument("--images", action="store_true",
+                   help="also picture-fingerprint image files for --images "
+                        "dupes (decodes each image once, small)")
+    p.add_argument("--images-only", action="store_true",
+                   help="only the picture fingerprints")
     p.add_argument("--under", metavar="FOLDER", help="only beneath this folder")
     p.add_argument("-e", "--ext", nargs="+", help="restrict to extensions")
     p.add_argument("--workers", type=int, default=None,

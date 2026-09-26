@@ -29,7 +29,8 @@ import findex_report
 import findex_verify
 import findex_tabs_organise
 
-TOOL_KINDS = ("hash", "hash-near", "snapshot", "verify", "report")
+TOOL_KINDS = ("hash", "hash-near", "hash-images", "snapshot", "verify",
+              "report")
 
 
 def _g():
@@ -148,7 +149,7 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
 
     def _tool_finished(self, kind, code):
         """The engine child for a tool tab ended."""
-        if kind in ("hash", "hash-near"):
+        if kind in ("hash", "hash-near", "hash-images"):
             if code == 0:
                 self._dupes_query()
             else:
@@ -503,7 +504,8 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
 
     DUPE_MODES = (("name", "Same name and size  (instant)"),
                   ("exact", "Identical contents  (hashes size-matches first)"),
-                  ("near", "Near-identical text  (fingerprints documents)"))
+                  ("near", "Near-identical text  (fingerprints documents)"),
+                  ("images", "Similar images  (fingerprints pictures)"))
 
     def _build_dupes_tab(self):
         t = self.tab_dupes
@@ -513,6 +515,7 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
         self.var_dunder = tk.StringVar(value="")
         self.var_dexts = tk.StringVar(value="")
         self.var_dnohash = tk.BooleanVar(value=False)
+        self.var_ddist = tk.IntVar(value=findex_hash.IMAGE_DISTANCE)
         self.var_dstatus = tk.StringVar(value="")
 
         modes = ttk.LabelFrame(t, text="What counts as a duplicate")
@@ -532,12 +535,35 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
                         "the draft and the final, the same report saved twice "
                         "under different names. Works on text findex already "
                         "extracted, so no files are opened; the first run "
-                        "fingerprints every document once."}
+                        "fingerprints every document once.",
+                "images": "Pictures that LOOK the same, whatever the file "
+                          "says: the same photo as PNG and JPEG, the original "
+                          "and the copy shrunk for email, a re-saved "
+                          "screenshot. Each image is decoded once (small) "
+                          "and given a 64-bit picture fingerprint; two "
+                          "fingerprints within the distance set on the right "
+                          "count as a match. Re-runs read only new images."}
         for key, label in self.DUPE_MODES:
             rb = ttk.Radiobutton(inner, text=label, value=key,
                                  variable=self.var_dmode)
             rb.pack(side="left", padx=(0, 18))
             self.tip(rb, tips[key])
+        Spinbox = _g().Spinbox
+        dist = ttk.Frame(inner)
+        dist.pack(side="right")
+        lbl = ttk.Label(dist, text="Image distance:")
+        lbl.pack(side="left")
+        spin = Spinbox(dist, from_=0, to=32, width=4,
+                       textvariable=self.var_ddist)
+        spin.pack(side="left", padx=(4, 0))
+        self._track_spin(spin)
+        for w in (lbl, spin):
+            self.tip(w, "For Similar images: how many of the 64 fingerprint "
+                        "bits may differ and still count as the same "
+                        "picture. 0 = only near-pixel-identical images; 10 "
+                        "(the default) catches resizes, re-saves and light "
+                        "edits; above 16 starts pairing pictures that merely "
+                        "look alike.")
 
         top = ttk.Frame(t)
         top.pack(fill="x", padx=12, pady=(4, 4))
@@ -635,21 +661,28 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
                                        "--progress"]
         if mode == "near":
             cmd.append("--near-only")
+        elif mode == "images":
+            cmd.append("--images-only")
         if under:
             cmd += ["--under", under]
         if exts:
             cmd += ["-e"] + exts
         self._progress_est = 0
-        self.var_dstatus.set("Reading files..." if mode == "exact"
-                             else "Fingerprinting documents...")
-        self.launch(cmd, "hash" if mode == "exact" else "hash-near",
-                    "Hashing for duplicates..." if mode == "exact"
-                    else "Fingerprinting documents...")
+        doing = {"exact": ("hash", "Reading files...",
+                           "Hashing for duplicates..."),
+                 "near": ("hash-near", "Fingerprinting documents...",
+                          "Fingerprinting documents..."),
+                 "images": ("hash-images", "Fingerprinting images...",
+                            "Fingerprinting images...")}[mode]
+        self.var_dstatus.set(doing[1])
+        self.launch(cmd, doing[0], doing[2])
 
     def _dupes_query(self):
         mode = self.var_dmode.get()
         exts, under = self._dupes_filter()
         db = self.var_db.get()
+        distance = max(0, _g().int_of(self.var_ddist,
+                                      findex_hash.IMAGE_DISTANCE))
         self.var_dstatus.set("Looking for duplicates...")
 
         def work():
@@ -687,13 +720,20 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
                     if cur:
                         groups.append(cur)
                     summary = findex_hash.exact_dupe_summary(conn, exts, under)
+                elif mode == "images":
+                    alike = findex_hash.similar_image_groups(
+                        conn, exts, under, distance)
+                    groups = [[(p, s, m) for p, s, m, dh in g] for g in alike]
+                    files = sum(len(g) for g in groups)
+                    summary = (len(groups), files, 0)
                 else:
                     near = findex_hash.near_dupe_groups(conn, exts, under)
                     groups = [[(p, s, m) for p, s, m, c, fh in g]
                               for g in near]
                     files = sum(len(g) for g in groups)
                     summary = (len(groups), files, 0)
-                self.msgs.put(("call", self._dupes_show, (groups, summary, mode)))
+                self.msgs.put(("call", self._dupes_show,
+                               (groups, summary, mode, distance)))
             except Exception as exc:                           # noqa: BLE001
                 self.msgs.put(("call", self.var_dstatus.set,
                                ("Failed: {}".format(exc),)))
@@ -702,7 +742,7 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
                     conn.close()
         threading.Thread(target=work, daemon=True).start()
 
-    def _dupes_show(self, groups, summary, mode):
+    def _dupes_show(self, groups, summary, mode, distance=None):
         self.dtree.delete(*self.dtree.get_children())
         self._dpaths = {}
         self._dgroups = groups
@@ -711,17 +751,20 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
         shown = 0
         for gi, g in enumerate(groups[:3000]):
             size = g[0][1] or 0
+            fuzzy = mode in ("near", "images")
             if mode == "near":
                 head = "{} similar documents".format(len(g))
+            elif mode == "images":
+                head = "{} similar images".format(len(g))
             elif mode == "exact":
                 head = "{} identical copies".format(len(g))
             else:
                 head = "{} x {}".format(len(g), os.path.basename(g[0][0]))
             parent = self.dtree.insert(
                 "", "end", text=head, open=(gi < 40), tags=("head",),
-                values=(human(size) if mode != "near" else "",
+                values=(human(size) if not fuzzy else "",
                         "", "{} reclaimable".format(human(size * (len(g) - 1)))
-                        if mode != "near" else ""))
+                        if not fuzzy else ""))
             for i, (path, s, m) in enumerate(g):
                 iid = self.dtree.insert(
                     parent, "end", text=os.path.basename(path),
@@ -735,6 +778,11 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
             msg = ("{:,} group(s) of near-identical documents, {:,} files"
                    .format(n_groups, n_files) if n_groups else
                    "No near-identical documents found")
+        elif mode == "images":
+            msg = ("{:,} group(s) of look-alike images, {:,} files (within "
+                   "{} bits)".format(n_groups, n_files, distance) if n_groups
+                   else "No look-alike images found (within {} bits)".format(
+                       distance))
         elif n_groups:
             msg = ("{:,} set(s), {:,} files - {} to be had back if each set "
                    "kept one copy".format(n_groups, n_files, human(wasted)))

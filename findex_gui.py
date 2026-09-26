@@ -10,12 +10,14 @@ Search tab  one Everything-style box, live as you type: names by default,
             content:word for text inside files, C:\\ path scopes, ext: filters,
             ! exclusions.
 Index tab   pick folders, run an index, watch progress, auto re-index on a
-            timer, or turn on live updates (real-time watching).
+            timer, a background refresh the OS scheduler runs even when the
+            app is closed, or live updates (real-time watching).
 Changes     the journal of everything that changed in the indexed folders.
 Health      what is wrong with the tree: empty folders, bad names, long
             paths, stale/zero-byte/temp files, corrupt files, mismatched
             types, secrets in documents - and an exportable report.
-Duplicates  same name+size, byte-identical, or near-identical text.
+Duplicates  same name+size, byte-identical, near-identical text, or
+            look-alike images.
 Rename      bulk renaming from a search, with a preview and an undo.
 Organise    sort a folder's files into subfolders by rules - suggested,
             checked, previewed as the resulting tree, applied, undoable.
@@ -52,6 +54,7 @@ if not getattr(sys, "frozen", False) and _SCRIPT_DIR not in sys.path:
 import findex  # noqa: E402
 import theme   # noqa: E402  - the shared light/dark palettes + ttk styling
 import findex_tabs  # noqa: E402  - the Health / Duplicates / Rename / Verify tabs
+import findex_schedule  # noqa: E402  - the background refresh (OS scheduler)
 
 # One source of truth for "the folder findex owns" - beside the scripts, or
 # beside findex.exe / findex.app in a standalone build. See findex._app_dir.
@@ -80,6 +83,7 @@ DEFAULTS = {
     "dark": True,
     "auto_index": False,
     "auto_minutes": 60,
+    "bg_hours": 6,
     "watch": False,
     "limit": 0,
     "exts": "",
@@ -816,6 +820,9 @@ class FindexApp(findex_tabs.ToolTabs):
         self.var_auto = tk.BooleanVar(value=bool(c.get("auto_index", False)))
         self.var_auto_mins = tk.IntVar(value=int(c.get("auto_minutes", 60)))
         self.var_auto_next = tk.StringVar(value="")
+        self.var_bg = tk.BooleanVar(value=False)     # set from the scheduler
+        self.var_bg_hours = tk.StringVar(value=str(c.get("bg_hours", 6)))
+        self.var_bg_note = tk.StringVar(value="")
         self.var_watch = tk.BooleanVar(value=bool(c.get("watch", False)))
         self.var_watch_note = tk.StringVar(value="")
         self.var_counts = tk.StringVar(value="Idle")
@@ -833,6 +840,9 @@ class FindexApp(findex_tabs.ToolTabs):
         self._menus.append(m)
         m.add_command(label="Choose index database...", command=self.choose_db)
         m.add_command(label="Open index folder", command=self.open_db_folder)
+        m.add_separator()
+        m.add_command(label="Export this list...",
+                      command=self.export_results_ui)
         m.add_separator()
         m.add_command(label="Default save folder...",
                       command=self.choose_save_dir)
@@ -1233,6 +1243,8 @@ class FindexApp(findex_tabs.ToolTabs):
         self.ctx.add_separator()
         self.ctx.add_command(label="Rename these...",
                              command=self.rename_from_search)
+        self.ctx.add_command(label="Export this list...",
+                             command=self.export_results_ui)
         self.ctx.add_separator()
         self.ctx.add_command(label="Delete...", command=self.delete_files)
 
@@ -1517,13 +1529,17 @@ class FindexApp(findex_tabs.ToolTabs):
         ocr_row = ttk.Frame(opts)
         ocr_row.pack(fill="x", padx=8, pady=(0, 8))
         chk = ttk.Checkbutton(ocr_row,
-                              text="OCR scanned PDFs (slower)",
+                              text="OCR scanned PDFs and images (slower)",
                               variable=self.var_ocr)
         chk.pack(side="left")
-        self.tip(chk, "For PDFs that are pictures of pages rather than text: "
-                      "read up to 20 pages with the OCR engine built into "
-                      "Windows / macOS, so scans become searchable. Much "
-                      "slower - leave off for huge image collections.")
+        self.tip(chk, "For PDFs that are pictures of pages rather than text, "
+                      "and for image files - photos of letters, screenshots, "
+                      "scans saved as JPEG or PNG: read them with the OCR "
+                      "engine built into Windows / macOS, so the words in "
+                      "them become searchable with content:. Up to 20 pages "
+                      "per file. Much slower - leave off for huge photo "
+                      "collections. Images already indexed are picked up on "
+                      "the next run when this is turned on.")
 
         auto = ttk.Frame(opts)
         auto.pack(fill="x", padx=8, pady=(0, 8))
@@ -1543,6 +1559,35 @@ class FindexApp(findex_tabs.ToolTabs):
                        "starting point; re-runs only read what changed.")
         ttk.Label(auto, text="minutes while the app is open").pack(side="left")
         ttk.Label(auto, textvariable=self.var_auto_next,
+                  style="Accent.TLabel").pack(side="left", padx=12)
+
+        bg = ttk.Frame(opts)
+        bg.pack(fill="x", padx=8, pady=(0, 8))
+        self.chk_bg = ttk.Checkbutton(
+            bg, text="Keep the index fresh in the background, every",
+            variable=self.var_bg, command=self.toggle_bg_refresh)
+        self.chk_bg.pack(side="left")
+        self.tip(self.chk_bg,
+                 "Even when this app is closed: findex registers a job with "
+                 "the operating system's own scheduler (Task Scheduler on "
+                 "Windows, launchd on the Mac) that re-runs the folders "
+                 "above on this timer - new and changed files only, so each "
+                 "run is quick. Ticking registers it, unticking removes it; "
+                 "nothing to set up by hand. Runs while you are logged in; "
+                 "a run missed because the PC was off happens at the next "
+                 "opportunity.")
+        self.bg_box = ttk.Combobox(bg, textvariable=self.var_bg_hours,
+                                   width=4, state="readonly",
+                                   values=[str(h) for h in
+                                           findex_schedule.INTERVALS])
+        self.bg_box.pack(side="left", padx=4)
+        self.bg_box.bind("<<ComboboxSelected>>",
+                         lambda e: self._bg_interval_changed())
+        self.tip(self.bg_box, "Hours between background runs. Changing it "
+                              "while the box is ticked re-registers the job "
+                              "with the new timer.")
+        ttk.Label(bg, text="hours").pack(side="left")
+        ttk.Label(bg, textvariable=self.var_bg_note,
                   style="Accent.TLabel").pack(side="left", padx=12)
 
         live = ttk.Frame(opts)
@@ -1628,6 +1673,7 @@ class FindexApp(findex_tabs.ToolTabs):
                     "anything.")
 
         self.update_auto_label()
+        self.root.after(1200, self.refresh_bg_state)
 
     # -- searching ---------------------------------------------------------
 
@@ -2181,6 +2227,40 @@ class FindexApp(findex_tabs.ToolTabs):
         cmd = engine_command() + ["--db", self.var_db.get(), "tree", "-o", path]
         self.launch(cmd, "tree", "Exporting the file tree...")
 
+    def export_results_ui(self):
+        """Save the list exactly as shown - the current search, type filter
+        and sort order - as CSV, plain paths or JSON, picked by the file
+        type in the save dialog. Starts in the default save folder."""
+        if not self.rows:
+            self.var_status.set("Nothing to export - the list is empty")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export this list",
+            initialdir=self.save_dir(),
+            initialfile="findex-results-{}.csv".format(
+                time.strftime("%Y-%m-%d")),
+            defaultextension=".csv",
+            filetypes=[("Spreadsheet (CSV)", "*.csv"),
+                       ("One path per line (text)", "*.txt"),
+                       ("JSON", "*.json")])
+        if not path:
+            return
+        fmt = os.path.splitext(path)[1].lstrip(".").lower() or "csv"
+        # the snippet column only means something in a content: search
+        with_snip = bool(findex.parse_query(self.var_query.get())["content"])
+        records = [findex.result_record(
+            r["path"], r["size"], r["mtime"], r.get("is_dir", False),
+            r.get("snippet", "") if with_snip else None) for r in self.rows]
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as out:
+                findex.write_results(records, out, fmt)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Could not export", str(exc))
+            return
+        self.var_status.set("{:,} result(s) exported to {}".format(
+            len(records), path))
+        reveal_path(path)
+
     def run_vacuum(self):
         if self.proc is not None:
             messagebox.showinfo("Busy", "Something is already running.")
@@ -2416,10 +2496,18 @@ class FindexApp(findex_tabs.ToolTabs):
         if self.proc_kind == "index":
             self.last_index_finished = time.time()
             self.update_auto_label()
+            if self.var_bg.get():
+                self.refresh_bg_state()      # "index last updated" in the note
         if self.proc_kind == "setup" and self._handle_setup_end(code):
             return
         word = "finished" if code == 0 else "stopped (exit {})".format(code)
         self.var_status.set("{} {}".format(self.proc_kind.title(), word))
+        if self.proc_kind == "index" and code == 3:
+            # the engine found another run's lock - the background refresh,
+            # most likely - and declined to run alongside it
+            self.var_status.set("Another index run is already working on "
+                                "this database (the background refresh?) - "
+                                "try again when it has finished")
         if self.proc_kind == "tree" and code == 0 \
                 and getattr(self, "_tree_out", None):
             self.var_status.set("File tree exported to " + self._tree_out)
@@ -2454,6 +2542,102 @@ class FindexApp(findex_tabs.ToolTabs):
         due = self.last_index_finished + mins * 60
         self.var_auto_next.set("next run " + time.strftime("%H:%M",
                                                            time.localtime(due)))
+
+    # -- background refresh (the OS scheduler) -----------------------------
+
+    def _bg_extra(self):
+        """Index options the scheduled run should share with the app's."""
+        extra = []
+        if self.var_ocr.get():
+            extra.append("--ocr")
+        if self.var_cloud.get():
+            extra.append("--include-cloud")
+        workers = int_of(self.var_workers)
+        if workers > 0:
+            extra += ["--workers", str(workers)]
+        return extra
+
+    def refresh_bg_state(self):
+        """Read what the scheduler actually holds and show it - the tick
+        box follows the OS, not the settings file, so a job removed by
+        hand (or registered from the command line) is reflected."""
+        db = self.var_db.get()
+
+        def work():
+            st = findex_schedule.status()
+            self.msgs.put(("call", self._bg_show, (st, db)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _bg_show(self, st, db):
+        if not st["supported"]:
+            self.var_bg.set(False)
+            self.chk_bg.configure(state="disabled")
+            self.bg_box.configure(state="disabled")
+            self.var_bg_note.set("not supported on this OS")
+            return
+        self.var_bg.set(bool(st["registered"]))
+        if st["registered"] and st["hours"]:
+            self.var_bg_hours.set(str(int(st["hours"])))
+        self.var_bg_note.set(
+            findex_schedule.describe(db, st).replace("Background refresh: ",
+                                                     ""))
+
+    def toggle_bg_refresh(self):
+        if self.var_bg.get():
+            if not self.current_roots():
+                self.var_bg.set(False)
+                messagebox.showwarning(
+                    "No folders",
+                    "Add at least one folder to index first - the background "
+                    "refresh re-runs the folders listed above.")
+                return
+            self._bg_apply(True)
+        else:
+            self._bg_apply(False)
+
+    def _bg_interval_changed(self):
+        self.cfg["bg_hours"] = int_of(self.var_bg_hours, 6) or 6
+        if self.var_bg.get():
+            self._bg_apply(True)
+
+    def _bg_apply(self, on):
+        """Register or remove the job, off the Tk thread (schtasks and
+        launchctl take a moment), and report in the note and the Output."""
+        hours = int_of(self.var_bg_hours, 6) or 6
+        db = self.var_db.get()
+        extra = self._bg_extra()
+        self.var_bg_note.set("registering..." if on else "removing...")
+
+        def work():
+            try:
+                msg = (findex_schedule.enable(db, hours, extra=extra) if on
+                       else findex_schedule.disable())
+                self.msgs.put(("log", "-- " + msg + " --"))
+            except findex_schedule.ScheduleError as exc:
+                self.msgs.put(("log", "-- background refresh: {} --".format(exc)))
+                self.msgs.put(("call", messagebox.showerror,
+                               ("Background refresh", str(exc))))
+            self.msgs.put(("call", self.refresh_bg_state, ()))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _bg_sync_on_close(self):
+        """The job carries the OCR / OneDrive / worker options it was
+        registered with. If those changed during this session and the job
+        is on, register it again so the background run matches the app."""
+        if not self.var_bg.get():
+            return
+        try:
+            st = findex_schedule.status()
+            if not st["registered"]:
+                return
+            want = subprocess.list2cmdline(findex_schedule.refresh_command(
+                self.var_db.get(), extra=self._bg_extra()))
+            hours = int_of(self.var_bg_hours, 6) or 6
+            if st["command"] != want or st["hours"] != hours:
+                findex_schedule.enable(self.var_db.get(), hours,
+                                       extra=self._bg_extra())
+        except Exception:                                      # noqa: BLE001
+            pass
 
     # -- progress + resources ----------------------------------------------
 
@@ -2671,6 +2855,7 @@ class FindexApp(findex_tabs.ToolTabs):
         if self.watch_proc is not None:
             self._kill_proc_tree(self.watch_proc)
             self.watch_proc = None
+        self._bg_sync_on_close()
         self.cfg.update({
             "db": portable(self.var_db.get()),
             "roots": [portable(r) for r in self.current_roots()],
@@ -2680,6 +2865,7 @@ class FindexApp(findex_tabs.ToolTabs):
             "dark": bool(self.var_dark.get()),
             "auto_index": bool(self.var_auto.get()),
             "auto_minutes": int_of(self.var_auto_mins, 60) or 60,
+            "bg_hours": int_of(self.var_bg_hours, 6) or 6,
             "watch": bool(self.var_watch.get()),
             "limit": max(0, int_of(self.var_limit)),
             "exts": self.var_exts.get(),

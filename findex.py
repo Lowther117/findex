@@ -8,7 +8,7 @@ Commands:
     findex find "QUERY"         Everything-style search (content:, C:\\, ext:, !)
     findex search "QUERY"       Full-text search of file contents
     findex name "PATTERN"       Filename search (substring or *wildcard*)
-    findex dupes                Duplicate files (same name and size, or --exact)
+    findex dupes                Duplicate files (name+size, --exact, --near, --images)
     findex stats                Index statistics
     findex vacuum               Compact the database
     findex clear                Delete the index and start fresh
@@ -21,6 +21,7 @@ Tools built on the index (each lives in its own module beside this one):
     findex snapshot / verify    Manifest of a tree; later prove nothing changed
     findex rename               Bulk rename with a dry-run preview and undo
     findex organise             Sort a folder's files into subfolders by rules
+    findex schedule             Background index refresh (Task Scheduler / launchd)
 
 EVERY file AND folder under the indexed roots is recorded by name, size and
 date, so filename search covers the whole drive - like Everything does. Text
@@ -124,9 +125,13 @@ CHUNK = 4000
 # Name-only records written per transaction.
 NAME_CHUNK = 8000
 
-# OCR of scanned PDFs (opt-in via --ocr): pages are rendered and read with
-# tesseract. Capped so one huge scan cannot stall the whole run.
+# OCR of scanned PDFs and of image files (opt-in via --ocr): pages are
+# rendered and read with the OS's own engine or tesseract. Capped so one
+# huge scan cannot stall the whole run.
 OCR_MAX_PAGES = 20
+OCR_MAX_SIDE = 2500      # an image is shrunk to this many px on its longest
+                         # side before OCR - plenty for text, kind to the engine
+OCR_MIN_SIDE = 64        # anything smaller is an icon or a button, not a page
 OCR_ENABLED = os.environ.get("FINDEX_OCR") == "1"
 
 DOC_EXTS = {".pdf", ".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".rtf",
@@ -137,6 +142,8 @@ DOC_EXTS = {".pdf", ".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".rtf"
 MSG_EXTS = {".msg"}                              # Outlook (needs extract-msg)
 AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus",
               ".wma", ".wav", ".aiff", ".mp4", ".m4v", ".mov"}  # tags (mutagen)
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif",
+              ".webp", ".heic", ".heif"}       # OCR (only with --ocr)
 TEXT_EXTS = {
     ".txt", ".md", ".csv", ".tsv", ".log", ".json", ".xml", ".html", ".htm",
     ".ini", ".cfg", ".conf", ".yml", ".yaml", ".py", ".js", ".ts", ".css",
@@ -233,6 +240,11 @@ def can_extract(ext):
         return HAVE_MSG
     if ext in AUDIO_EXTS:
         return HAVE_MUTAGEN
+    if ext in IMAGE_EXTS:
+        # Pictures have no text to extract - unless OCR is on, in which case
+        # a photo of a letter or a screenshot is as searchable as a scan.
+        # With it off they stay name-only, exactly as before.
+        return HAVE_FITZ and OCR_ENABLED
     return ext in DOC_EXTS or ext in TEXT_EXTS
 
 
@@ -590,7 +602,10 @@ def _fitz_open(path):
             raise
     with open(path, "rb") as fh:
         data = fh.read()
-    return fitz.open(stream=data, filetype="pdf")
+    # MuPDF picks the parser from the name it is given; a stream has none,
+    # so the extension says what the bytes are (PDF, or an image format).
+    return fitz.open(stream=data,
+                     filetype=os.path.splitext(path)[1].lstrip(".") or "pdf")
 
 
 def _pdf_ocr(path):
@@ -630,6 +645,49 @@ def _pdf(path):
         if ocr.strip():
             text = (text + "\n" + ocr).strip()
     return text
+
+
+def _image_pages(path, max_side=OCR_MAX_SIDE, max_pages=OCR_MAX_PAGES):
+    """Render an image file to PNG bytes for OCR, one item per frame (a
+    multi-page TIFF is several; a photo is one). MuPDF opens the common
+    image formats as one-page documents, so this is the PDF path with a
+    different file behind it. The longest side is capped at max_side -
+    OCR engines are no better on a 6000 px photo than on 2500, only slower.
+    Frames under OCR_MIN_SIDE on either side (icons, buttons, tracking
+    pixels) are left out: there is nothing to read on them."""
+    out = []
+    with _fitz_open(path) as doc:
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+            w, h = page.rect.width, page.rect.height
+            if w < OCR_MIN_SIDE or h < OCR_MIN_SIDE:
+                continue
+            scale = min(1.0, float(max_side) / max(w, h))
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+            out.append(pix.tobytes("png"))
+    return out
+
+
+def _image(path):
+    """OCR an image file. Only reached with --ocr on (see can_extract)."""
+    if not HAVE_FITZ:
+        raise RuntimeError("PyMuPDF not installed - run: pip install pymupdf")
+    try:
+        pages = _image_pages(path)
+    except Exception:                                          # noqa: BLE001
+        # HEIC/HEIF depend on codecs MuPDF may not have been built with;
+        # a picture it cannot open is not a broken file, so it simply stays
+        # name-only. Anything else that fails to open really is damaged.
+        if os.path.splitext(path)[1].lower() in (".heic", ".heif"):
+            return ""
+        raise
+    out = []
+    for png in pages:
+        text = _ocr_png(png)
+        if text:
+            out.append(text)
+    return "\n".join(out)
 
 
 def _epub(path):
@@ -826,6 +884,8 @@ def extract_one(path):
             text = _zipnames(p)
         elif ext in AUDIO_EXTS:
             text = _audio(p)
+        elif ext in IMAGE_EXTS:
+            text = _image(p)
         else:
             text = _plain(p)
     except Exception as exc:
@@ -854,7 +914,8 @@ CREATE TABLE IF NOT EXISTS files (
     phash   TEXT,
     fhash   TEXT,
     kind    TEXT,
-    simhash INTEGER
+    simhash INTEGER,
+    dhash   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
 CREATE INDEX IF NOT EXISTS idx_files_ext  ON files(ext);
@@ -1087,7 +1148,8 @@ def open_db(path, timeout=60):
     have = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
     for col, decl in (("is_dir", "INTEGER NOT NULL DEFAULT 0"),
                       ("phash", "TEXT"), ("fhash", "TEXT"),
-                      ("kind", "TEXT"), ("simhash", "INTEGER")):
+                      ("kind", "TEXT"), ("simhash", "INTEGER"),
+                      ("dhash", "INTEGER")):
         if col not in have:
             conn.execute("ALTER TABLE files ADD COLUMN {} {}".format(col, decl))
     # Indexes over columns the migration may only just have added.
@@ -1175,11 +1237,14 @@ ON CONFLICT(path) DO UPDATE SET
     kind=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime
               THEN files.kind END,
     simhash=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime
-                 AND files.chars=excluded.chars THEN files.simhash END
+                 AND files.chars=excluded.chars THEN files.simhash END,
+    dhash=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime
+               THEN files.dhash END
 """
-# The hashes and detected type (findex_hash.py) describe the file's BYTES, so
-# they are dropped the moment a rewrite changes its size or timestamp and
-# recomputed on the next hashing pass. The CASE has no ELSE: it yields NULL.
+# The hashes, detected type and image fingerprint (findex_hash.py) describe
+# the file's BYTES, so they are dropped the moment a rewrite changes its size
+# or timestamp and recomputed on the next hashing pass. The CASE has no ELSE:
+# it yields NULL.
 
 
 DROP_TEXT = ("DELETE FROM docs WHERE rowid IN "
@@ -1251,7 +1316,104 @@ def emit_progress(stats, start):
                   stats["skipped"], time.time() - start), flush=True)
 
 
+# Only one index run per database at a time. Two runs over the same roots
+# would each see the other's writes as changes, journal them twice and fight
+# over the write lock; with a background refresh (findex schedule) it is
+# easy to have one start while a manual run is still going. The lock is a
+# small file beside the database holding the owner's pid: a run that
+# crashed or was killed leaves it behind, so a lock whose pid is no longer
+# alive - or that is older than any run could plausibly be - is stale and
+# simply taken over. Nothing here can wedge.
+
+LOCK_MAX_AGE = 3 * 86400          # a lock this old is a leftover, not a run
+
+
+def index_lock_path(db):
+    return db + ".lock"
+
+
+def _pid_alive(pid):
+    """Is a process with this id running right now? Best effort."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED
+            if not handle:
+                # 5 = access denied: it exists, it is just not ours
+                return ctypes.GetLastError() == 5
+            code = ctypes.c_ulong()
+            alive = (k32.GetExitCodeProcess(handle, ctypes.byref(code))
+                     and code.value == 259)                # STILL_ACTIVE
+            k32.CloseHandle(handle)
+            return bool(alive)
+        except Exception:                                  # noqa: BLE001
+            return True         # cannot tell - assume the run is real
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True             # someone else's process, but it exists
+    except OSError:
+        return True
+
+
+def acquire_index_lock(db):
+    """Take the lock for this database. Returns the lock path, or None when
+    another run holds it (and that run is alive)."""
+    path = index_lock_path(db)
+    for _attempt in range(2):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        except FileExistsError:
+            pid, age = 0, 0.0
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    pid = int((fh.read().split() or ["0"])[0])
+                age = time.time() - os.path.getmtime(path)
+            except (OSError, ValueError):
+                pass
+            if _pid_alive(pid) and age < LOCK_MAX_AGE:
+                return None
+            try:                # stale: a crashed run, or a recycled machine
+                os.remove(path)
+            except OSError:
+                return None
+            continue
+        except OSError:
+            return path         # cannot create it (read-only place): carry on
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("{} {}\n".format(os.getpid(), int(time.time())))
+        return path
+    return None
+
+
+def release_index_lock(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
 def cmd_index(args):
+    lock = acquire_index_lock(args.db)
+    if lock is None:
+        sys.stderr.write("Another index run is already working on this "
+                         "database - nothing done.\n"
+                         "(Lock file: {})\n".format(index_lock_path(args.db)))
+        return 3
+    try:
+        return _cmd_index(args)
+    finally:
+        release_index_lock(lock)
+
+
+def _cmd_index(args):
     if not HAVE_FITZ:
         sys.stderr.write("WARNING: PyMuPDF is not installed - PDFs will error.\n"
                          "         pip install pymupdf\n\n")
@@ -1757,6 +1919,94 @@ def human(n):
     return "{:.1f}TB".format(n)
 
 
+# Results as a file or a machine-readable stream - the app's "Export this
+# list..." and the CLI's --json / --csv. One record shape for every list a
+# search can produce, so a script reading `findex find --json` and one
+# reading `findex name --json` see the same fields.
+
+RESULT_FIELDS = ("path", "name", "ext", "size", "modified", "kind")
+
+
+def result_record(path, size, mtime, is_dir=False, snippet=None):
+    """One result as a plain dict. `snippet` is included only when given -
+    a content search has one, a name search does not."""
+    rec = {"path": path, "name": os.path.basename(path.rstrip("\\/")) or path,
+           "ext": os.path.splitext(path)[1].lower() if not is_dir else "",
+           "size": None if is_dir else (size or 0),
+           "modified": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+                        if mtime else ""),
+           "kind": "folder" if is_dir else "file"}
+    if snippet is not None:
+        rec["snippet"] = snippet.replace(">>", "").replace("<<", "")
+    return rec
+
+
+def write_results(records, out, fmt, group_key=None):
+    """Write result records (from result_record) as csv, json or txt.
+
+    txt is one full path per line; csv has a header and the record fields
+    (plus snippet when the records carry one); json is an array of objects.
+    group_key names a field that groups the records (duplicate sets): csv
+    gets it as the first column, txt puts a blank line between groups, json
+    nests each group as its own array.
+    """
+    records = list(records)
+    fmt = (fmt or "txt").lower().lstrip(".")
+    if fmt == "json":
+        import json
+        if group_key:
+            groups, order = {}, []
+            for r in records:
+                key = r.get(group_key)
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append({k: v for k, v in r.items()
+                                    if k != group_key})
+            json.dump([groups[k] for k in order], out, indent=1,
+                      ensure_ascii=False)
+        else:
+            json.dump(records, out, indent=1, ensure_ascii=False)
+        out.write("\n")
+        return
+    if fmt == "csv":
+        import csv
+        fields = list(RESULT_FIELDS)
+        if any("snippet" in r for r in records):
+            fields.append("snippet")
+        if group_key:
+            fields.insert(0, group_key)
+        w = csv.writer(out)
+        w.writerow(fields)
+        for r in records:
+            w.writerow(["" if r.get(f) is None else r.get(f) for f in fields])
+        return
+    if fmt != "txt":
+        raise ValueError("format must be txt, csv or json, not " + fmt)
+    first, last = True, None
+    for r in records:
+        if group_key and r.get(group_key) != last:
+            if not first:
+                out.write("\n")             # a blank line between sets
+            last = r.get(group_key)
+        first = False
+        out.write(r["path"] + "\n")
+
+
+def _machine_out(args):
+    """The --json / --csv choice on a CLI command, or None for the usual
+    console listing. stdout is switched to UTF-8 with no newline
+    translation, so the CSV is byte-exact on Windows too."""
+    fmt = ("json" if getattr(args, "json", False)
+           else "csv" if getattr(args, "csv", False) else None)
+    if fmt:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", newline="")
+        except (AttributeError, ValueError):
+            pass
+    return fmt
+
+
 def search_rows(conn, query, limit=25, exts=None, snippet_len=14):
     """Full-text search. Returns [(path, size, mtime, snippet, rank)] rows."""
     sql = ("SELECT f.path, f.size, f.mtime, "
@@ -2064,6 +2314,11 @@ def cmd_search(args):
                          "a NOT b, prefix*, NEAR(a b, 5)\n")
         return 1
 
+    fmt = _machine_out(args)
+    if fmt:
+        write_results((result_record(p, s, m, False, snip)
+                       for p, s, m, snip, _r in rows), sys.stdout, fmt)
+        return 0
     if not rows:
         print("No matches.")
         return 0
@@ -2081,6 +2336,11 @@ def cmd_search(args):
 def cmd_name(args):
     conn = open_db(args.db)
     rows = name_rows(conn, args.pattern, args.limit, getattr(args, "ext", None))
+    fmt = _machine_out(args)
+    if fmt:
+        write_results((result_record(p, s, m) for p, s, m in rows),
+                      sys.stdout, fmt)
+        return 0
     for i, (path, size, mtime) in enumerate(rows, 1):
         when = time.strftime("%Y-%m-%d", time.localtime(mtime))
         print("{:>4}. {:>7}  {}  {}".format(i, human(size), when, path))
@@ -2097,6 +2357,13 @@ def cmd_find(args):
     except sqlite3.OperationalError as exc:
         sys.stderr.write("Query error: {}\n".format(exc))
         return 1
+    fmt = _machine_out(args)
+    if fmt:
+        with_snip = bool(parse_query(args.query)["content"])
+        write_results((result_record(p, s, m, bool(d), snip if with_snip
+                                     else None)
+                       for p, s, m, snip, d in rows), sys.stdout, fmt)
+        return 0
     for i, (path, size, mtime, snip, is_dir) in enumerate(rows, 1):
         when = time.strftime("%Y-%m-%d", time.localtime(mtime))
         print("{:>4}. {:>7}  {}  {}".format(
@@ -2108,12 +2375,23 @@ def cmd_find(args):
 
 
 def cmd_dupes(args):
-    if getattr(args, "exact", False) or getattr(args, "near", False):
+    if (getattr(args, "exact", False) or getattr(args, "near", False)
+            or getattr(args, "images", False)):
         import findex_hash
         return findex_hash.cmd_dupes(args)
     conn = open_db(args.db)
     groups, files, wasted = dupe_summary(conn, getattr(args, "ext", None))
     rows = dupe_rows(conn, args.limit, getattr(args, "ext", None))
+    fmt = _machine_out(args)
+    if fmt:
+        recs, keys = [], {}
+        for path, size, mtime, n in rows:
+            key = (os.path.basename(path), size)
+            rec = result_record(path, size, mtime)
+            rec["set"] = keys.setdefault(key, len(keys) + 1)
+            recs.append(rec)
+        write_results(recs, sys.stdout, fmt, group_key="set")
+        return 0
     last = None
     for path, size, mtime, n in rows:
         key = (os.path.basename(path), size)
@@ -2474,7 +2752,43 @@ def tool_modules():
         mods.append(findex_organise)
     except ImportError:
         pass
+    try:
+        import findex_schedule
+        mods.append(findex_schedule)
+    except ImportError:
+        pass
     return mods
+
+
+REFRESH_LOG = "findex-refresh.log"   # output of console-less runs, by the db
+
+
+def _headless_log(fallback, argv=None):
+    """A text stream for a run that has no console: findex-refresh.log in
+    the database's folder (--db is looked for in argv by hand - the parser
+    has not run yet and may itself want to print). Truncated per run, so it
+    is always the last run's output. `fallback` when even that fails."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    folder = os.path.dirname(os.path.abspath(DEFAULT_DB))
+    for i, a in enumerate(argv):
+        if a == "--db" and i + 1 < len(argv):
+            folder = os.path.dirname(os.path.abspath(argv[i + 1]))
+        elif a.startswith("--db="):
+            folder = os.path.dirname(os.path.abspath(a[5:]))
+    try:
+        return open(os.path.join(folder, REFRESH_LOG), "w", encoding="utf-8",
+                    errors="replace", buffering=1)
+    except OSError:
+        return fallback
+
+
+def _machine_flags(p):
+    """--json / --csv on the commands that list results, for scripts."""
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--json", action="store_true",
+                   help="write the results as a JSON array on stdout (UTF-8)")
+    g.add_argument("--csv", action="store_true",
+                   help="write the results as CSV on stdout (UTF-8, header row)")
 
 
 def main(argv=None):
@@ -2494,8 +2808,9 @@ def main(argv=None):
                    help="extract text from OneDrive online-only files "
                         "(forces downloads; their names are indexed either way)")
     p.add_argument("--ocr", action="store_true",
-                   help="OCR scanned PDFs with the engine built into Windows/"
-                        "macOS, or tesseract (slow; first {} pages of each)"
+                   help="OCR scanned PDFs and image files (png, jpg, tiff, "
+                        "webp...) with the engine built into Windows/macOS, "
+                        "or tesseract (slow; first {} pages of each)"
                         .format(OCR_MAX_PAGES))
     p.add_argument("--progress", action="store_true",
                    help="emit machine-readable @P progress lines (used by the GUI)")
@@ -2513,10 +2828,12 @@ def main(argv=None):
                        "names, content:word, C:\\ paths, ext:pdf, !not")
     p.add_argument("query")
     p.add_argument("-n", "--limit", type=int, default=50)
+    _machine_flags(p)
     p.set_defaults(func=cmd_find)
 
     p = sub.add_parser("dupes", help="duplicate files: same name and size "
-                       "(instant), --exact identical bytes, --near similar text")
+                       "(instant), --exact identical bytes, --near similar "
+                       "text, --images similar pictures")
     p.add_argument("-n", "--limit", type=int, default=0)
     p.add_argument("-e", "--ext", nargs="+", help="restrict to extensions")
     p.add_argument("--exact", action="store_true",
@@ -2525,21 +2842,30 @@ def main(argv=None):
     p.add_argument("--near", action="store_true",
                    help="documents whose extracted text is nearly the same - "
                         "revisions of one document under different names")
+    p.add_argument("--images", action="store_true",
+                   help="pictures that look alike - the same photo resized, "
+                        "re-saved or lightly edited (perceptual fingerprints)")
+    p.add_argument("--distance", type=int, default=None, metavar="BITS",
+                   help="how different two fingerprints may be and still "
+                        "match: default 10 of 64 for --images, 3 for --near")
     p.add_argument("--under", metavar="FOLDER", help="only beneath this folder")
     p.add_argument("--no-hash", action="store_true",
                    help="use the hashes already stored; do not read any file")
+    _machine_flags(p)
     p.set_defaults(func=cmd_dupes)
 
     p = sub.add_parser("search", help="full-text search of file contents")
     p.add_argument("query")
     p.add_argument("-n", "--limit", type=int, default=25)
     p.add_argument("-e", "--ext", nargs="+", help="restrict to extensions")
+    _machine_flags(p)
     p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("name", help="filename search")
     p.add_argument("pattern")
     p.add_argument("-n", "--limit", type=int, default=50)
     p.add_argument("-e", "--ext", nargs="+", help="restrict to extensions")
+    _machine_flags(p)
     p.set_defaults(func=cmd_name)
 
     p = sub.add_parser("gui", help="open the desktop app")
@@ -2586,13 +2912,22 @@ def main(argv=None):
     for mod in tool_modules():
         mod.add_commands(sub)
 
+    # A run with no console at all - the windowed standalone exe, or
+    # pythonw, started by the background refresh (findex schedule) - has
+    # None for its streams, and the first stderr.write would end it. Send
+    # both to a log file beside the database instead; the last run is kept.
+    if sys.stdout is None or sys.stderr is None:
+        log = _headless_log(open(os.devnull, "w"), argv)
+        sys.stdout = sys.stdout or log
+        sys.stderr = sys.stderr or log
+
     # A file name the console/pipe encoding cannot represent must never
     # kill a run (Windows pipes default to cp1252): replace, don't raise.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(errors="replace")
         except (AttributeError, ValueError):
-            pass    # no stream at all (windowed build), or not a text stream
+            pass    # not a text stream
 
     args = ap.parse_args(argv)
     try:
