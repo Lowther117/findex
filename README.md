@@ -309,15 +309,25 @@ is remembered in `findex_gui.json`.
   folder* - a Downloads tidy, a shared drive that grew by accretion, a
   project handover. **Move** or **Copy**; unmatched files stay where they
   are unless **Sweep unmatched files into** is ticked (default `_Unsorted`).
-- **Rules**, one per line, first match wins, typed on the left with the
-  plan updating as you type. A pattern is a glob (`Invoice*`, quoted if it
-  has spaces), a regex (`re:^([A-Z]{3})-\d+`, groups come back as `{1}`),
-  `ext:pdf;docx`, `type:images`, `year:2019-2021`, `older:3y` / `newer:30d`
-  or `*`; several on one line must all match. The destination is a folder
-  path with tokens: `{1}`.., `{name}`, `{stem}`, `{ext}`, `{type}`,
-  `{first}`, `{year}` `{month}` `{day}` `{date}` `{yyyymm}`, `{parent}`,
-  and `|upper` / `|lower` / `|title` filters. Help > Organise rules has the
-  full sheet with examples.
+- **Rules** are built in plain English, one row each: *name starts with* /
+  *contains* / *ends with* / *is exactly* + the text, *file type is*
+  (Pictures, Videos, Music, Documents, Zip & archives, Programs, Emails,
+  Code), *extension is* (`pdf, docx`), *older than* / *newer than* (`3
+  years`, `30 days`), or *anything else*; then "go into folder" (`Finance/
+  Invoices` nests) and optionally "then by" year / year and month / file
+  type / first word / extension. Rows can be reordered - the first that
+  fits wins - and a row that is missing something says so underneath. The
+  plan updates as you type.
+- Tick **Advanced** to see and edit the same rules as text, one per line:
+  a pattern is a glob (`Invoice*`, quoted if it has spaces), a regex
+  (`re:^([A-Z]{3})-\d+`, groups come back as `{1}`), `ext:pdf;docx`,
+  `type:images`, `year:2019-2021`, `older:3y` / `newer:30d` or `*`; several
+  on one line must all match. The destination is a folder path with tokens:
+  `{1}`.., `{name}`, `{stem}`, `{ext}`, `{type}`, `{first}`, `{year}`
+  `{month}` `{day}` `{date}` `{yyyymm}`, `{parent}`, and `|upper` /
+  `|lower` / `|title` filters. A text rule the builder has no boxes for
+  (a regex) shows in the builder as an "advanced rule" row and still works.
+  Help > Organise rules has the full sheet with examples.
 - **Suggest rules** reads the names and drafts a rule set with a count and
   examples against each: recurring leading words (`invoice*` -> Invoices,
   `"board minutes*"` -> Board/Minutes - it knows common kinds and nests

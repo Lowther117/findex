@@ -16,11 +16,30 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import re
+
 import findex
 import findex_organise
 import findex_rename
 
 RULES_HELP = """\
+THE SIMPLE BUILDER (the default view)
+
+Each rule is one row: which files, and which folder they go into.
+    name starts with / contains / ends with / is exactly   + the text
+    file type is        Pictures, Videos, Music, Documents, Zip, Programs...
+    extension is        pdf, docx
+    older than / newer than      3 years, 6 months, 30 days
+    anything else       every file no earlier rule took - put it last
+"go into folder" is the folder to make under the one being organised
+(Finance/Invoices puts a folder inside a folder); "then by" splits it
+further - a subfolder per year, per year and month, per file type...
+Rules are checked top to bottom and the first that fits wins, so put
+specific rules above general ones. Press "Suggest rules" to have the
+rows drafted from the file names, then adjust them.
+
+THE TEXT SYNTAX (tick "Advanced")
+
 One rule per line - first match wins.  Comments start with #.
 
     pattern [pattern ...] -> destination
@@ -60,6 +79,183 @@ reverses exactly, folders created and removed included.
 
 def _g():
     return sys.modules["findex_gui"]
+
+
+# The simple builder's vocabulary. Each row is a dict:
+#   cond   one of COND's keys      value  the text / type key / age
+#   dest   folder                  sub    one of SUBS' keys ("" = none)
+#   raw    the rule text when the builder has no shape for it (else None)
+#   note   a comment shown under the row (the suggester's reason)
+COND = (("starts", "name starts with"), ("contains", "name contains"),
+        ("ends", "name ends with"), ("exact", "name is exactly"),
+        ("type", "file type is"), ("ext", "extension is"),
+        ("older", "older than"), ("newer", "newer than"),
+        ("any", "anything else"))
+TYPES = (("images", "Pictures"), ("videos", "Videos"),
+         ("audio", "Music & audio"), ("documents", "Documents"),
+         ("compressed", "Zip & archives"), ("programs", "Programs & installers"),
+         ("emails", "Emails"), ("code", "Code & scripts"))
+SUBS = (("", "nothing more"), ("year", "year"), ("ym", "year, then month"),
+        ("type", "file type"), ("first", "first word of the name"),
+        ("ext", "extension"))
+_SUB_SUFFIX = {"year": "/{year}", "ym": "/{year}/{month}", "type": "/{type}",
+               "first": "/{first|title}", "ext": "/{ext}"}
+_AGE_UNITS = {"day": "d", "days": "d", "d": "d", "week": "w", "weeks": "w",
+              "w": "w", "month": "m", "months": "m", "m": "m", "year": "y",
+              "years": "y", "y": "y", "yr": "y", "yrs": "y"}
+
+
+def _quote_glob(text):
+    return '"{}"'.format(text) if (" " in text or not text) else text
+
+
+def _age_spec(text):
+    """'3 years' / '30 days' / '6m' -> '3y' / '30d' / '6m' (None if unclear)."""
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)\s*$", text or "")
+    if not m:
+        return None
+    unit = _AGE_UNITS.get(m.group(2).lower() or "days")
+    return (m.group(1) + unit) if unit else None
+
+
+def row_to_line(row):
+    """One builder row -> one rule line (or its raw text)."""
+    if row.get("raw") is not None:
+        return row["raw"]
+    cond, value = row.get("cond", "starts"), (row.get("value") or "").strip()
+    dest = (row.get("dest") or "").strip().strip("/\\")
+    dest = dest + _SUB_SUFFIX.get(row.get("sub") or "", "")
+    if cond == "starts":
+        pat = _quote_glob(value + "*")
+    elif cond == "contains":
+        pat = _quote_glob("*" + value + "*")
+    elif cond == "ends":
+        pat = 'rei:"{}(\\.[^.]+)?$"'.format(re.escape(value))
+    elif cond == "exact":
+        pat = 'rei:"^{}(\\.[^.]+)?$"'.format(re.escape(value))
+    elif cond == "type":
+        pat = "type:" + (value or "documents")
+    elif cond == "ext":
+        exts = [e.strip().lstrip(".") for e in
+                re.split(r"[,; ]+", value) if e.strip()]
+        pat = "ext:" + ";".join(exts)
+    elif cond in ("older", "newer"):
+        pat = "{}:{}".format(cond, _age_spec(value) or "?")
+    else:
+        pat = "*"
+    return "{} -> {}".format(pat, dest or "?")
+
+
+def rows_to_text(rows):
+    lines = []
+    for row in rows:
+        if row.get("note"):
+            lines.append("# " + row["note"])
+        lines.append(row_to_line(row))
+    return "\n".join(lines)
+
+
+def rows_lines(rows):
+    """The rule-line number each row generates (for matching issues)."""
+    out, n = [], 0
+    for row in rows:
+        if row.get("note"):
+            n += 1
+        n += 1
+        out.append(n)
+    return out
+
+
+_ENDS = re.compile(r'^rei:"(.*)\(\\\.\[\^\.\]\+\)\?\$"$')
+_EXACT = re.compile(r'^rei:"\^(.*)\(\\\.\[\^\.\]\+\)\?\$"$')
+
+
+def _unescape(text):
+    return re.sub(r"\\(.)", r"\1", text)
+
+
+def line_to_row(line, note=""):
+    """A rule line -> a builder row; a shape the builder lacks -> raw."""
+    row = {"cond": "starts", "value": "", "dest": "", "sub": "", "raw": None,
+           "note": note}
+    sep = "->" if "->" in line else ("=>" if "=>" in line else None)
+    if sep is None:
+        row["raw"] = line
+        return row
+    left, _, right = line.partition(sep)
+    left, dest = left.strip(), right.strip().strip('"')
+    for key, suffix in _SUB_SUFFIX.items():
+        if dest.endswith(suffix):
+            row["sub"] = key
+            dest = dest[:-len(suffix)]
+            break
+    if "{" in dest:
+        row["raw"] = line
+        return row
+    row["dest"] = dest
+    toks = findex_organise._tokens(left)
+    if len(toks) != 1:
+        row["raw"] = line
+        return row
+    tok = toks[0]
+    low = tok.lower()
+    m = _ENDS.match(left) or None
+    if left == "*":
+        row["cond"] = "any"
+    elif low.startswith("type:"):
+        g = tok[5:].split(";")[0].lower()
+        if g not in dict(TYPES) or ";" in tok:
+            row["raw"] = line
+            return row
+        row["cond"], row["value"] = "type", g
+    elif low.startswith("ext:"):
+        row["cond"], row["value"] = "ext", ", ".join(
+            e for e in tok[4:].split(";") if e)
+    elif low.startswith(("older:", "newer:")):
+        kind, spec = low.split(":", 1)
+        mm = re.fullmatch(r"(\d+(?:\.\d+)?)([dwmy])", spec)
+        if not mm:
+            row["raw"] = line
+            return row
+        row["cond"] = kind
+        row["value"] = "{} {}".format(mm.group(1), {
+            "d": "days", "w": "weeks", "m": "months", "y": "years"}[mm.group(2)])
+    elif _EXACT.match(left):
+        row["cond"], row["value"] = "exact", _unescape(_EXACT.match(left).group(1))
+    elif m:
+        row["cond"], row["value"] = "ends", _unescape(m.group(1))
+    elif low.startswith(("re:", "rei:", "year:")):
+        row["raw"] = line
+        return row
+    else:
+        if tok.startswith("*") and tok.endswith("*") and len(tok) > 2 \
+                and "*" not in tok[1:-1] and "?" not in tok:
+            row["cond"], row["value"] = "contains", tok[1:-1]
+        elif tok.endswith("*") and "*" not in tok[:-1] and "?" not in tok \
+                and "[" not in tok:
+            row["cond"], row["value"] = "starts", tok[:-1]
+        else:
+            row["raw"] = line
+            return row
+    return row
+
+
+def text_to_rows(text):
+    rows, note = [], ""
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            body = line.lstrip("#").strip()
+            if body.startswith("---") or body.startswith("suggested by") \
+                    or body.startswith("note:"):
+                continue
+            note = body
+            continue
+        rows.append(line_to_row(line, note))
+        note = ""
+    return rows
 
 
 class OrganiseTab:
@@ -165,11 +361,58 @@ class OrganiseTab:
         body.pack(fill="both", expand=True, padx=12, pady=(4, 6))
         left = ttk.Frame(body)
         left.pack(side="left", fill="both", expand=False, padx=(0, 8))
-        hdr = ttk.Label(left, style="Dim.TLabel",
-                        text="Rules - one per line, first match wins.  "
-                             "Help > Organise rules for the syntax.")
+        hdr = ttk.Frame(left)
         hdr.pack(fill="x", pady=(0, 4))
-        holder = ttk.Frame(left)
+        ttk.Label(hdr, style="Dim.TLabel",
+                  text="Rules - checked top to bottom, the first that fits "
+                       "wins").pack(side="left")
+        self.var_oadvanced = tk.BooleanVar(value=False)
+        b = ttk.Checkbutton(hdr, text="Advanced (edit as text)",
+                            variable=self.var_oadvanced,
+                            command=self._organise_toggle_view)
+        b.pack(side="right")
+        self.tip(b, "Switch between the simple rule builder and the rules "
+                    "as text. Both edit the same rules; a rule the builder "
+                    "cannot show (a hand-written regular expression) is "
+                    "kept as an 'advanced' row. Help > Organise rules has "
+                    "the text syntax.")
+
+        # simple builder: one row per rule
+        self.obuilder = ttk.Frame(left)
+        self.obuilder.pack(fill="both", expand=True)
+        self._orows = []                       # [dict] - the builder's model
+        self._orow_widgets = []
+        canvas_holder = ttk.Frame(self.obuilder)
+        canvas_holder.pack(fill="both", expand=True)
+        self.ocanvas = tk.Canvas(canvas_holder, highlightthickness=0,
+                                 borderwidth=0, width=560)
+        vsb = ttk.Scrollbar(canvas_holder, orient="vertical",
+                            command=self.ocanvas.yview)
+        self.ocanvas.configure(yscrollcommand=vsb.set)
+        self.ocanvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.orows_frame = ttk.Frame(self.ocanvas)
+        self._ocanvas_win = self.ocanvas.create_window(
+            (0, 0), window=self.orows_frame, anchor="nw")
+        self.orows_frame.bind("<Configure>", lambda e: self.ocanvas.configure(
+            scrollregion=self.ocanvas.bbox("all")))
+        self.ocanvas.bind("<Configure>", lambda e: self.ocanvas.itemconfigure(
+            self._ocanvas_win, width=e.width))
+        addrow = ttk.Frame(self.obuilder)
+        addrow.pack(fill="x", pady=(6, 0))
+        b = ttk.Button(addrow, text="+ Add a rule", command=self._organise_add_row)
+        b.pack(side="left")
+        self.tip(b, "Add a blank rule: choose what to look for in the file's "
+                    "name or type, and the folder those files should go into.")
+        b = ttk.Button(addrow, text="Remove all", command=self._organise_clear_rows)
+        b.pack(side="left", padx=(6, 0))
+        ttk.Label(addrow, style="Dim.TLabel",
+                  text="   Each rule: which files  ->  which folder").pack(
+            side="left")
+
+        # advanced: the rules as text
+        self.otextframe = ttk.Frame(left)
+        holder = ttk.Frame(self.otextframe)
         holder.pack(fill="both", expand=True)
         self.rules_text = tk.Text(holder, width=54, wrap="none", relief="flat",
                                   padx=8, pady=6, undo=True)
@@ -179,8 +422,11 @@ class OrganiseTab:
         self.rules_text.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self.rules_text.bind("<<Modified>>", self._organise_text_changed)
-        self.tip(self.rules_text, "Type rules here. The plan on the right "
-                                  "updates as you type.", popup=False)
+        self.tip(self.rules_text, "Type rules here - one per line, first match "
+                                  "wins. The plan on the right updates as you "
+                                  "type.", popup=False)
+        self._orules = ""                      # the rules, as the engine sees them
+        self._osyncing = False
 
         right = ttk.Frame(body)
         right.pack(side="left", fill="both", expand=True)
@@ -273,29 +519,234 @@ class OrganiseTab:
     # -- rules text --------------------------------------------------------
 
     def _organise_rules(self):
-        try:
-            return self.rules_text.get("1.0", "end").rstrip("\n")
-        except tk.TclError:
-            return ""
+        return self._orules
 
     def _organise_set_rules(self, text):
-        self.rules_text.configure(state="normal")
-        self.rules_text.delete("1.0", "end")
-        self.rules_text.insert("1.0", text)
+        """New rules from outside (a suggestion, a template): update the
+        model, both views, and the plan."""
+        self._orules = text.rstrip("\n")
+        self._osyncing = True
         try:
-            self.rules_text.edit_modified(False)
-        except tk.TclError:
-            pass
+            self.rules_text.configure(state="normal")
+            self.rules_text.delete("1.0", "end")
+            self.rules_text.insert("1.0", self._orules)
+            try:
+                self.rules_text.edit_modified(False)
+            except tk.TclError:
+                pass
+            self._orows = text_to_rows(self._orules)
+            self._organise_render_rows()
+        finally:
+            self._osyncing = False
         self._organise_debounce()
 
     def _organise_text_changed(self, _event=None):
+        if self._osyncing:
+            return
         try:
             if not self.rules_text.edit_modified():
                 return
             self.rules_text.edit_modified(False)
         except tk.TclError:
             pass
+        self._orules = self.rules_text.get("1.0", "end").rstrip("\n")
         self._organise_debounce()
+
+    def _organise_toggle_view(self):
+        """Builder <-> text. Going to text shows the rules as they are;
+        coming back parses them into rows (hand-written rules the builder
+        has no shape for become 'advanced' rows)."""
+        if self.var_oadvanced.get():
+            self.obuilder.pack_forget()
+            self.otextframe.pack(fill="both", expand=True)
+        else:
+            self._orows = text_to_rows(self._orules)
+            self._organise_render_rows()
+            self.otextframe.pack_forget()
+            self.obuilder.pack(fill="both", expand=True)
+
+    # -- the simple builder --------------------------------------------------
+
+    def _organise_rows_changed(self):
+        """A builder row was edited: regenerate the text and re-plan."""
+        if self._osyncing:
+            return
+        self._orules = rows_to_text(self._orows)
+        self._osyncing = True
+        try:
+            self.rules_text.configure(state="normal")
+            self.rules_text.delete("1.0", "end")
+            self.rules_text.insert("1.0", self._orules)
+            try:
+                self.rules_text.edit_modified(False)
+            except tk.TclError:
+                pass
+        finally:
+            self._osyncing = False
+        self._organise_debounce()
+
+    def _organise_add_row(self, row=None):
+        self._orows.append(row or {"cond": "starts", "value": "", "dest": "",
+                                   "sub": "", "raw": None, "note": ""})
+        self._organise_render_rows()
+        self._organise_rows_changed()
+
+    def _organise_clear_rows(self):
+        if self._orows and not messagebox.askyesno(
+                "Remove all rules?", "Clear every rule from the list?"):
+            return
+        self._orows = []
+        self._organise_render_rows()
+        self._organise_rows_changed()
+
+    def _organise_row_op(self, i, op):
+        rows = self._orows
+        if op == "del":
+            rows.pop(i)
+        elif op == "up" and i > 0:
+            rows[i - 1], rows[i] = rows[i], rows[i - 1]
+        elif op == "down" and i < len(rows) - 1:
+            rows[i + 1], rows[i] = rows[i], rows[i + 1]
+        self._organise_render_rows()
+        self._organise_rows_changed()
+
+    def _organise_render_rows(self):
+        """Rebuild the builder's widgets from the model."""
+        for w in self._orow_widgets:
+            w.destroy()
+        self._orow_widgets = []
+        frame = self.orows_frame
+        if not self._orows:
+            lbl = ttk.Label(frame, style="Dim.TLabel", text=(
+                "No rules yet. Press 'Suggest rules' to draft some from the "
+                "file names, or '+ Add a rule'."))
+            lbl.pack(fill="x", padx=6, pady=10)
+            self._orow_widgets.append(lbl)
+            return
+        for i, row in enumerate(self._orows):
+            box = ttk.Frame(frame, padding=(4, 4))
+            box.pack(fill="x", pady=(0, 2))
+            self._orow_widgets.append(box)
+            self._organise_render_row(box, i, row)
+
+    def _organise_render_row(self, box, i, row):
+        cond_labels = [lbl for k, lbl in COND]
+        top = ttk.Frame(box)
+        top.pack(fill="x")
+        ttk.Label(top, text="{}.".format(i + 1), width=3).pack(side="left")
+        if row.get("raw") is not None:
+            raw = row["raw"]
+            shown = raw if len(raw) <= 58 else raw[:55] + "..."
+            lbl = ttk.Label(top, text="advanced rule:  " + shown,
+                            style="Dim.TLabel")
+            lbl.pack(side="left", fill="x", expand=True, padx=(4, 4))
+            self.tip(lbl, "A rule written in the text syntax that the builder "
+                          "has no boxes for (a pattern such as a reference "
+                          "code). It works as it is; to change it, tick "
+                          "Advanced.\n\n" + raw)
+        else:
+            var_c = tk.StringVar(value=dict(COND).get(row["cond"], cond_labels[0]))
+            cb = ttk.Combobox(top, textvariable=var_c, width=17, state="readonly",
+                              values=cond_labels)
+            cb.pack(side="left")
+            self.tip(cb, "What to look for. 'anything else' catches every "
+                         "file no earlier rule took - put it last.")
+
+            var_v = tk.StringVar(value=row.get("value", ""))
+            if row["cond"] == "type":
+                ev = ttk.Combobox(top, textvariable=var_v, width=20,
+                                  state="readonly",
+                                  values=[lbl for k, lbl in TYPES])
+                var_v.set(dict(TYPES).get(row.get("value", ""),
+                                          row.get("value", "")))
+            elif row["cond"] == "any":
+                ev = ttk.Label(top, text="(every remaining file)", width=22)
+            else:
+                ev = ttk.Entry(top, textvariable=var_v, width=22)
+                hint = {"starts": "e.g.  Invoice", "contains": "e.g.  minutes",
+                        "ends": "e.g.  final  (before the .pdf)",
+                        "exact": "e.g.  Thumbs.db", "ext": "e.g.  pdf, docx",
+                        "older": "e.g.  3 years  /  6 months  /  30 days",
+                        "newer": "e.g.  30 days"}.get(row["cond"], "")
+                if hint:
+                    self.tip(ev, hint)
+            ev.pack(side="left", padx=(4, 0))
+
+            def on_cond(_e=None, r=row, vc=var_c):
+                key = {lbl: k for k, lbl in COND}[vc.get()]
+                if key != r["cond"]:
+                    r["cond"] = key
+                    if key in ("type", "any"):
+                        r["value"] = TYPES[0][0] if key == "type" else ""
+                    self._organise_render_rows()
+                    self._organise_rows_changed()
+            cb.bind("<<ComboboxSelected>>", on_cond)
+
+            def on_value(_e=None, r=row, vv=var_v):
+                v = vv.get()
+                if r["cond"] == "type":
+                    v = {lbl: k for k, lbl in TYPES}.get(v, v)
+                if v != r.get("value"):
+                    r["value"] = v
+                    self._organise_rows_changed()
+            if isinstance(ev, ttk.Combobox):
+                ev.bind("<<ComboboxSelected>>", on_value)
+            elif isinstance(ev, ttk.Entry):
+                ev.bind("<KeyRelease>", on_value)
+                ev.bind("<FocusOut>", on_value)
+
+        ops = ttk.Frame(top)
+        ops.pack(side="right")
+        for text, op, tip in (("\u25b2", "up", "Move this rule up - earlier "
+                                            "rules win"),
+                              ("\u25bc", "down", "Move this rule down"),
+                              ("\u2715", "del", "Remove this rule")):
+            b = ttk.Button(ops, text=text, width=2,
+                           command=lambda i=i, op=op: self._organise_row_op(i, op))
+            b.pack(side="left", padx=(2, 0))
+            self.tip(b, tip)
+
+        if row.get("raw") is None:
+            bottom = ttk.Frame(box)
+            bottom.pack(fill="x", pady=(3, 0))
+            ttk.Label(bottom, text="", width=3).pack(side="left")
+            ttk.Label(bottom, text="go into folder").pack(side="left")
+            var_d = tk.StringVar(value=row.get("dest", ""))
+            ed = ttk.Entry(bottom, textvariable=var_d, width=22)
+            ed.pack(side="left", padx=(4, 0))
+            self.tip(ed, "The folder to put them in, made under the folder "
+                         "being organised. Use / for a folder inside a "
+                         "folder: Finance/Invoices")
+
+            def on_dest(_e=None, r=row, vd=var_d):
+                if vd.get() != r.get("dest"):
+                    r["dest"] = vd.get()
+                    self._organise_rows_changed()
+            ed.bind("<KeyRelease>", on_dest)
+            ed.bind("<FocusOut>", on_dest)
+            ttk.Label(bottom, text="then by").pack(side="left", padx=(8, 0))
+            var_s = tk.StringVar(value=dict(SUBS).get(row.get("sub", ""),
+                                                      SUBS[0][1]))
+            cs = ttk.Combobox(bottom, textvariable=var_s, width=17,
+                              state="readonly", values=[lbl for k, lbl in SUBS])
+            cs.pack(side="left", padx=(4, 0))
+            self.tip(cs, "Optionally split that folder further - a subfolder "
+                         "per year, per year and month, per file type...")
+
+            def on_sub(_e=None, r=row, vs=var_s):
+                key = {lbl: k for k, lbl in SUBS}[vs.get()]
+                if key != r.get("sub", ""):
+                    r["sub"] = key
+                    self._organise_rows_changed()
+            cs.bind("<<ComboboxSelected>>", on_sub)
+        note = row.get("note") or ""
+        issue = row.get("issue")
+        if note or issue:
+            lbl = ttk.Label(box, style="Dim.TLabel", wraplength=540,
+                            text=(("! " + issue + "   ") if issue else "") + note)
+            lbl.pack(fill="x", padx=(28, 0), pady=(2, 0))
+            if issue:
+                lbl.configure(style="Accent.TLabel")
 
     def _organise_debounce(self):
         if self._oafter:
@@ -394,6 +845,26 @@ class OrganiseTab:
                                             "{}.end".format(line))
         except tk.TclError:
             pass
+        # the same problems against the builder's rows
+        line_of = rows_lines(self._orows)
+        by_line = {}
+        for level, line, msg in plan.issues:
+            if line and level in ("error", "warning"):
+                by_line.setdefault(line, []).append(msg)
+        changed = False
+        for row, line in zip(self._orows, line_of):
+            issue = "; ".join(by_line.get(line, [])) or None
+            if row.get("raw") is None:          # plainer words for blanks
+                if not (row.get("dest") or "").strip():
+                    issue = "type the folder these files should go into"
+                elif row.get("cond") not in ("any", "type") and \
+                        not (row.get("value") or "").strip():
+                    issue = "type what to look for"
+            if issue != row.get("issue"):
+                row["issue"] = issue
+                changed = True
+        if changed and not self.var_oadvanced.get():
+            self._organise_render_rows()
         errs = sum(1 for i in plan.issues if i[0] == "error")
         warns = sum(1 for i in plan.issues if i[0] == "warning")
         self.onb.tab(self.otab_issues, text=" Issues{} ".format(
