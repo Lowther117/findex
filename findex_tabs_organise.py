@@ -32,13 +32,14 @@ Each rule is one row: which files, and which folder they go into.
     older than / newer than      3 years, 6 months, 30 days
     anything else       every file no earlier rule took - put it last
 "go into folder" is the folder to make under the one being organised
-(Finance/Invoices puts a folder inside a folder); "then by" splits it
-further - a subfolder per year, per year and month, per file type...
+(Finance/Invoices puts a folder inside a folder); "then a subfolder per"
+splits it further - per year, per year and month, per file type...
 Rules are checked top to bottom and the first that fits wins, so put
-specific rules above general ones. Press "Suggest rules" to have the
-rows drafted from the file names, then adjust them.
+specific rules above general ones (Up / Down move them; Remove takes one
+out). Press "Suggest rules" to have the rows drafted from the file names,
+then adjust them. Problems with a rule appear underneath it.
 
-THE TEXT SYNTAX (tick "Advanced")
+THE TEXT SYNTAX (More > Advanced: edit rules as text)
 
 One rule per line - first match wins.  Comments start with #.
 
@@ -273,123 +274,87 @@ class OrganiseTab:
         self.var_oident = tk.BooleanVar(value=True)
         self.var_oempty = tk.BooleanVar(value=True)
         self.var_otemplate = tk.StringVar(value="")
-        self.var_ostatus = tk.StringVar(value="Choose a folder and write or "
-                                              "suggest some rules.")
+        self.var_oadvanced = tk.BooleanVar(value=False)
+        self.var_ostatus = tk.StringVar(value="Choose a folder, then press "
+                                              "Suggest rules or add your own.")
+        self.var_oapply = tk.StringVar(value="Move the files...")
 
-        top = ttk.Frame(t)
-        top.pack(fill="x", padx=12, pady=(10, 4))
-        ttk.Label(top, text="Folder:").pack(side="left")
-        e = ttk.Entry(top, textvariable=self.var_oroot)
-        e.pack(side="left", fill="x", expand=True, padx=(6, 4))
-        self.tip(e, "The folder to tidy. Every file beneath it - subfolders "
-                    "included - is considered and re-sorted against the "
-                    "rules into subfolders of this folder.", popup=False)
+        # ---- 1. which folder --------------------------------------------
+        step1 = ttk.Frame(t)
+        step1.pack(fill="x", padx=12, pady=(10, 2))
+        ttk.Label(step1, text="1.  Folder to tidy:").pack(side="left")
+        e = ttk.Entry(step1, textvariable=self.var_oroot)
+        e.pack(side="left", fill="x", expand=True, padx=(8, 4))
+        self.tip(e, "Everything in this folder - subfolders included - is "
+                    "sorted into subfolders of it by the rules below.",
+                 popup=False)
 
         def browse():
-            d = filedialog.askdirectory(title="Folder to organise",
+            d = filedialog.askdirectory(title="Folder to tidy",
                                         initialdir=self.var_oroot.get() or None)
             if d:
                 self.var_oroot.set(os.path.normpath(d))
-        ttk.Button(top, text="Browse...", width=9, command=browse).pack(side="left")
-        ttk.Label(top, text="   ").pack(side="left")
-        rb = ttk.Radiobutton(top, text="Move", value=False, variable=self.var_ocopy)
-        rb.pack(side="left")
-        self.tip(rb, "Move files into place. Instant on the same drive, and "
-                     "the folders they leave empty can be removed.")
-        rb = ttk.Radiobutton(top, text="Copy", value=True, variable=self.var_ocopy)
-        rb.pack(side="left", padx=(6, 0))
-        self.tip(rb, "Copy files into place and leave the originals where "
-                     "they are. Undo removes the copies (if unchanged).")
-        b = ttk.Button(top, text="Suggest rules", width=13,
-                       command=self.organise_suggest)
-        b.pack(side="left", padx=(16, 0))
-        self.tip(b, "Read the names under the folder and draft a rule set: "
-                    "recurring leading words (Invoice, Board minutes...), "
-                    "reference codes (ACM-0042), date-named files, and type "
-                    "groups for the rest - each with a count. Appended below "
-                    "any rules already written; edit freely.")
-        b = ttk.Button(top, text="Check rules", width=11,
-                       command=lambda: (self._organise_plan(),
-                                        self.onb.select(self.otab_issues)))
-        b.pack(side="left", padx=(6, 0))
-        self.tip(b, "Re-run the plan and open the Issues list: bad patterns, "
-                    "unknown tokens, rules that can never match, rules an "
-                    "earlier rule shadows, collisions.")
+        ttk.Button(step1, text="Browse...", width=9, command=browse).pack(side="left")
+        b = ttk.Button(step1, text="Suggest rules", width=13,
+                       style="Accent.TButton", command=self.organise_suggest)
+        b.pack(side="left", padx=(12, 0))
+        self.tip(b, "Look at the file names and draft the rules for you - "
+                    "files that start with the same word, reference codes, "
+                    "date-named files, then by type. Each suggested rule says "
+                    "how many files it covers. Change or remove any of them.")
+        self.omore = ttk.Menubutton(step1, text="More \u25be", width=8)
+        self.omore.pack(side="left", padx=(6, 0))
+        self.omore_menu = tk.Menu(self.omore, tearoff=0)
+        self._menus.append(self.omore_menu)
+        self.omore["menu"] = self.omore_menu
+        self.otemplate_menu = tk.Menu(self.omore_menu, tearoff=0,
+                                      postcommand=self._organise_templates)
+        self._menus.append(self.otemplate_menu)
+        self.omore_menu.add_cascade(label="Load saved rules", menu=self.otemplate_menu)
+        self.omore_menu.add_command(label="Save these rules as...",
+                                    command=self.organise_save_template)
+        self.omore_menu.add_command(label="Delete saved rules...",
+                                    command=self.organise_delete_template)
+        self.omore_menu.add_separator()
+        self.omore_menu.add_command(label="Check the rules for problems",
+                                    command=lambda: (self._organise_plan(),
+                                                     self.onb.select(self.otab_issues)))
+        self.omore_menu.add_command(label="Export the plan...",
+                                    command=self.organise_export)
+        self.omore_menu.add_separator()
+        self.omore_menu.add_checkbutton(label="Advanced: edit rules as text",
+                                        variable=self.var_oadvanced,
+                                        command=self._organise_toggle_view)
+        self.omore_menu.add_command(label="Help with rules",
+                                    command=self.show_organise_help)
+        self.tip(self.omore, "Saved rule sets, a problem check, exporting the "
+                             "plan, and the text editor for rules.")
 
-        opts = ttk.Frame(t)
-        opts.pack(fill="x", padx=12, pady=(0, 4))
-        chk = ttk.Checkbutton(opts, text="Sweep unmatched files into",
-                              variable=self.var_osweep)
-        chk.pack(side="left")
-        e = ttk.Entry(opts, textvariable=self.var_osweep_name, width=12)
-        e.pack(side="left", padx=(4, 12))
-        for w in (chk, e):
-            self.tip(w, "Files no rule matches normally stay where they are. "
-                        "Tick this and they are gathered into this folder "
-                        "instead - the same as a final '* -> _Unsorted' rule.")
-        chk = ttk.Checkbutton(opts, text="Identical file already there = done",
-                              variable=self.var_oident)
-        chk.pack(side="left", padx=(0, 12))
-        self.tip(chk, "When a byte-identical copy is already at the target "
-                      "(by content hash - see the Duplicates tab), treat the "
-                      "file as placed and skip it rather than calling it a "
-                      "collision.")
-        chk = ttk.Checkbutton(opts, text="Remove folders left empty",
-                              variable=self.var_oempty)
-        chk.pack(side="left", padx=(0, 12))
-        self.tip(chk, "After moving, remove the folders the moves emptied. "
-                      "Only folders something moved out of; folders that "
-                      "were already empty are the Health tab's business.")
-        ttk.Label(opts, text="Template:").pack(side="left")
-        self.otemplate_box = ttk.Combobox(opts, textvariable=self.var_otemplate,
-                                          width=16, state="readonly",
-                                          values=[],
-                                          postcommand=self._organise_templates)
-        self.otemplate_box.pack(side="left", padx=(4, 4))
-        self.otemplate_box.bind("<<ComboboxSelected>>",
-                                lambda e: self._organise_load_template())
-        self.tip(self.otemplate_box, "Saved rule sets (with their options), "
-                                     "kept in the index. Pick one to load it.")
-        b = ttk.Button(opts, text="Save as...", width=9,
-                       command=self.organise_save_template)
-        b.pack(side="left")
-        b = ttk.Button(opts, text="Delete", width=7,
-                       command=self.organise_delete_template)
-        b.pack(side="left", padx=(4, 0))
-
-        body = ttk.Frame(t)
-        body.pack(fill="both", expand=True, padx=12, pady=(4, 6))
-        left = ttk.Frame(body)
-        left.pack(side="left", fill="both", expand=False, padx=(0, 8))
-        hdr = ttk.Frame(left)
-        hdr.pack(fill="x", pady=(0, 4))
-        ttk.Label(hdr, style="Dim.TLabel",
-                  text="Rules - checked top to bottom, the first that fits "
-                       "wins").pack(side="left")
-        self.var_oadvanced = tk.BooleanVar(value=False)
-        b = ttk.Checkbutton(hdr, text="Advanced (edit as text)",
-                            variable=self.var_oadvanced,
-                            command=self._organise_toggle_view)
+        # ---- 2. the rules ------------------------------------------------
+        step2 = ttk.Frame(t)
+        step2.pack(fill="x", padx=12, pady=(8, 2))
+        self._ostep2 = step2
+        ttk.Label(step2, text="2.  Rules  -  read top to bottom; the first "
+                              "that fits a file wins").pack(side="left")
+        b = ttk.Button(step2, text="+ Add a rule", command=self._organise_add_row)
         b.pack(side="right")
-        self.tip(b, "Switch between the simple rule builder and the rules "
-                    "as text. Both edit the same rules; a rule the builder "
-                    "cannot show (a hand-written regular expression) is "
-                    "kept as an 'advanced' row. Help > Organise rules has "
-                    "the text syntax.")
+        self.tip(b, "Add a blank rule: what to look for, and the folder those "
+                    "files should go into.")
+        b = ttk.Button(step2, text="Clear all rules", command=self._organise_clear_rows)
+        b.pack(side="right", padx=(0, 6))
 
-        # simple builder: one row per rule
-        self.obuilder = ttk.Frame(left)
-        self.obuilder.pack(fill="both", expand=True)
+        self.obuilder = ttk.Frame(t)
+        self.obuilder.pack(fill="x", padx=12, pady=(0, 4))
         self._orows = []                       # [dict] - the builder's model
         self._orow_widgets = []
         canvas_holder = ttk.Frame(self.obuilder)
-        canvas_holder.pack(fill="both", expand=True)
+        canvas_holder.pack(fill="x")
         self.ocanvas = tk.Canvas(canvas_holder, highlightthickness=0,
-                                 borderwidth=0, width=560)
+                                 borderwidth=0, height=190)
         vsb = ttk.Scrollbar(canvas_holder, orient="vertical",
                             command=self.ocanvas.yview)
         self.ocanvas.configure(yscrollcommand=vsb.set)
-        self.ocanvas.pack(side="left", fill="both", expand=True)
+        self.ocanvas.pack(side="left", fill="x", expand=True)
         vsb.pack(side="right", fill="y")
         self.orows_frame = ttk.Frame(self.ocanvas)
         self._ocanvas_win = self.ocanvas.create_window(
@@ -398,23 +363,12 @@ class OrganiseTab:
             scrollregion=self.ocanvas.bbox("all")))
         self.ocanvas.bind("<Configure>", lambda e: self.ocanvas.itemconfigure(
             self._ocanvas_win, width=e.width))
-        addrow = ttk.Frame(self.obuilder)
-        addrow.pack(fill="x", pady=(6, 0))
-        b = ttk.Button(addrow, text="+ Add a rule", command=self._organise_add_row)
-        b.pack(side="left")
-        self.tip(b, "Add a blank rule: choose what to look for in the file's "
-                    "name or type, and the folder those files should go into.")
-        b = ttk.Button(addrow, text="Remove all", command=self._organise_clear_rows)
-        b.pack(side="left", padx=(6, 0))
-        ttk.Label(addrow, style="Dim.TLabel",
-                  text="   Each rule: which files  ->  which folder").pack(
-            side="left")
 
-        # advanced: the rules as text
-        self.otextframe = ttk.Frame(left)
+        # advanced: the same rules as text (swapped in for the builder)
+        self.otextframe = ttk.Frame(t)
         holder = ttk.Frame(self.otextframe)
         holder.pack(fill="both", expand=True)
-        self.rules_text = tk.Text(holder, width=54, wrap="none", relief="flat",
+        self.rules_text = tk.Text(holder, height=10, wrap="none", relief="flat",
                                   padx=8, pady=6, undo=True)
         vsb = ttk.Scrollbar(holder, orient="vertical",
                             command=self.rules_text.yview)
@@ -422,23 +376,59 @@ class OrganiseTab:
         self.rules_text.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self.rules_text.bind("<<Modified>>", self._organise_text_changed)
-        self.tip(self.rules_text, "Type rules here - one per line, first match "
-                                  "wins. The plan on the right updates as you "
-                                  "type.", popup=False)
+        self.tip(self.rules_text, "The rules as text - one per line, first "
+                                  "match wins. More > Help with rules has the "
+                                  "syntax.", popup=False)
         self._orules = ""                      # the rules, as the engine sees them
         self._osyncing = False
 
-        right = ttk.Frame(body)
-        right.pack(side="left", fill="both", expand=True)
-        self.onb = ttk.Notebook(right)
+        # ---- 3. what to do -----------------------------------------------
+        step3 = ttk.Frame(t)
+        step3.pack(fill="x", padx=12, pady=(6, 2))
+        ttk.Label(step3, text="3.  Then:").pack(side="left")
+        rb = ttk.Radiobutton(step3, text="Move the files", value=False,
+                             variable=self.var_ocopy)
+        rb.pack(side="left", padx=(8, 0))
+        self.tip(rb, "Move files into their folders. Instant on the same "
+                     "drive; folders left empty can be tidied away.")
+        rb = ttk.Radiobutton(step3, text="Copy them (keep the originals)",
+                             value=True, variable=self.var_ocopy)
+        rb.pack(side="left", padx=(10, 0))
+        self.tip(rb, "Copy files into their folders and leave the originals "
+                     "where they are. Undo removes the copies.")
+        chk = ttk.Checkbutton(step3, text="Files no rule fits go into",
+                              variable=self.var_osweep)
+        chk.pack(side="left", padx=(24, 0))
+        e = ttk.Entry(step3, textvariable=self.var_osweep_name, width=12)
+        e.pack(side="left", padx=(4, 0))
+        for w in (chk, e):
+            self.tip(w, "Normally a file no rule fits stays where it is. Tick "
+                        "this to gather those files into one folder instead.")
+        chk = ttk.Checkbutton(step3, text="Skip a file if an identical copy is "
+                                          "already there",
+                              variable=self.var_oident)
+        chk.pack(side="left", padx=(16, 0))
+        self.tip(chk, "If the destination already holds a byte-for-byte "
+                      "identical file, count the file as done rather than "
+                      "reporting a clash. Nothing is ever overwritten either "
+                      "way.")
+        chk = ttk.Checkbutton(step3, text="Tidy away folders left empty",
+                              variable=self.var_oempty)
+        chk.pack(side="left", padx=(16, 0))
+        self.tip(chk, "After moving, remove the folders the moves emptied.")
+
+        # ---- what will happen --------------------------------------------
+        body = ttk.Frame(t)
+        body.pack(fill="both", expand=True, padx=12, pady=(6, 6))
+        self.onb = ttk.Notebook(body)
         self.onb.pack(fill="both", expand=True)
         self.otab_plan = ttk.Frame(self.onb)
         self.otab_tree = ttk.Frame(self.onb)
         self.otab_issues = ttk.Frame(self.onb)
         self.otab_summary = ttk.Frame(self.onb)
-        self.onb.add(self.otab_plan, text=" Plan ")
-        self.onb.add(self.otab_tree, text=" Resulting tree ")
-        self.onb.add(self.otab_issues, text=" Issues ")
+        self.onb.add(self.otab_plan, text=" What will happen ")
+        self.onb.add(self.otab_tree, text=" Folders afterwards ")
+        self.onb.add(self.otab_issues, text=" Problems ")
         self.onb.add(self.otab_summary, text=" Summary ")
 
         h, self.otree_plan = self._tool_tree(
@@ -464,12 +454,13 @@ class OrganiseTab:
         h, self.otree_issues = self._tool_tree(
             self.otab_issues, ("level", "line", "message"),
             [("level", "Level", 80, "w", False),
-             ("line", "Rule line", 80, "e", False),
+             ("line", "Rule", 60, "e", False),
              ("message", "What", 600, "w", True)])
         h.pack(fill="both", expand=True)
         self.otree_issues.bind("<Double-1>", lambda e: self._organise_goto_issue())
-        self.tip(self.otree_issues, "Problems with the rules. Double-click "
-                                    "one to jump to its line.", popup=False)
+        self.tip(self.otree_issues, "Problems with the rules. The same "
+                                    "messages appear under the rule itself.",
+                 popup=False)
 
         self.osummary = tk.Text(self.otab_summary, wrap="word", relief="flat",
                                 padx=10, pady=8, state="disabled")
@@ -479,25 +470,22 @@ class OrganiseTab:
         foot.pack(fill="x", padx=12, pady=(0, 8))
         ttk.Label(foot, textvariable=self.var_ostatus,
                   style="Dim.TLabel").pack(side="left", fill="x", expand=True)
-        b = ttk.Button(foot, text="Apply...", width=10, style="Accent.TButton",
-                       command=self.organise_apply)
-        b.pack(side="right")
-        self.tip(b, "Carry the plan out as one batch. Asks first, and refuses "
-                    "while the rules have errors unless you say so.")
-        b = ttk.Button(foot, text="Undo last batch...", width=16,
+        self.obtn_apply = ttk.Button(foot, textvariable=self.var_oapply,
+                                     width=22, style="Accent.TButton",
+                                     command=self.organise_apply)
+        self.obtn_apply.pack(side="right")
+        self.tip(self.obtn_apply, "Do what the plan shows, as one batch. Asks "
+                                  "first. Undo reverses the whole batch.")
+        b = ttk.Button(foot, text="Undo the last run...", width=18,
                        command=self.organise_undo)
         b.pack(side="right", padx=(0, 6))
-        self.tip(b, "Reverse the most recent batch - moves, copies, folders "
-                    "created and folders removed - in the opposite order.")
-        b = ttk.Button(foot, text="Export plan...", width=13,
-                       command=self.organise_export)
-        b.pack(side="right", padx=(0, 6))
-        self.tip(b, "Save the summary, rule check, resulting tree and every "
-                    "planned move as a web page, CSV, text or JSON.")
+        self.tip(b, "Put everything back the way it was before the last run - "
+                    "files, and any folders made or removed.")
 
         for var in (self.var_oroot, self.var_ocopy, self.var_osweep,
                     self.var_osweep_name, self.var_oident, self.var_oempty):
             var.trace_add("write", lambda *_: self._organise_debounce())
+        self._organise_render_rows()
 
     # -- theming hook (called from _theme_tools) ---------------------------
 
@@ -555,15 +543,17 @@ class OrganiseTab:
     def _organise_toggle_view(self):
         """Builder <-> text. Going to text shows the rules as they are;
         coming back parses them into rows (hand-written rules the builder
-        has no shape for become 'advanced' rows)."""
+        has no shape for become 'advanced' rows). Whichever panel is shown
+        sits between step 2 and step 3."""
         if self.var_oadvanced.get():
             self.obuilder.pack_forget()
-            self.otextframe.pack(fill="both", expand=True)
+            self.otextframe.pack(fill="x", padx=12, pady=(0, 4),
+                                 after=self._ostep2)
         else:
             self._orows = text_to_rows(self._orules)
             self._organise_render_rows()
             self.otextframe.pack_forget()
-            self.obuilder.pack(fill="both", expand=True)
+            self.obuilder.pack(fill="x", padx=12, pady=(0, 4), after=self._ostep2)
 
     # -- the simple builder --------------------------------------------------
 
@@ -618,53 +608,57 @@ class OrganiseTab:
         frame = self.orows_frame
         if not self._orows:
             lbl = ttk.Label(frame, style="Dim.TLabel", text=(
-                "No rules yet. Press 'Suggest rules' to draft some from the "
-                "file names, or '+ Add a rule'."))
-            lbl.pack(fill="x", padx=6, pady=10)
+                "No rules yet.  Press  Suggest rules  to have them drafted from "
+                "the file names, or  + Add a rule  to write your own."))
+            lbl.pack(fill="x", padx=6, pady=12)
             self._orow_widgets.append(lbl)
             return
         for i, row in enumerate(self._orows):
-            box = ttk.Frame(frame, padding=(4, 4))
-            box.pack(fill="x", pady=(0, 2))
+            box = ttk.Frame(frame, padding=(4, 3))
+            box.pack(fill="x", pady=(0, 1))
             self._orow_widgets.append(box)
             self._organise_render_row(box, i, row)
 
     def _organise_render_row(self, box, i, row):
+        """One rule as one line:
+        [n.] [condition v] [value]  go into  [folder]  then a subfolder per
+        [x v]   [Up] [Down] [Remove]   - with the note / problem underneath."""
         cond_labels = [lbl for k, lbl in COND]
-        top = ttk.Frame(box)
-        top.pack(fill="x")
-        ttk.Label(top, text="{}.".format(i + 1), width=3).pack(side="left")
+        line = ttk.Frame(box)
+        line.pack(fill="x")
+        ttk.Label(line, text="{}.".format(i + 1), width=3).pack(side="left")
         if row.get("raw") is not None:
             raw = row["raw"]
-            shown = raw if len(raw) <= 58 else raw[:55] + "..."
-            lbl = ttk.Label(top, text="advanced rule:  " + shown,
+            shown = raw if len(raw) <= 70 else raw[:67] + "..."
+            lbl = ttk.Label(line, text="advanced rule:  " + shown,
                             style="Dim.TLabel")
             lbl.pack(side="left", fill="x", expand=True, padx=(4, 4))
             self.tip(lbl, "A rule written in the text syntax that the builder "
                           "has no boxes for (a pattern such as a reference "
-                          "code). It works as it is; to change it, tick "
+                          "code). It works as it is; to change it, use More > "
                           "Advanced.\n\n" + raw)
         else:
             var_c = tk.StringVar(value=dict(COND).get(row["cond"], cond_labels[0]))
-            cb = ttk.Combobox(top, textvariable=var_c, width=17, state="readonly",
+            cb = ttk.Combobox(line, textvariable=var_c, width=16, state="readonly",
                               values=cond_labels)
             cb.pack(side="left")
-            self.tip(cb, "What to look for. 'anything else' catches every "
+            self.tip(cb, "What to look for. 'Everything else' catches every "
                          "file no earlier rule took - put it last.")
 
             var_v = tk.StringVar(value=row.get("value", ""))
             if row["cond"] == "type":
-                ev = ttk.Combobox(top, textvariable=var_v, width=20,
+                ev = ttk.Combobox(line, textvariable=var_v, width=19,
                                   state="readonly",
                                   values=[lbl for k, lbl in TYPES])
                 var_v.set(dict(TYPES).get(row.get("value", ""),
                                           row.get("value", "")))
             elif row["cond"] == "any":
-                ev = ttk.Label(top, text="(every remaining file)", width=22)
+                ev = ttk.Label(line, text="(every remaining file)", width=21,
+                               style="Dim.TLabel")
             else:
-                ev = ttk.Entry(top, textvariable=var_v, width=22)
+                ev = ttk.Entry(line, textvariable=var_v, width=21)
                 hint = {"starts": "e.g.  Invoice", "contains": "e.g.  minutes",
-                        "ends": "e.g.  final  (before the .pdf)",
+                        "ends": "e.g.  final   (the part before .pdf)",
                         "exact": "e.g.  Thumbs.db", "ext": "e.g.  pdf, docx",
                         "older": "e.g.  3 years  /  6 months  /  30 days",
                         "newer": "e.g.  30 days"}.get(row["cond"], "")
@@ -695,28 +689,13 @@ class OrganiseTab:
                 ev.bind("<KeyRelease>", on_value)
                 ev.bind("<FocusOut>", on_value)
 
-        ops = ttk.Frame(top)
-        ops.pack(side="right")
-        for text, op, tip in (("\u25b2", "up", "Move this rule up - earlier "
-                                            "rules win"),
-                              ("\u25bc", "down", "Move this rule down"),
-                              ("\u2715", "del", "Remove this rule")):
-            b = ttk.Button(ops, text=text, width=2,
-                           command=lambda i=i, op=op: self._organise_row_op(i, op))
-            b.pack(side="left", padx=(2, 0))
-            self.tip(b, tip)
-
-        if row.get("raw") is None:
-            bottom = ttk.Frame(box)
-            bottom.pack(fill="x", pady=(3, 0))
-            ttk.Label(bottom, text="", width=3).pack(side="left")
-            ttk.Label(bottom, text="go into folder").pack(side="left")
+            ttk.Label(line, text="  go into").pack(side="left")
             var_d = tk.StringVar(value=row.get("dest", ""))
-            ed = ttk.Entry(bottom, textvariable=var_d, width=22)
+            ed = ttk.Entry(line, textvariable=var_d, width=20)
             ed.pack(side="left", padx=(4, 0))
-            self.tip(ed, "The folder to put them in, made under the folder "
-                         "being organised. Use / for a folder inside a "
-                         "folder: Finance/Invoices")
+            self.tip(ed, "The folder to put them in, made inside the folder "
+                         "being tidied. Use / for a folder inside a folder: "
+                         "Finance/Invoices")
 
             def on_dest(_e=None, r=row, vd=var_d):
                 if vd.get() != r.get("dest"):
@@ -724,10 +703,10 @@ class OrganiseTab:
                     self._organise_rows_changed()
             ed.bind("<KeyRelease>", on_dest)
             ed.bind("<FocusOut>", on_dest)
-            ttk.Label(bottom, text="then by").pack(side="left", padx=(8, 0))
+            ttk.Label(line, text="  then a subfolder per").pack(side="left")
             var_s = tk.StringVar(value=dict(SUBS).get(row.get("sub", ""),
                                                       SUBS[0][1]))
-            cs = ttk.Combobox(bottom, textvariable=var_s, width=17,
+            cs = ttk.Combobox(line, textvariable=var_s, width=14,
                               state="readonly", values=[lbl for k, lbl in SUBS])
             cs.pack(side="left", padx=(4, 0))
             self.tip(cs, "Optionally split that folder further - a subfolder "
@@ -739,14 +718,26 @@ class OrganiseTab:
                     r["sub"] = key
                     self._organise_rows_changed()
             cs.bind("<<ComboboxSelected>>", on_sub)
+
+        ops = ttk.Frame(line)
+        ops.pack(side="right")
+        for text, op, width, tip in (("Up", "up", 4, "Move this rule up - "
+                                                    "earlier rules win"),
+                                     ("Down", "down", 5, "Move this rule down"),
+                                     ("Remove", "del", 7, "Take this rule out")):
+            b = ttk.Button(ops, text=text, width=width,
+                           command=lambda i=i, op=op: self._organise_row_op(i, op))
+            b.pack(side="left", padx=(3, 0))
+            self.tip(b, tip)
+
         note = row.get("note") or ""
         issue = row.get("issue")
         if note or issue:
-            lbl = ttk.Label(box, style="Dim.TLabel", wraplength=540,
-                            text=(("! " + issue + "   ") if issue else "") + note)
-            lbl.pack(fill="x", padx=(28, 0), pady=(2, 0))
-            if issue:
-                lbl.configure(style="Accent.TLabel")
+            lbl = ttk.Label(box, wraplength=900,
+                            style="Accent.TLabel" if issue else "Dim.TLabel",
+                            text=(("\u26a0 " + issue + "    ") if issue else "")
+                            + note)
+            lbl.pack(fill="x", padx=(30, 0), pady=(1, 0))
 
     def _organise_debounce(self):
         if self._oafter:
@@ -867,7 +858,7 @@ class OrganiseTab:
             self._organise_render_rows()
         errs = sum(1 for i in plan.issues if i[0] == "error")
         warns = sum(1 for i in plan.issues if i[0] == "warning")
-        self.onb.tab(self.otab_issues, text=" Issues{} ".format(
+        self.onb.tab(self.otab_issues, text=" Problems{} ".format(
             " ({})".format(errs + warns) if errs + warns else ""))
         # summary
         lines = plan.summary_lines()
@@ -886,6 +877,9 @@ class OrganiseTab:
         verb = "copy" if plan.options.get("copy") else "move"
         n = plan.counts["move"] + plan.counts["copy"] + plan.counts["sweep"]
         b = plan.bytes["move"] + plan.bytes["copy"] + plan.bytes["sweep"]
+        self.var_oapply.set("{} {:,} file{}...".format(
+            verb.capitalize(), n, "" if n == 1 else "s") if n
+            else "Nothing to {}".format(verb))
         self.var_ostatus.set(
             "{:,} of {:,} files to {} ({}) into {:,} folder(s)  |  {:,} in "
             "place  |  {:,} collision(s)  |  {:,} unmatched{}{}".format(
@@ -969,16 +963,24 @@ class OrganiseTab:
     # -- templates ---------------------------------------------------------
 
     def _organise_templates(self):
+        """Rebuild the 'Load saved rules' submenu from the index."""
         try:
             conn = self._ro()
             names = [r[0] for r in findex_organise.templates(conn)]
             conn.close()
         except Exception:                                      # noqa: BLE001
             names = []
-        self.otemplate_box["values"] = names
+        self._otemplate_names = names
+        self.otemplate_menu.delete(0, "end")
+        if not names:
+            self.otemplate_menu.add_command(label="(nothing saved yet)",
+                                            state="disabled")
+        for name in names:
+            self.otemplate_menu.add_command(
+                label=name, command=lambda n=name: self._organise_load_template(n))
 
-    def _organise_load_template(self):
-        name = self.var_otemplate.get()
+    def _organise_load_template(self, name=None):
+        name = name or self.var_otemplate.get()
         if not name:
             return
         try:
@@ -994,6 +996,7 @@ class OrganiseTab:
             o = json.loads(options or "{}")
         except ValueError:
             o = {}
+        self.var_otemplate.set(name)
         self.var_ocopy.set(bool(o.get("copy")))
         self.var_osweep.set(bool(o.get("sweep")))
         if o.get("sweep"):
@@ -1001,7 +1004,7 @@ class OrganiseTab:
         self.var_oident.set(bool(o.get("skip_identical", True)))
         self.var_oempty.set(bool(o.get("remove_empty", True)))
         self._organise_set_rules(rules)
-        self.var_ostatus.set("Loaded template {!r}".format(name))
+        self.var_ostatus.set("Loaded the saved rules {!r}".format(name))
 
     def organise_save_template(self):
         from tkinter import simpledialog
@@ -1010,7 +1013,7 @@ class OrganiseTab:
             messagebox.showinfo("Nothing to save", "Write some rules first.")
             return
         name = simpledialog.askstring(
-            "Save template", "Name for this rule set:",
+            "Save these rules", "A name for this set of rules:",
             initialvalue=self.var_otemplate.get() or "", parent=self.root)
         if not name:
             return
@@ -1024,14 +1027,25 @@ class OrganiseTab:
             return
         self.var_otemplate.set(name.strip())
         self._organise_templates()
-        self.var_ostatus.set("Saved template {!r}".format(name.strip()))
+        self.var_ostatus.set("Saved these rules as {!r} - find them under More > "
+                             "Load saved rules".format(name.strip()))
 
     def organise_delete_template(self):
-        name = self.var_otemplate.get()
-        if not name:
+        from tkinter import simpledialog
+        names = getattr(self, "_otemplate_names", None)
+        if names is None:
+            self._organise_templates()
+            names = self._otemplate_names
+        if not names:
+            messagebox.showinfo("Nothing saved", "There are no saved rule sets.")
             return
-        if not messagebox.askyesno("Delete template",
-                                   "Delete the template {!r}?".format(name)):
+        name = simpledialog.askstring(
+            "Delete saved rules", "Which one? Saved: {}".format(", ".join(names)),
+            initialvalue=self.var_otemplate.get() or names[0], parent=self.root)
+        if not name or name not in names:
+            return
+        if not messagebox.askyesno("Delete saved rules",
+                                   "Delete the saved rules {!r}?".format(name)):
             return
         try:
             conn = findex.open_db(self.var_db.get(), timeout=5)

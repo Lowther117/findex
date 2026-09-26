@@ -308,17 +308,19 @@ is remembered in `findex_gui.json`.
   considered and re-sorted against the rules into subfolders *of that
   folder* - a Downloads tidy, a shared drive that grew by accretion, a
   project handover. **Move** or **Copy**; unmatched files stay where they
-  are unless **Sweep unmatched files into** is ticked (default `_Unsorted`).
+  are unless **Files no rule fits go into** is ticked (default `_Unsorted`).
 - **Rules** are built in plain English, one row each: *name starts with* /
   *contains* / *ends with* / *is exactly* + the text, *file type is*
   (Pictures, Videos, Music, Documents, Zip & archives, Programs, Emails,
   Code), *extension is* (`pdf, docx`), *older than* / *newer than* (`3
   years`, `30 days`), or *anything else*; then "go into folder" (`Finance/
   Invoices` nests) and optionally "then by" year / year and month / file
-  type / first word / extension. Rows can be reordered - the first that
-  fits wins - and a row that is missing something says so underneath. The
-  plan updates as you type.
-- Tick **Advanced** to see and edit the same rules as text, one per line:
+  type / first word / extension. Up / Down reorder the rows - the first
+  that fits wins - Remove takes one out, and a row that is missing
+  something says so underneath. The plan updates as you type. Saved rule
+  sets, the problem check, plan export and the text editor live under
+  **More**.
+- **More > Advanced** shows and edits the same rules as text, one per line:
   a pattern is a glob (`Invoice*`, quoted if it has spaces), a regex
   (`re:^([A-Z]{3})-\d+`, groups come back as `{1}`), `ext:pdf;docx`,
   `type:images`, `year:2019-2021`, `older:3y` / `newer:30d` or `*`; several
@@ -335,26 +337,27 @@ is remembered in `findex_gui.json`.
   per prefix), date-named files (by year then month), and type groups for
   what is left, with a `{year}` split when a set spans several years. It
   appends below any rules already written; edit freely.
-- **Check rules** / the **Issues** list: bad patterns, unknown tokens,
+- **More > Check the rules** / the **Problems** list: bad patterns, unknown tokens,
   `{2}` where the pattern has one group, a rule that matches nothing, a
   rule an earlier rule shadows completely, a catch-all that is not last,
   two destinations that differ only by case, collisions. Double-click an
   issue to jump to its line; error lines are highlighted.
-- **Plan** lists every file with its action and destination; **Resulting
-  tree** shows how the folder would look afterwards with counts per
+- **What will happen** lists every file with its action and destination;
+  **Folders afterwards** shows how the folder would look with counts per
   folder; **Summary** has the numbers - files and bytes to move or copy,
   swept, already in place, identical copies skipped, collisions,
   destination folders, folders that would be left empty.
 - Nothing is overwritten. A different file already at a target is a
-  **collision** and is skipped; with **Identical file already there = done**
-  a byte-identical one (by content hash) counts as placed. **Remove folders
-  left empty** tidies the folders the moves emptied.
-- **Apply...** carries the plan out as one batch - moves or copies, the
-  folders it created, the folders it removed - and **Undo last batch...**
-  reverses the lot in the opposite order, folders included. Rename and
-  Organise share one batch history. **Templates** save a rule set with its
-  options in the index for next time; **Export plan...** writes summary,
-  rule check, tree and plan as a page, CSV, text or JSON.
+  **collision** and is skipped; with **Skip a file if an identical copy is
+  already there** a byte-identical one (by content hash) counts as placed.
+  **Tidy away folders left empty** removes the folders the moves emptied.
+- **Move N files... / Copy N files...** carries the plan out as one batch -
+  moves or copies, the folders it created, the folders it removed - and
+  **Undo the last run...** reverses the lot in the opposite order, folders
+  included. Rename and Organise share one batch history. **More > Save these
+  rules as...** keeps a rule set with its options in the index for next
+  time; **More > Export the plan...** writes summary, rule check, tree and
+  plan as a page, CSV, text or JSON.
 
 **Verify tab** - prove a copy or a later state matches
 
