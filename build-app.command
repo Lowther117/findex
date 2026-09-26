@@ -168,6 +168,16 @@ pipget "pymupdf>=1.26"                 "PDF text"
 pipget "mutagen>=1.47"                 "media tags"
 pipget "extract-msg>=0.54"             "Outlook messages" --no-binary red-black-tree-mod
 pipget "watchdog>=6.0"                 "live updates"
+# watchdog publishes wheels a little behind new Pythons (none for 3.14 at
+# the time of writing). Its source tarball builds a small C extension, which
+# the Xcode command line tools that Homebrew needs anyway can compile - so
+# when the wheel is missing, try that before giving up on live updates.
+if ! "$PY" -c "import watchdog" >/dev/null 2>&1; then
+    printf '   live updates: no wheel for this Python - building from source...\n'
+    if "$PY" -m pip install "watchdog>=6.0"; then
+        MISSING="${MISSING/ live updates/}"
+    fi
+fi
 pipget "psutil>=6.0"                   "resource monitor"
 pipget "pyobjc-framework-Vision>=10.0" "built-in OCR"
 if [ -n "$MISSING" ]; then

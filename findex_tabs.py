@@ -27,6 +27,7 @@ import findex_hash
 import findex_rename
 import findex_report
 import findex_verify
+import findex_tabs_organise
 
 TOOL_KINDS = ("hash", "hash-near", "snapshot", "verify", "report")
 
@@ -53,7 +54,7 @@ def _folder_row(parent, var, tip_fn, tip_text, label="Folder:"):
     return row
 
 
-class ToolTabs:
+class ToolTabs(findex_tabs_organise.OrganiseTab):
     """Mixin for findex_gui.FindexApp. Expects the app's usual attributes
     (root, nb, tip, launch, msgs, var_db, var_status, pal, log_line...)."""
 
@@ -67,14 +68,17 @@ class ToolTabs:
         self.tab_health = ttk.Frame(self.nb)
         self.tab_dupes = ttk.Frame(self.nb)
         self.tab_rename = ttk.Frame(self.nb)
+        self.tab_organise = ttk.Frame(self.nb)
         self.tab_verify = ttk.Frame(self.nb)
         self.nb.add(self.tab_health, text="  Health  ")
         self.nb.add(self.tab_dupes, text="  Duplicates  ")
         self.nb.add(self.tab_rename, text="  Rename  ")
+        self.nb.add(self.tab_organise, text="  Organise  ")
         self.nb.add(self.tab_verify, text="  Verify  ")
         self._build_health_tab()
         self._build_dupes_tab()
         self._build_rename_tab()
+        self._build_organise_tab()
         self._build_verify_tab()
 
     def _tool_tree(self, parent, cols, spec, height=None):
@@ -114,12 +118,16 @@ class ToolTabs:
             tree.tag_configure("good", foreground=c["good"])
             tree.tag_configure("head", font=(self.ui_family, self.ui_size,
                                              "bold"))
+        self._theme_organise(c, pal)
 
     def _tool_tab_shown(self, name):
         if name == "Health" and not self._health_scanned and self.proc is None:
             self.health_scan()
         elif name == "Rename":
             self._rename_debounce()
+        elif name == "Organise":
+            self._organise_templates()
+            self._organise_debounce()
         elif name == "Verify":
             self._verify_refresh_history()
 

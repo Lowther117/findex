@@ -17,8 +17,10 @@ Health      what is wrong with the tree: empty folders, bad names, long
             types, secrets in documents - and an exportable report.
 Duplicates  same name+size, byte-identical, or near-identical text.
 Rename      bulk renaming from a search, with a preview and an undo.
+Organise    sort a folder's files into subfolders by rules - suggested,
+            checked, previewed as the resulting tree, applied, undoable.
 Verify      snapshots of a tree and proof that a copy or later state matches.
-The last four live in findex_tabs.py.
+The tool tabs live in findex_tabs.py and findex_tabs_organise.py.
 
 Settings are kept in findex_gui.json next to this script. Indexing runs as a
 separate findex.py process so the window never freezes and Stop always works.
@@ -213,29 +215,9 @@ WINRT_PACKAGES = [
     "winrt-Windows.Storage.Streams",
 ]
 
-# Type-dropdown groups: pick "Images" and every extension in the family is
-# included. Counts shown against each group come from the index itself.
-TYPE_GROUPS = {
-    "images": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif",
-               ".tiff", ".heic", ".heif", ".svg", ".ico", ".raw", ".cr2",
-               ".nef", ".arw", ".dng", ".psd"],
-    "videos": [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".webm",
-               ".flv", ".mpg", ".mpeg", ".ts", ".3gp", ".vob"],
-    "audio": [".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus",
-              ".wma", ".wav", ".aiff", ".mid", ".midi"],
-    "documents": [".pdf", ".doc", ".docx", ".docm", ".xls", ".xlsx", ".xlsm",
-                  ".ppt", ".pptx", ".pptm", ".odt", ".ods", ".odp", ".rtf",
-                  ".txt", ".md", ".epub", ".pages", ".numbers", ".key",
-                  ".csv"],
-    "compressed": [".zip", ".rar", ".7z", ".gz", ".bz2", ".xz", ".tar",
-                   ".cbz", ".cbr", ".iso", ".dmg"],
-    "code": [".py", ".js", ".ts", ".html", ".htm", ".css", ".c", ".h",
-             ".cpp", ".cs", ".java", ".sql", ".sh", ".bat", ".cmd", ".ps1",
-             ".json", ".xml", ".yml", ".yaml", ".ini", ".cfg", ".lua",
-             ".gd"],
-    "programs": [".exe", ".msi", ".app", ".dll", ".apk", ".deb", ".pkg"],
-    "emails": [".eml", ".msg"],
-}
+# Type-dropdown groups live in the engine (findex.TYPE_GROUPS) so the tools
+# can use them too; kept under the old name here.
+TYPE_GROUPS = findex.TYPE_GROUPS
 
 def palette_extras(c):
     """findex's own colours - alternate result rows, the search-hit
@@ -889,6 +871,7 @@ class FindexApp(findex_tabs.ToolTabs):
         m = tk.Menu(bar, tearoff=0)
         self._menus.append(m)
         m.add_command(label="Search syntax", command=self.show_syntax)
+        m.add_command(label="Organise rules", command=self.show_organise_help)
         m.add_command(label="About findex", command=self.show_about)
         bar.add_cascade(label="Help", menu=m)
 

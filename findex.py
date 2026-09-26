@@ -20,6 +20,7 @@ Tools built on the index (each lives in its own module beside this one):
     findex secrets              Passwords, keys and tokens sitting in files
     findex snapshot / verify    Manifest of a tree; later prove nothing changed
     findex rename               Bulk rename with a dry-run preview and undo
+    findex organise             Sort a folder's files into subfolders by rules
 
 EVERY file AND folder under the indexed roots is recorded by name, size and
 date, so filename search covers the whole drive - like Everything does. Text
@@ -142,6 +143,30 @@ TEXT_EXTS = {
     ".c", ".h", ".cpp", ".cs", ".java", ".sql", ".ps1", ".bat", ".cmd", ".sh",
 }
 INDEXABLE = DOC_EXTS | TEXT_EXTS | MSG_EXTS | AUDIO_EXTS
+
+# Type groups - "images" covers every extension in the family. Used by the
+# app's Type dropdown, the Organise tool's type: rules and the health report.
+TYPE_GROUPS = {
+    "images": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif",
+               ".tiff", ".heic", ".heif", ".svg", ".ico", ".raw", ".cr2",
+               ".nef", ".arw", ".dng", ".psd"],
+    "videos": [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".webm",
+               ".flv", ".mpg", ".mpeg", ".ts", ".3gp", ".vob"],
+    "audio": [".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus",
+              ".wma", ".wav", ".aiff", ".mid", ".midi"],
+    "documents": [".pdf", ".doc", ".docx", ".docm", ".xls", ".xlsx", ".xlsm",
+                  ".ppt", ".pptx", ".pptm", ".odt", ".ods", ".odp", ".rtf",
+                  ".txt", ".md", ".epub", ".pages", ".numbers", ".key",
+                  ".csv"],
+    "compressed": [".zip", ".rar", ".7z", ".gz", ".bz2", ".xz", ".tar",
+                   ".cbz", ".cbr", ".iso", ".dmg"],
+    "code": [".py", ".js", ".ts", ".html", ".htm", ".css", ".c", ".h",
+             ".cpp", ".cs", ".java", ".sql", ".sh", ".bat", ".cmd", ".ps1",
+             ".json", ".xml", ".yml", ".yaml", ".ini", ".cfg", ".lua",
+             ".gd"],
+    "programs": [".exe", ".msi", ".app", ".dll", ".apk", ".deb", ".pkg"],
+    "emails": [".eml", ".msg"],
+}
 
 SKIP_DIRS = {
     "windows", "program files", "program files (x86)", "programdata",
@@ -2442,6 +2467,11 @@ def tool_modules():
     try:
         import findex_rename
         mods.append(findex_rename)
+    except ImportError:
+        pass
+    try:
+        import findex_organise
+        mods.append(findex_organise)
     except ImportError:
         pass
     return mods

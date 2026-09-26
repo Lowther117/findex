@@ -28,6 +28,8 @@ and no machine-specific path is ever stored.
 | `findex_app.py` | build only | build only | Entry point compiled into the standalone exe/app. Not run directly. |
 | `theme.py` | the app | the app | The shared light/dark palette and ttk styling the window uses. Not run directly. |
 | `findex_tabs.py` | the app | the app | The Health, Duplicates, Rename and Verify tabs. Part of the app; not run directly. |
+| `findex_tabs_organise.py` | the app | the app | The Organise tab. Part of the app; not run directly. |
+| `findex_organise.py` | engine | engine | Sort a folder into subfolders by rules, with suggestions, a rule check, preview and undo: `findex organise`. |
 | `findex_hash.py` | engine | engine | Content fingerprints and type detection: `findex hash`, `findex dupes --exact / --near`. |
 | `findex_report.py` | engine | engine | The health report: `findex report`. |
 | `findex_secrets.py` | engine | engine | Passwords, keys and tokens in indexed text: `findex secrets`. |
@@ -51,8 +53,10 @@ Findex/
   findex_secrets.py   } snapshot, verify, rename. findex.py imports
   findex_verify.py    } them when present; a missing one just means
   findex_rename.py    } its commands are absent
+  findex_organise.py  }
   findex_gui.py       Tkinter desktop app (Search, Index, Changes tabs)
   findex_tabs.py      the Health, Duplicates, Rename and Verify tabs
+  findex_tabs_organise.py   the Organise tab
   theme.py            light/dark palette + styling for the app
   findex_app.py       entry point for the optional standalone build
   findex.bat          CLI launcher (Windows)
@@ -298,6 +302,50 @@ is remembered in `findex_gui.json`.
   has since moved on is reported, not guessed at. `findex rename --history`
   lists batches; any batch can be undone from the command line.
 
+**Organise tab** - sort a folder's files into subfolders by rules
+
+- Point it at a folder. Everything beneath it, subfolders included, is
+  considered and re-sorted against the rules into subfolders *of that
+  folder* - a Downloads tidy, a shared drive that grew by accretion, a
+  project handover. **Move** or **Copy**; unmatched files stay where they
+  are unless **Sweep unmatched files into** is ticked (default `_Unsorted`).
+- **Rules**, one per line, first match wins, typed on the left with the
+  plan updating as you type. A pattern is a glob (`Invoice*`, quoted if it
+  has spaces), a regex (`re:^([A-Z]{3})-\d+`, groups come back as `{1}`),
+  `ext:pdf;docx`, `type:images`, `year:2019-2021`, `older:3y` / `newer:30d`
+  or `*`; several on one line must all match. The destination is a folder
+  path with tokens: `{1}`.., `{name}`, `{stem}`, `{ext}`, `{type}`,
+  `{first}`, `{year}` `{month}` `{day}` `{date}` `{yyyymm}`, `{parent}`,
+  and `|upper` / `|lower` / `|title` filters. Help > Organise rules has the
+  full sheet with examples.
+- **Suggest rules** reads the names and drafts a rule set with a count and
+  examples against each: recurring leading words (`invoice*` -> Invoices,
+  `"board minutes*"` -> Board/Minutes - it knows common kinds and nests
+  pairs that share a first word), reference codes (`ACM-0042` -> one folder
+  per prefix), date-named files (by year then month), and type groups for
+  what is left, with a `{year}` split when a set spans several years. It
+  appends below any rules already written; edit freely.
+- **Check rules** / the **Issues** list: bad patterns, unknown tokens,
+  `{2}` where the pattern has one group, a rule that matches nothing, a
+  rule an earlier rule shadows completely, a catch-all that is not last,
+  two destinations that differ only by case, collisions. Double-click an
+  issue to jump to its line; error lines are highlighted.
+- **Plan** lists every file with its action and destination; **Resulting
+  tree** shows how the folder would look afterwards with counts per
+  folder; **Summary** has the numbers - files and bytes to move or copy,
+  swept, already in place, identical copies skipped, collisions,
+  destination folders, folders that would be left empty.
+- Nothing is overwritten. A different file already at a target is a
+  **collision** and is skipped; with **Identical file already there = done**
+  a byte-identical one (by content hash) counts as placed. **Remove folders
+  left empty** tidies the folders the moves emptied.
+- **Apply...** carries the plan out as one batch - moves or copies, the
+  folders it created, the folders it removed - and **Undo last batch...**
+  reverses the lot in the opposite order, folders included. Rename and
+  Organise share one batch history. **Templates** save a rule set with its
+  options in the index for next time; **Export plan...** writes summary,
+  rule check, tree and plan as a page, CSV, text or JSON.
+
 **Verify tab** - prove a copy or a later state matches
 
 - **Save snapshot...** writes a manifest of a folder (or the whole index):
@@ -357,6 +405,11 @@ findex verify before.fxsnap --against after.fxsnap
 findex rename "D:\Photos ext:jpg" --find IMG_ --replace ""   dry run
 findex rename "D:\Shared" --normalise --apply
 findex rename --undo                   reverse the last batch
+findex organise D:\Downloads --suggest -o tidy.rules     draft rules
+findex organise D:\Downloads --rules tidy.rules          preview (dry run)
+findex organise D:\Downloads --rules tidy.rules --sweep --remove-empty --apply
+findex organise D:\Downloads --template tidy --copy --apply
+findex organise --undo
 findex tree                            export the index as a tree (Downloads)
 findex tree -o C:\out.csv --under D:\Work
 findex journal                         what changed, newest first
@@ -373,8 +426,9 @@ findex gui                             open the desktop app
 docstrings (top of each `findex_*.py`) explain the reasoning.
 
 `findex verify` exits 0 when nothing differs and 1 when something does, so it
-can end a migration script. `findex rename` is a dry run unless `--apply` is
-given.
+can end a migration script. `findex rename` and `findex organise` are dry runs
+unless `--apply` is given; `organise` refuses to apply while the rules have
+errors (`--force` applies the rows that can be placed).
 
 The locations you index are remembered **in the index itself** - a `roots`
 table in `findex.db` - not in a settings file beside whichever copy of findex

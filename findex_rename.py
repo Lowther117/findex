@@ -65,6 +65,13 @@ _SEPS = re.compile(r"[\\/]")
 
 def ensure_schema(conn):
     conn.executescript(RENAMES_SCHEMA)
+    # op: rename (the default, also plain moves) or copy - the Organise tool
+    # records copies here too so one undo covers everything it did
+    have = {r[1] for r in conn.execute("PRAGMA table_info(renames)")}
+    if "op" not in have:
+        conn.execute("ALTER TABLE renames ADD COLUMN op TEXT NOT NULL "
+                     "DEFAULT 'rename'")
+        conn.commit()
 
 
 # ----------------------------------------------------------------------------
@@ -274,13 +281,70 @@ def undo(conn, batch=None, log=None):
         batch = row[0] if row else None
     if not batch:
         return None, 0, []
-    rows = conn.execute("SELECT id, old_path, new_path, is_dir FROM renames "
+    rows = conn.execute("SELECT id, old_path, new_path, is_dir, op FROM renames "
                         "WHERE batch=? ORDER BY id DESC", (batch,)).fetchall()
     done, failed = 0, []
     cur = conn.cursor()
     cur.execute("BEGIN")
     now = time.time()
-    for rid, old, new, is_dir in rows:
+    for rid, old, new, is_dir, op in rows:
+        if op == "mkdir":
+            # a folder the batch created: take it away again if it is empty
+            try:
+                if os.path.isdir(findex.lp(new)):
+                    if os.listdir(findex.lp(new)):
+                        raise OSError("folder is not empty: " + new)
+                    os.rmdir(findex.lp(new))
+            except OSError as exc:
+                failed.append((new, str(exc)))
+                if log:
+                    log("undo failed: {}: {}".format(new, exc))
+                continue
+            cur.execute("DELETE FROM files WHERE path=?", (new,))
+            findex.journal_add(cur, [(now, "deleted", new, None, 0, 1, "undo")])
+            cur.execute("DELETE FROM renames WHERE id=?", (rid,))
+            done += 1
+            continue
+        if op == "rmdir":
+            # a folder the batch removed as empty: bring it back
+            try:
+                os.makedirs(findex.lp(old), exist_ok=True)
+                st = os.stat(findex.lp(old))
+            except OSError as exc:
+                failed.append((old, str(exc)))
+                continue
+            cur.execute(findex.UPSERT, (old, os.path.basename(old), "", 0,
+                                        st.st_mtime, now, 0, "folder", None, 1))
+            findex.journal_add(cur, [(now, "added", old, None, 0, 1, "undo")])
+            cur.execute("DELETE FROM renames WHERE id=?", (rid,))
+            done += 1
+            continue
+        if op == "copy":
+            # undoing a copy = removing the copy we made, provided it is still
+            # the same bytes as its source (size + timestamp); an edited copy
+            # is left alone and reported
+            try:
+                if not os.path.exists(findex.lp(new)):
+                    raise FileNotFoundError("copy no longer at " + new)
+                if os.path.exists(findex.lp(old)):
+                    a, b = os.stat(findex.lp(old)), os.stat(findex.lp(new))
+                    if a.st_size != b.st_size or abs(a.st_mtime - b.st_mtime) > 2:
+                        raise OSError("copy has been changed since: " + new)
+                os.remove(findex.lp(new))
+            except OSError as exc:
+                failed.append((new, str(exc)))
+                if log:
+                    log("undo failed: {}: {}".format(new, exc))
+                continue
+            for (fid,) in cur.execute("SELECT id FROM files WHERE path=?",
+                                      (new,)).fetchall():
+                cur.execute("DELETE FROM docs WHERE rowid=?", (fid,))
+                cur.execute("DELETE FROM files WHERE id=?", (fid,))
+            findex.journal_add(cur, [(now, "deleted", new, None, None, 0,
+                                      "undo")])
+            cur.execute("DELETE FROM renames WHERE id=?", (rid,))
+            done += 1
+            continue
         try:
             if not os.path.exists(findex.lp(new)) and not os.path.lexists(
                     findex.lp(new)):
@@ -288,6 +352,7 @@ def undo(conn, batch=None, log=None):
             if (os.path.normcase(old) != os.path.normcase(new)
                     and os.path.exists(findex.lp(old))):
                 raise FileExistsError("original name is taken again: " + old)
+            os.makedirs(os.path.dirname(findex.lp(old)), exist_ok=True)
             os.rename(findex.lp(new), findex.lp(old))
         except OSError as exc:
             failed.append((new, str(exc)))
