@@ -605,7 +605,8 @@ def _fitz_open(path):
     # MuPDF picks the parser from the name it is given; a stream has none,
     # so the extension says what the bytes are (PDF, or an image format).
     return fitz.open(stream=data,
-                     filetype=os.path.splitext(path)[1].lstrip(".") or "pdf")
+                     filetype=os.path.splitext(path)[1].lstrip(".").lower()
+                     or "pdf")
 
 
 def _pdf_ocr(path):
@@ -647,23 +648,75 @@ def _pdf(path):
     return text
 
 
+# Formats MuPDF is not built for: a picture it cannot open is not a broken
+# file, it just stays name-only (and never lands in the Health tab as
+# "unreadable"). WebP and HEIC/HEIF are the usual ones; the phrases catch
+# any other "no decoder for this" answer, in either PyMuPDF generation.
+_IMAGE_UNSUPPORTED_EXTS = (".webp", ".heic", ".heif")
+_IMAGE_UNSUPPORTED_MSGS = ("document handler", "unknown file type",
+                           "unrecognized file type", "not supported",
+                           "unsupported")
+
+
+def _image_px(data):
+    """(width, height) in PIXELS of an image's first frame, read from its
+    header, or None when that cannot be told. Needed because MuPDF sizes
+    an image's page in points - pixels * 72 / the dpi in its metadata (96
+    when there is none) - so rendering at scale 1 returns a 300-dpi scan at
+    a quarter of its pixels, which is not what OCR wants."""
+    prof = getattr(fitz, "image_profile", None)
+    if prof is None:
+        return None
+    try:
+        info = prof(data) or {}
+        w, h = int(info.get("width") or 0), int(info.get("height") or 0)
+    except Exception:                                          # noqa: BLE001
+        return None
+    return (w, h) if w > 0 and h > 0 else None
+
+
+def _image_unsupported(path, exc):
+    """Did opening `path` fail because MuPDF has no decoder for the format
+    (as opposed to the file being damaged)?"""
+    if os.path.splitext(path)[1].lower() in _IMAGE_UNSUPPORTED_EXTS:
+        return True
+    msg = str(exc).lower()
+    return any(m in msg for m in _IMAGE_UNSUPPORTED_MSGS)
+
+
 def _image_pages(path, max_side=OCR_MAX_SIDE, max_pages=OCR_MAX_PAGES):
     """Render an image file to PNG bytes for OCR, one item per frame (a
     multi-page TIFF is several; a photo is one). MuPDF opens the common
     image formats as one-page documents, so this is the PDF path with a
-    different file behind it. The longest side is capped at max_side -
-    OCR engines are no better on a 6000 px photo than on 2500, only slower.
+    different file behind it. Each frame is rendered at its own pixel size
+    (see _image_px), then the longest side is capped at max_side - OCR
+    engines are no better on a 6000 px photo than on 2500, only slower.
     Frames under OCR_MIN_SIDE on either side (icons, buttons, tracking
     pixels) are left out: there is nothing to read on them."""
     out = []
+    px = None
+    try:
+        with open(path, "rb") as fh:
+            px = _image_px(fh.read())
+    except OSError:
+        pass
+    native = None       # points -> the image's own pixels (dpi / 72)
     with _fitz_open(path) as doc:
         for i, page in enumerate(doc):
             if i >= max_pages:
                 break
             w, h = page.rect.width, page.rect.height
-            if w < OCR_MIN_SIDE or h < OCR_MIN_SIDE:
+            if w < 1 or h < 1:
                 continue
-            scale = min(1.0, float(max_side) / max(w, h))
+            if native is None:
+                # from the first frame's header; the frames of a TIFF share
+                # a dpi. 1.0 when the header could not be read - MuPDF's
+                # 96-dpi default, near enough
+                native = (float(max(px)) / max(w, h)) if px else 1.0
+            pw, ph = w * native, h * native
+            if pw < OCR_MIN_SIDE or ph < OCR_MIN_SIDE:
+                continue
+            scale = native * min(1.0, float(max_side) / max(pw, ph))
             pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
             out.append(pix.tobytes("png"))
     return out
@@ -675,11 +728,11 @@ def _image(path):
         raise RuntimeError("PyMuPDF not installed - run: pip install pymupdf")
     try:
         pages = _image_pages(path)
-    except Exception:                                          # noqa: BLE001
-        # HEIC/HEIF depend on codecs MuPDF may not have been built with;
-        # a picture it cannot open is not a broken file, so it simply stays
-        # name-only. Anything else that fails to open really is damaged.
-        if os.path.splitext(path)[1].lower() in (".heic", ".heif"):
+    except Exception as exc:                                   # noqa: BLE001
+        # A format this MuPDF has no decoder for (WebP, HEIC/HEIF...) is
+        # not a broken file: it simply stays name-only. Anything else that
+        # fails to open really is damaged.
+        if _image_unsupported(path, exc):
             return ""
         raise
     out = []

@@ -255,18 +255,39 @@ def command_from_task_xml(xml):
 # Talking to the scheduler
 # ----------------------------------------------------------------------------
 
+def _decode(data):
+    """Console tool output as text. schtasks may answer in the console
+    code page or - for /Query /XML - in UTF-16, BOM or not; a wrong guess
+    would leave the task looking registered with no interval or command,
+    and the app re-registering it on every close."""
+    if not data:
+        return ""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", errors="replace").lstrip("\ufeff")
+    if b"\x00" in data[:256]:
+        return data.decode("utf-16-le", errors="replace").lstrip("\ufeff")
+    import locale
+    enc = locale.getpreferredencoding(False) or "utf-8"
+    try:
+        return data.decode(enc, errors="replace")
+    except LookupError:
+        return data.decode("utf-8", errors="replace")
+
+
 def _run(cmd, input_text=None):
     kwargs = {}
     if os.name == "nt":
         kwargs["creationflags"] = 0x08000000     # CREATE_NO_WINDOW
     try:
-        r = subprocess.run(cmd, input=input_text, capture_output=True,
-                           text=True, errors="replace", timeout=60, **kwargs)
+        r = subprocess.run(cmd, capture_output=True, timeout=60,
+                           input=(input_text.encode("utf-8")
+                                  if input_text is not None else None),
+                           **kwargs)
     except FileNotFoundError:
         raise ScheduleError("{} was not found on this machine".format(cmd[0]))
     except subprocess.TimeoutExpired:
         raise ScheduleError("{} did not answer".format(cmd[0]))
-    return r.returncode, (r.stdout or ""), (r.stderr or "")
+    return r.returncode, _decode(r.stdout), _decode(r.stderr)
 
 
 def _windows_user():
@@ -404,6 +425,8 @@ def status(platform=None):
                             "turn the refresh off and on again")
     except ScheduleError as exc:
         st["detail"] = str(exc)
+    except Exception as exc:                                   # noqa: BLE001
+        st["detail"] = "could not read the scheduler: {}".format(exc)
     return st
 
 

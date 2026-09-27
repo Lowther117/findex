@@ -304,10 +304,11 @@ is remembered in `findex_gui.json`.
   each other count as the same picture. The default of 10 catches resizes,
   re-saves and light edits without pairing merely similar photos; 0 asks
   for near-pixel-identical; above 16 gets loose. Featureless images - a
-  solid colour, a blank page - all fingerprint alike and are left out
-  rather than reported as one huge set. Cropped or rotated copies are not
-  found (the fingerprint describes the whole frame). Formats: png, jpg,
-  tiff, bmp, gif, webp, and heic/heif where PyMuPDF can open them.
+  solid colour, a blank or nearly blank page - all fingerprint alike and
+  are left out rather than reported as one huge set. Cropped or rotated
+  copies are not found (the fingerprint describes the whole frame).
+  Formats: png, jpg, tiff, bmp, gif; webp and heic/heif only where PyMuPDF
+  or Pillow can decode them (PyMuPDF alone cannot).
 - Results are sets you can expand, with the copies underneath. **Keep
   newest, select the rest** (also oldest / first, on the right-click menu)
   selects every copy but one in each set - then Delete sends the selection
@@ -528,8 +529,9 @@ the settings file the first time the app opens it, and keeps it from then on.
   automatically once it qualifies - including types that gain support later.
 - **OCR** (*OCR scanned PDFs and images* in the app, `--ocr` on the CLI):
   a PDF with no real text layer gets its first 20 pages rendered and read,
-  and **image files** - `.png .jpg .jpeg .tif .tiff .bmp .gif .webp`, plus
-  `.heic/.heif` where PyMuPDF can open them - are read the same way, so a
+  and **image files** - `.png .jpg .jpeg .tif .tiff .bmp .gif`, plus
+  `.webp .heic .heif` where PyMuPDF can open them (stock builds cannot;
+  they stay name-only) - are read the same way, so a
   photo of a letter, a screenshot of an email or a scan someone saved as a
   JPEG turns up in `content:` searches like any document. Images are decoded
   with PyMuPDF and shrunk to at most 2,500 px on the long side before

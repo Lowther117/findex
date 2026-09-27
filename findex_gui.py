@@ -2504,7 +2504,11 @@ class FindexApp(findex_tabs.ToolTabs):
         self.var_status.set("{} {}".format(self.proc_kind.title(), word))
         if self.proc_kind == "index" and code == 3:
             # the engine found another run's lock - the background refresh,
-            # most likely - and declined to run alongside it
+            # most likely - and declined to run alongside it. The status bar
+            # is overwritten by the list refresh below, so say it in the
+            # Output too, where it stays.
+            word = "skipped - another index run (the background refresh?) " \
+                   "is already working on this database"
             self.var_status.set("Another index run is already working on "
                                 "this database (the background refresh?) - "
                                 "try again when it has finished")

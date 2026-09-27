@@ -52,10 +52,13 @@ IMAGE_DISTANCE = 10          # dhash bits that may differ and still "look alike"
 DHASH_SIDE = 256             # images are decoded no larger than this first
 DHASH_NONE = -(1 << 63)      # stored for an image that could not be decoded,
                              # so it is not tried again on every run
-DHASH_FLAT_BITS = 2          # a fingerprint with this few bits set (or this
+DHASH_FLAT_BITS = 8          # a fingerprint with this few bits set (or this
                              # few clear) is a featureless image: a solid
-                             # colour, a plain gradient - and looks like
-                             # every other featureless image; never grouped
+                             # colour, a plain gradient, a mostly-white page
+                             # with a few lines of text - and looks like every
+                             # other featureless image, so it is never grouped.
+                             # A photo has about 32 of 64 bits set, give or
+                             # take 4; fewer than 8 is not a picture of anything
 
 
 # ----------------------------------------------------------------------------
@@ -325,22 +328,18 @@ def hamming(a, b):
 def _decode_grey(path, max_side=DHASH_SIDE):
     """Decode an image to 8-bit greyscale no larger than max_side on its
     longest side: (width, height, bytes), or None when nothing here can
-    read it. PyMuPDF does the work, as everywhere else in findex; Pillow is
-    tried only when PyMuPDF is missing (it never is in a findex
-    environment - this keeps the fingerprint testable without it).
-    Neither is a hard dependency."""
+    read it. PyMuPDF does the work, as everywhere else in findex; Pillow
+    is tried when PyMuPDF is missing or cannot open the file (WebP, HEIC:
+    formats it is not built for). Neither is a hard dependency."""
     p = findex.lp(path)
     if findex.HAVE_FITZ:
-        fitz = findex.fitz
-        with findex._fitz_open(p) as doc:
-            page = doc[0]
-            w, h = page.rect.width, page.rect.height
-            if w < 1 or h < 1:
-                return None
-            scale = min(1.0, float(max_side) / max(w, h))
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
-                                  colorspace=fitz.csGRAY, alpha=False)
-            return pix.width, pix.height, bytes(pix.samples)
+        try:
+            return _decode_grey_fitz(p, max_side)
+        except Exception:                                      # noqa: BLE001
+            try:
+                import PIL  # noqa: F401
+            except ImportError:
+                raise
     try:
         from PIL import Image
     except ImportError:
@@ -352,6 +351,30 @@ def _decode_grey(path, max_side=DHASH_SIDE):
         if scale < 1.0:
             im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))))
         return im.width, im.height, im.tobytes()
+
+
+def _decode_grey_fitz(p, max_side):
+    fitz = findex.fitz
+    px = None
+    try:
+        with open(p, "rb") as fh:
+            px = findex._image_px(fh.read())
+    except OSError:
+        pass
+    with findex._fitz_open(p) as doc:
+        page = doc[0]
+        w, h = page.rect.width, page.rect.height
+        if w < 1 or h < 1:
+            return None
+        # the page is in points (pixels * 72 / dpi); render at the image's
+        # own pixel size, then no larger than max_side
+        native = (float(max(px)) / max(w, h)) if px else 1.0
+        scale = native * min(1.0, float(max_side) / max(w * native, h * native))
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
+                              colorspace=fitz.csGRAY, alpha=False)
+        if pix.n != 1:
+            return None
+        return pix.width, pix.height, bytes(pix.samples)
 
 
 def _grid_means(w, h, data, cols, rows):
@@ -398,6 +421,8 @@ def dhash_file(job):
     """Worker: (id, path) -> (id, dhash, error). An image nothing can
     decode gets DHASH_NONE, so it is not reopened on every run."""
     fid, path = job
+    if not os.path.exists(findex.lp(path)):
+        return fid, None, "gone"
     try:
         decoded = _decode_grey(path)
     except FileNotFoundError:
@@ -802,17 +827,22 @@ def cmd_hash(args):
     return 0
 
 
-def _group_records(groups, mode):
-    """Duplicate sets as result records with a `set` number, for --json /
-    --csv (findex.write_results)."""
+def _group_records(groups, mode, start=0):
+    """Duplicate sets as result records with a `set` number (continuing
+    from `start`, so sets from --exact, --near and --images in one run do
+    not share numbers), for --json / --csv (findex.write_results)."""
     out = []
-    for n, g in enumerate(groups, 1):
+    for n, g in enumerate(groups, start + 1):
         for row in g:
             rec = findex.result_record(row[0], row[1], row[2])
             rec["set"] = n
             rec["match"] = mode
             out.append(rec)
     return out
+
+
+def _last_set(records):
+    return records[-1]["set"] if records else 0
 
 
 def cmd_dupes(args):
@@ -829,6 +859,8 @@ def cmd_dupes(args):
         if getattr(args, "images", False):
             run_dhash(conn, under=args.under, exts=args.ext, log=quiet)
     distance = getattr(args, "distance", None)
+    if distance is not None:
+        distance = max(0, min(64, distance))
     records = []
     if args.exact:
         groups, files, wasted = exact_dupe_summary(conn, args.ext, args.under)
@@ -840,7 +872,7 @@ def cmd_dupes(args):
                     last = fh
                     sets.append([])
                 sets[-1].append((path, size, mtime))
-            records += _group_records(sets, "identical")
+            records += _group_records(sets, "identical", _last_set(records))
         last = None
         for path, size, mtime, n, fh in rows:
             if fh != last:
@@ -859,7 +891,7 @@ def cmd_dupes(args):
                                   distance if distance is not None
                                   else NEAR_DISTANCE)
         groups = groups[:args.limit or None]
-        records += _group_records(groups, "near-text")
+        records += _group_records(groups, "near-text", _last_set(records))
         for g in groups:
             quiet("\n{} similar documents:".format(len(g)))
             for path, size, mtime, chars, fh in g:
@@ -875,7 +907,8 @@ def cmd_dupes(args):
                                       distance if distance is not None
                                       else IMAGE_DISTANCE)
         groups = groups[:args.limit or None]
-        records += _group_records(groups, "similar-image")
+        records += _group_records(groups, "similar-image",
+                                  _last_set(records))
         for g in groups:
             quiet("\n{} similar images:".format(len(g)))
             for path, size, mtime, dh in g:
