@@ -346,6 +346,14 @@ this folder**.
     not - condensed a batch at a time and then merged, so it scales to any
     number of files. A section of more than 120 files is represented by
     its 120 most typical ones, and says so to the model.
+  - **Closing findex closes it all.** If findex had to start Ollama
+    itself, it ends it - and the model processes under it - when the
+    window closes, along with any run still going, so nothing is left in
+    the background holding memory or keeping the app's folder locked. An
+    Ollama that was already running before findex (its tray app, say) is
+    left alone; findex just unloads the models it used from it. The build
+    scripts likewise stop the Ollama they started once the models are in.
+    `findex summarise --ai-stop` does the same from the command line.
   - *Model* - pick among the models installed, or download another. The
     ones offered are small and quick on purpose:
 
@@ -605,6 +613,7 @@ findex summarise --ai-models           the small, fast models findex suggests
 findex summarise --ai-setup            install/start Ollama, download gemma3:1b
 findex summarise --ai-setup --model llama3.2:1b   ...or the one you name
 findex summarise --ai-setup --model all           ...or all five (8.7 GB)
+findex summarise --ai-stop             stop the Ollama findex started
 findex summarise D:\Shared --forget    drop that folder's sections
 findex tree                            export the index as a tree (Downloads)
 findex tree -o C:\out.csv --under D:\Work

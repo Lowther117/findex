@@ -70,6 +70,7 @@ class SummaryTab:
         self._sautorun = False
         self._snote = ""              # said once, ahead of the next status
         self._swant_model = ""        # model being downloaded
+        self._sused = set()           # models this session has run
         self._sdigest = None          # this folder's "selected files" summary
         self._sshow_digest = False    # show it as soon as it is written
         self._scard = None            # (parts, terms) of the card on show
@@ -833,6 +834,9 @@ class SummaryTab:
         model = self.var_smodel.get().strip()
         if model:
             cmd += ["--model", model]
+        used = fs.pick_model(self._sai["models"], model or None)
+        if used:
+            self._sused.add(used)       # unloaded again when the app closes
         return cmd
 
     def _summary_ai_ready(self):
@@ -970,6 +974,16 @@ class SummaryTab:
                     "Open the Ollama download page? Install it, open it "
                     "once, then choose AI summaries > Set up again."):
                 webbrowser.open("https://ollama.com/download")
+
+    def _summary_shutdown(self):
+        """The app is closing: end the Ollama findex started and the model
+        processes under it, or - when Ollama was already running before
+        findex - just unload the models findex used. Quick, and never
+        allowed to stop the window closing."""
+        try:
+            fs.ai_stop(models=sorted(self._sused))
+        except Exception:                                      # noqa: BLE001
+            pass
 
     def _summary_ai_check(self):
         self._sai["at"] = time.time()

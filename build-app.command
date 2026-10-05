@@ -273,7 +273,10 @@ case "$AI_MODELS" in
             echo "   NOTE: the AI models are not all installed (reason above). The"
             echo "   app is fine without them; AI summaries > Set up retries from"
             echo "   inside the app."
-        fi ;;
+        fi
+        # The build started Ollama to do the downloading; it is not left
+        # running. (One that was already running before the build is.)
+        "$PY" -u findex.py summarise --ai-stop >/dev/null 2>&1 || true ;;
 esac
 
 echo

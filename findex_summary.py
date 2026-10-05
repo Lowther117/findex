@@ -11,6 +11,7 @@ findex_summary - what is in a folder, without opening anything.
                                            describe each section
     findex summarise --ai-status           is a local model available?
     findex summarise --ai-models           the small, fast models suggested
+    findex summarise --ai-stop             stop the Ollama findex started
 
 Two layers, both entirely on this computer:
 
@@ -2142,17 +2143,108 @@ def ai_start(url=None, log=print, install=False):
         kwargs["creationflags"] = 0x08000008       # no window, detached
     else:
         kwargs["start_new_session"] = True
+    # Started in the home folder, never the app's: a server left running
+    # with the app folder as its working directory keeps that folder locked
+    # (Windows then refuses to delete or rename it).
+    kwargs["cwd"] = os.path.expanduser("~")
     try:
-        subprocess.Popen([exe, "serve"], **kwargs)
+        proc = subprocess.Popen([exe, "serve"], **kwargs)
     except OSError as exc:
         st["error"] = "could not start Ollama: {}".format(exc)
         return st
+    _remember_server(proc.pid)
     for _ in range(60):
         time.sleep(0.5)
         st = ai_status(url)
         if st["ok"]:
             break
     return st
+
+
+# The Ollama findex starts is findex's to stop. Its pid is kept in a small
+# file in the temp folder, because the process that starts it (a build
+# script, a background run, the app's own check) is usually not the one that
+# will be around to stop it.
+def _server_file():
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "findex-ollama.pid")
+
+
+def _remember_server(pid):
+    try:
+        with open(_server_file(), "w", encoding="ascii") as fh:
+            fh.write(str(int(pid)))
+    except OSError:
+        pass
+
+
+def _is_ollama(pid):
+    """Is that pid (still) an Ollama process? Checked before anything is
+    stopped - pids get reused."""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["tasklist", "/FI", "PID eq {}".format(pid), "/FO", "CSV",
+                 "/NH"], capture_output=True, text=True, timeout=10,
+                creationflags=0x08000000).stdout
+        else:
+            out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="],
+                                 capture_output=True, text=True,
+                                 timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "ollama" in out.lower()
+
+
+def ai_stop(url=None, models=(), log=lambda *a: None):
+    """Shut down what findex started, and free what it loaded.
+
+    The Ollama server findex itself started (and the model processes under
+    it) is ended. An Ollama that was already running - the tray app, a
+    service - is somebody else's and is left alone, but the `models` findex
+    used are unloaded from it so their memory comes back. Returns what it
+    did: 'stopped', 'unloaded' or ''."""
+    did = ""
+    pid = 0
+    try:
+        with open(_server_file(), encoding="ascii") as fh:
+            pid = int(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        pass
+    if pid and _is_ollama(pid):
+        try:
+            if os.name == "nt":         # /T: llama-server.exe goes with it
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, timeout=15,
+                               creationflags=0x08000000)
+            else:
+                import signal
+                try:                    # it leads its own process group
+                    os.killpg(pid, signal.SIGTERM)
+                except (OSError, AttributeError):
+                    os.kill(pid, signal.SIGTERM)
+            did = "stopped"
+            log("Stopped the Ollama findex started.")
+        except (OSError, subprocess.SubprocessError) as exc:
+            log("Could not stop Ollama: {}".format(exc))
+    if pid:
+        try:
+            os.remove(_server_file())
+        except OSError:
+            pass
+    if not did and models:
+        url = (url or AI_URL).rstrip("/")
+        for m in models:
+            try:
+                with _http(url + "/api/generate",
+                           {"model": m, "keep_alive": 0}, timeout=3) as r:
+                    r.read()
+                did = "unloaded"
+            except Exception:                                  # noqa: BLE001
+                break                   # nothing answering: nothing loaded
+        if did:
+            log("Unloaded the model findex was using.")
+    return did
 
 
 def has_model(models, name):
@@ -2481,6 +2573,10 @@ def cmd_summarise(args):
         if other:
             print("Also installed: " + ", ".join(other))
         return 0
+    if args.ai_stop:
+        ai_stop(url, [args.model] if args.model else (), log) or print(
+            "Nothing of findex's is running.")
+        return 0
     if args.ai_setup:
         return ai_setup(args.model, url, args.progress, log)
     if args.ai_ids:
@@ -2628,6 +2724,9 @@ def add_commands(sub):
     p.add_argument("--ai-setup", action="store_true",
                    help="install/start Ollama and download a model "
                         "(--model picks which; default {})".format(AI_MODEL))
+    p.add_argument("--ai-stop", action="store_true",
+                   help="stop the Ollama findex started (one that was "
+                        "already running is left alone)")
     p.add_argument("--ai-models", action="store_true",
                    help="list the small, fast models findex suggests")
     p.add_argument("--progress", action="store_true",

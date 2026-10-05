@@ -205,7 +205,13 @@ echo    is fine without them; AI summaries, Set up retries from inside it.
 goto :aidone
 :aiskip
 echo    Skipped: FINDEX_AI_MODELS is %FINDEX_AI_MODELS%.
+goto :aiend
 :aidone
+rem The build started Ollama to do the downloading; it is not left running
+rem (one that was already running before the build is left alone). A server
+rem left behind would also keep this folder locked against deleting.
+"%PY%" -u "%HERE%findex.py" summarise --ai-stop >nul 2>&1
+:aiend
 
 echo.
 echo Done: %EXE%

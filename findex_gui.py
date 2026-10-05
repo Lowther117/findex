@@ -2927,6 +2927,7 @@ class FindexApp(findex_tabs.ToolTabs):
         if self.watch_proc is not None:
             self._kill_proc_tree(self.watch_proc)
             self.watch_proc = None
+        self._summary_shutdown()     # Ollama, if findex started it
         self._bg_sync_on_close()
         self.cfg.update({
             "db": portable(self.var_db.get()),
