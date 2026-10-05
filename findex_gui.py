@@ -89,6 +89,9 @@ DEFAULTS = {
     "exts": "",
     "save_dir": "",
     "geometry": "1060x700",
+    "ai_model": "",
+    "summary_detail": "normal",
+    "summary_sash": [],
 }
 
 
@@ -735,6 +738,7 @@ class FindexApp(findex_tabs.ToolTabs):
         self._build_menu()
         self._build_layout()
         self.apply_theme()
+        self._fit_window()
         # Ctrl+D toggles dark mode. Entry/Text widgets have an emacs-style
         # Ctrl+D (delete a character) class binding, which is replaced so the
         # toggle is the only thing that happens.
@@ -870,6 +874,9 @@ class FindexApp(findex_tabs.ToolTabs):
                       command=self.rename_from_search)
         m.add_command(label="Undo last rename batch...",
                       command=self.rename_undo)
+        m.add_separator()
+        m.add_command(label="Summarise this folder",
+                      command=self.summary_from_search)
         bar.add_cascade(label="Edit", menu=m)
 
         m = tk.Menu(bar, tearoff=0)
@@ -907,7 +914,32 @@ class FindexApp(findex_tabs.ToolTabs):
         # macOS Tk measures fonts differently: keep the size the window has
         # always used there, the house size everywhere else
         style.configure(".", font=(ui, self.ui_size))
-        style.configure("Treeview", font=(ui, self.ui_size))
+        # Rows sized from the font actually in use (a fixed height crams a
+        # 13pt Mac font into a row made for 10pt), and a little air either
+        # side of each cell so one column's text never runs into the next.
+        import tkinter.font as tkfont
+        line = tkfont.Font(family=ui, size=self.ui_size).metrics("linespace")
+        style.configure("Treeview", font=(ui, self.ui_size),
+                        rowheight=max(24, line + 10))
+        try:
+            style.configure("Treeview.Cell", padding=(8, 0))
+        except tk.TclError:
+            pass
+        # Menu buttons ("More", "Go to") look like the buttons beside them.
+        # Dividers between panes: wide enough to grab, quiet to look at.
+        style.configure("TPanedwindow", background=c["bg"])
+        style.configure("Sash", sashthickness=9, gripcount=6,
+                        background=c["bg"], bordercolor=c["bg"],
+                        lightcolor=c["border"], darkcolor=c["border"])
+        style.configure("TMenubutton", background=c["panel"],
+                        foreground=c["text"], bordercolor=c["field_border"],
+                        lightcolor=c["field_border"],
+                        darkcolor=c["field_border"], arrowcolor=c["dim"],
+                        padding=(11, 6), relief="solid")
+        style.map("TMenubutton",
+                  background=[("active", c["sel"]), ("pressed", c["sel"])],
+                  bordercolor=[("active", c["accent"])],
+                  foreground=[("disabled", c["dim"])])
         style.configure("TRadiobutton", background=c["bg"],
                         foreground=c["text"])
         style.map("TRadiobutton", background=[("active", c["bg"])],
@@ -1067,6 +1099,13 @@ class FindexApp(findex_tabs.ToolTabs):
     # -- layout ------------------------------------------------------------
 
     def _build_layout(self):
+        # The status strip is packed FIRST, against the bottom edge: pack
+        # hands out space in order, so when a tab asks for more height than
+        # the window has it is the tab that gets squeezed, never the strip
+        # (which used to slide off the bottom of the window).
+        bar = ttk.Frame(self.root)
+        bar.pack(fill="x", side="bottom", padx=12, pady=8)
+
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=10, pady=(10, 0))
 
@@ -1080,17 +1119,13 @@ class FindexApp(findex_tabs.ToolTabs):
         self._build_search_tab()
         self._build_index_tab()
         self._build_changes_tab()
-        self._build_tool_tabs()          # Health, Duplicates, Rename, Verify
+        self._build_tool_tabs()          # Summary, Health, Duplicates...
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-        bar = ttk.Frame(self.root)
-        bar.pack(fill="x", side="bottom", padx=12, pady=8)
-        ttk.Label(bar, textvariable=self.var_status).pack(side="left")
-        ttk.Label(bar, textvariable=self.var_hint,
-                  style="Dim.TLabel").pack(side="left", padx=14)
-        # Right-hand end, packed right to left: bar, its percentage, then
-        # the resource readout. The bar mirrors the one on the Index tab so
-        # a run can be watched from the Search tab.
+        # Right-hand end first, packed right to left: bar, its percentage,
+        # then the resource readout - so the status text on the left is
+        # what gives way in a narrow window. The bar mirrors the one on the
+        # Index tab so a run can be watched from the Search tab.
         self.busy = ttk.Progressbar(bar, mode="indeterminate", length=140)
         self.busy.pack(side="right")
         ttk.Label(bar, textvariable=self.var_progress,
@@ -1102,6 +1137,32 @@ class FindexApp(findex_tabs.ToolTabs):
                  "CPU and memory used by findex and every worker process it "
                  "has started. CPU is a share of the whole machine, so 100% "
                  "means every core is busy.")
+        ttk.Label(bar, textvariable=self.var_status).pack(side="left")
+        ttk.Label(bar, textvariable=self.var_hint,
+                  style="Dim.TLabel").pack(side="left", padx=14)
+
+    def _fit_window(self):
+        """Make the window tall enough for its tallest tab, where the
+        screen has the room - a remembered (or default) size that is too
+        short otherwise leaves the bottom of the bigger tabs out of sight.
+        Never shrinks it and never goes past the screen. Height only: the
+        width a window asks for is inflated by its long one-line hints."""
+        try:
+            self.root.update_idletasks()
+            size, _, pos = self.root.geometry().partition("+")   # WxH+X+Y
+            w, h = (int(v) for v in size.split("x"))
+            room = self.root.winfo_screenheight() - 110   # dock / taskbar
+            new_h = max(h, min(self.root.winfo_reqheight(), room))
+            if new_h != h:
+                x, _, y = pos.partition("+")
+                try:
+                    y = max(0, min(int(y), room - new_h + 60))
+                    self.root.geometry("{}x{}+{}+{}".format(w, new_h,
+                                                            int(x), y))
+                except ValueError:
+                    self.root.geometry("{}x{}".format(w, new_h))
+        except (tk.TclError, ValueError):
+            pass
 
     def _build_search_tab(self):
         top = ttk.Frame(self.tab_search)
@@ -1146,7 +1207,8 @@ class FindexApp(findex_tabs.ToolTabs):
 
         hint = ttk.Label(opts, style="Dim.TLabel",
                          text="names as you type  ·  content:word  ·  C:\\  ·"
-                              "  ext:pdf  ·  !leave-out  ·  folder:")
+                              "  ext:pdf  ·  !leave-out  ·  folder:  ·"
+                              "  section:")
         hint.pack(side="left", padx=(0, 20))
         self.tip(hint, "The search understands Everything-style filters, "
                        "combined freely - e.g.  C: content:dan ext:pdf "
@@ -1243,6 +1305,8 @@ class FindexApp(findex_tabs.ToolTabs):
         self.ctx.add_separator()
         self.ctx.add_command(label="Rename these...",
                              command=self.rename_from_search)
+        self.ctx.add_command(label="Summarise this folder",
+                             command=self.summary_from_search)
         self.ctx.add_command(label="Export this list...",
                              command=self.export_results_ui)
         self.ctx.add_separator()
@@ -2826,6 +2890,10 @@ class FindexApp(findex_tabs.ToolTabs):
             "  C:   D:\\Photos    only results under that drive/folder\n"
             "  ext:pdf;docx      only those types\n"
             "  folder:   file:   only folders / only files\n"
+            "  section:insurance files in a Summary section named so\n"
+            "  doctype:invoice   files the Summary pass typed as that\n"
+            "                    (letter, cv, contract, statement, minutes,\n"
+            "                     report, manual, email, code...)\n"
             "  !draft            leave out names containing draft\n"
             "  !ext:tmp  !C:\\Windows   ...works on filters too\n\n"
             "Example:  C: content:dan ext:pdf !draft\n\n"
@@ -2875,6 +2943,9 @@ class FindexApp(findex_tabs.ToolTabs):
             "exts": self.var_exts.get(),
             "save_dir": portable(self.cfg.get("save_dir") or ""),
             "geometry": self.root.geometry(),
+            "ai_model": self.var_smodel.get().strip(),
+            "summary_detail": self._summary_detail(),
+            "summary_sash": self._summary_sash(),
         })
         save_settings(self.cfg)
         self.root.destroy()

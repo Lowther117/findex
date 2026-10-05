@@ -30,6 +30,8 @@ and no machine-specific path is ever stored.
 | `theme.py` | the app | the app | The shared light/dark palette and ttk styling the window uses. Not run directly. |
 | `findex_tabs.py` | the app | the app | The Health, Duplicates, Rename and Verify tabs. Part of the app; not run directly. |
 | `findex_tabs_organise.py` | the app | the app | The Organise tab. Part of the app; not run directly. |
+| `findex_tabs_summary.py` | the app | the app | The Summary tab. Part of the app; not run directly. |
+| `findex_summary.py` | engine | engine | What a folder holds: files sorted into labelled sections by subject, a card per file, optional summaries from a local AI model: `findex summarise`. |
 | `findex_organise.py` | engine | engine | Sort a folder into subfolders by rules, with suggestions, a rule check, preview and undo: `findex organise`. |
 | `findex_hash.py` | engine | engine | Content fingerprints and type detection: `findex hash`, `findex dupes --exact / --near / --images`. |
 | `findex_report.py` | engine | engine | The health report: `findex report`. |
@@ -57,9 +59,11 @@ Findex/
   findex_rename.py    } its commands are absent
   findex_organise.py  }
   findex_schedule.py  }
+  findex_summary.py   }
   findex_gui.py       Tkinter desktop app (Search, Index, Changes tabs)
   findex_tabs.py      the Health, Duplicates, Rename and Verify tabs
   findex_tabs_organise.py   the Organise tab
+  findex_tabs_summary.py    the Summary tab
   theme.py            light/dark palette + styling for the app
   findex_app.py       entry point for the optional standalone build
   findex.bat          CLI launcher (Windows)
@@ -151,6 +155,12 @@ is remembered in `findex_gui.json`.
     work; half-typed queries quietly fall back to a literal word search)
   - `C:` or `D:\Photos` or `/Users/dan` limits results to that drive/folder
   - `ext:pdf;docx` limits the type; `folder:` / `file:` limit the kind
+  - `section:insurance` limits to files in a Summary section whose name
+    contains that word (`section:#12` is one exact section), and
+    `doctype:invoice` to files the Summary pass typed as that - `letter`,
+    `cv`, `contract`, `statement`, `payslip`, `minutes`, `report`, `manual`,
+    `policy`, `form`, `certificate`, `receipt`, `email`, `code`... Both only
+    match folders that have been summarised (see the Summary tab)
   - `!anything` leaves results out: `!draft`, `!ext:tmp`, `!C:\Windows`
   - e.g. `C: content:dan ext:pdf !draft`
 - **Weighted results**: name matches come back exact-name first, then names
@@ -158,6 +168,9 @@ is remembered in `findex_gui.json`.
   (bm25). Browsing with no terms is newest-first.
 - Right-click > **Rename these...** hands the selected files to the Rename
   tab as a hand-picked selection.
+- Right-click > **Summarise this folder** takes the selected folder (or the
+  folder of the selected file) to the Summary tab, and starts the summary
+  if that folder has never had one.
 - Right-click > **Export this list...** (also File > Export this list...)
   saves exactly what is on screen - the current search, type filter and
   sort order - to a file. Pick the type in the save dialog: `.csv` has
@@ -249,6 +262,105 @@ is remembered in `findex_gui.json`.
 - Entries are kept for 90 days by default (`findex journal --keep-days N`,
   0 = forever); older ones are pruned at the end of each index run.
   **Clear journal...** empties it; the index is untouched.
+
+**Summary tab** - what a folder holds, as labelled sections
+
+Point it at a folder and it tells you what is in there without you opening
+anything. One row of controls, two lists and a card:
+
+```
+Folder [..................] [Browse...] [Go to] [Summarise] [AI summaries] [More]
+Sections                    Files in the selected section
+                            The selected section's / file's card
+```
+
+While anything runs - a summary, AI summaries, a model download - the
+status line at the bottom of the tab shows what it is doing and how far it
+has got ("Reading files: 2,400 of 60,000 (4%)", then "sorting them into
+sections...") with a progress bar and a **Stop** button beside it. Stopping
+keeps everything done so far.
+
+The three panes are divided by bars you can drag: pull the one between
+*Sections* and the file list sideways, and the one between the file list
+and the card up or down, to give whichever matters most the room. The
+positions are remembered. (The Health tab's two lists have the same
+divider, and every list's column edges drag as well.)
+
+The tab is always about ONE folder - the one in the *Folder* box - and
+everything on it covers that folder and what is below it, nothing else.
+Blank is the whole index. Get to a folder by typing or **Browse...**, from
+**Go to** (the folders inside this one, biggest first, plus *Up one
+folder*), or by right-clicking a result on the Search tab > **Summarise
+this folder**.
+
+- **Summarise** is the offline pass. It reads the text findex *already
+  extracted* - no file on disk is opened, no AI is involved - and:
+  - gives every readable file a **card**: the kind of document it is
+    (invoice, letter, CV, contract, statement, payslip, minutes, report,
+    manual, policy, form, certificate, email, spreadsheet, presentation,
+    code...), its title, its key phrases, the dates / amounts / reference
+    numbers / emails / postcodes found in it, and a two-sentence gist
+    *lifted from its own text* (chosen, not written);
+  - sorts the documents into **sections by subject**, each named from the
+    phrases its documents share and few others do ("Insurance · Policy ·
+    Renewal"). Documents that fit nowhere land in *Unsorted*, by kind;
+  - groups everything with no text (pictures, video, archives, programs)
+    and everything that is not prose (code, data, logs) by type, splitting
+    a big group by the sub-folder its files sit in.
+
+  It is word statistics, not understanding: expect the odd section that is
+  really two subjects, and an Unsorted pile. Roughly 3 ms of CPU per
+  document, spread over every core - tens of seconds for tens of thousands
+  of documents - and cards are kept, so a second run, or a run on a
+  sub-folder, only reads what changed.
+- **Sections** (left) - click one to list its files; click a file for its
+  card underneath. *Overview* describes the folder as a whole. A
+  double-click (or More > *Show this section in Search*) opens the section
+  in the Search tab as `section:#n`, where the files can be copied, moved,
+  renamed or narrowed further. The file list has the usual right-click menu
+  (Open / Show in folder / Copy path / Delete to the bin).
+- **A folder inside a summarised one** needs no run of its own: go into it
+  and the tab shows the parent's sections narrowed to that folder, and says
+  so. Summarise it anyway for sections worked out from its files alone -
+  each folder keeps its own, side by side.
+- **AI summaries** (optional) - a small language model running on this
+  computer through [Ollama](https://ollama.com) writes proper summaries.
+  Nothing is sent anywhere; no account, no admin rights. The menu holds:
+  - *Summarise the selected files* (also on the right-click menu) - two or
+    three written sentences per file. A few seconds each, so it is for the
+    files you pick, not the whole index; Stop on the Index tab cancels and
+    keeps what was done.
+  - *Name and describe the sections* - a plain title and a line for each
+    section of this folder, and a paragraph about the folder (shown under
+    *Overview*). One short request per section.
+  - *Model* - pick among the models installed, or download another. The
+    ones offered are small and quick on purpose:
+
+    | Model | Download | What it is like |
+    |---|---|---|
+    | `gemma3:1b` | 815 MB | quickest - fine for a few plain sentences (the default) |
+    | `qwen3.5:0.8b` | 1.2 GB | newest of the tiny models |
+    | `llama3.2:1b` | 1.3 GB | quick, plain summaries |
+    | `granite4:micro` | 2.1 GB | steadier on business documents |
+    | `gemma3:4b` | 3.3 GB | best of the small ones, about 3x slower |
+
+    *Download all of them* fetches the lot (8.7 GB) - which is also what
+    the standalone build scripts do, so after a build they are already
+    there. Any other model already in Ollama is listed too. Requests are kept
+    short for speed (the first ~5,000 characters of a file plus its end, a
+    4k context, "thinking" switched off for models that have it).
+  - *Set up* (shown until a model is installed) - installs Ollama when it
+    is missing (Homebrew on macOS, winget on Windows), starts it, and
+    downloads `gemma3:1b`. `FINDEX_AI_URL` points findex at an Ollama
+    running somewhere other than `http://127.0.0.1:11434`.
+- **More** - *Export this summary...* (`.html` is a self-contained page of
+  sections and files with their kind, summary and key phrases; `.csv` is
+  one file per row; `.json` and `.txt` too), *fewer / balanced / more
+  sections* for the next run, and *Forget this folder's summary*.
+- Cards and sections live in the index database and follow it. A file that
+  leaves the index takes its card with it; a file that changes gets a new
+  card on the next run (and loses its AI summary, which described the old
+  text).
 
 **Health tab** - what is wrong with the tree, read from the index
 
@@ -464,6 +576,22 @@ findex organise D:\Downloads --rules tidy.rules          preview (dry run)
 findex organise D:\Downloads --rules tidy.rules --sweep --remove-empty --apply
 findex organise D:\Downloads --template tidy --copy --apply
 findex organise --undo
+findex summarise D:\Shared             sort one folder into sections by subject
+findex summarise                       ...or everything in the index
+findex summarise D:\Shared --show      the sections found last time
+findex summarise --section 12          the files in one section, with cards
+findex summarise D:\Shared -o out.html  export (.html .csv .json .txt)
+findex summarise D:\Shared --detail high   more, narrower sections
+findex summarise D:\Shared --ai        ...then have the local model title and
+                                       describe each section and the folder
+findex summarise --ai-files a.pdf b.docx   written summaries of these files
+findex summarise --ai-section 12 -n 20     ...of 20 files of a section
+findex summarise --ai-status           is a local model available?
+findex summarise --ai-models           the small, fast models findex suggests
+findex summarise --ai-setup            install/start Ollama, download gemma3:1b
+findex summarise --ai-setup --model llama3.2:1b   ...or the one you name
+findex summarise --ai-setup --model all           ...or all five (8.7 GB)
+findex summarise D:\Shared --forget    drop that folder's sections
 findex tree                            export the index as a tree (Downloads)
 findex tree -o C:\out.csv --under D:\Work
 findex journal                         what changed, newest first
@@ -638,6 +766,25 @@ Each build ends by running the built app's own self-test and says what is
 wrong rather than Done if something is missing; the full run is in
 `build-win-log.txt` / `build-mac-log.txt`.
 
+**The AI summary models are installed by the build too.** As its last step
+each script installs [Ollama](https://ollama.com) if the machine has none
+(Homebrew on the Mac; winget, or failing that Ollama's own per-user
+installer, on Windows - no admin rights), starts it, and downloads the five
+small models the Summary tab offers - about 8.7 GB the first time, nothing
+on later builds because models already there are skipped. So after a build,
+AI summaries simply work the first time the app is opened.
+
+- The models go onto *that machine* (`~/.ollama`), not into `dist/`: Ollama
+  is a separate program and the models are far too big to carry inside the
+  app. Copy the app to another computer and *AI summaries > Set up* fetches
+  them there.
+- Nothing in this step can fail the build - the app is complete without
+  the models, and says so if they are missing.
+- Choose what is fetched with `FINDEX_AI_MODELS` before running the script:
+  `none` skips the step, `gemma3:1b` fetches just that one (815 MB), and
+  `gemma3:1b,llama3.2:1b` a list. Windows: `set FINDEX_AI_MODELS=none`
+  then `build-exe.bat`; Mac: `FINDEX_AI_MODELS=none ./build-app.command`.
+
 ### The exe on a managed PC
 
 `findex.exe` is unsigned - PyInstaller builds are - and a PC under a security
@@ -699,6 +846,12 @@ Explorer, which has its own opinions about long paths.)
   on stop.
 - The index stores absolute file paths, so results from a machine you are not
   currently on will not open until you are back on it.
+- The Summary tab's sections come from word statistics over the text already
+  in the index: files with no extracted text (most images without OCR, video,
+  archives) can only be grouped by type and folder, and a folder of very
+  short or very mixed documents leaves more in *Unsorted*. Document kinds and
+  dates are read the British/English way (`03/04/2024` is 3 April). Written
+  summaries need Ollama running locally and take seconds per file.
 
 ## Licence
 

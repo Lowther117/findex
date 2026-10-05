@@ -18,6 +18,8 @@ rem
 rem The noisy output of pip and PyInstaller goes to build-win-log.txt so this
 rem window stays readable; if anything fails, the tail of that log is shown
 rem here. The finished exe is tested before this script claims success.
+rem The last step installs Ollama and the small AI models the Summary tab
+rem uses (set FINDEX_AI_MODELS=none first to skip it).
 
 setlocal
 cd /d "%~dp0"
@@ -159,11 +161,58 @@ type "%APPDIR%\findex-selftest.txt" >> "%LOG%"
 del /q "%APPDIR%\findex-selftest.txt" >nul 2>&1
 if not "%RC%"=="0" goto :selftestbad
 
+rem ---------------------------------------------------------------------
+rem 5. The AI summary models
+rem
+rem The Summary tab's written summaries come from small language models run
+rem on this PC by Ollama. Fetching them here means they are simply there
+rem the first time the app is opened. They are installed ON THIS PC (in
+rem %USERPROFILE%\.ollama), not inside dist\findex: Ollama is a separate
+rem program and the models are far too big to carry in the app folder.
+rem Copy the app to another PC and AI summaries, Set up fetches them there.
+rem
+rem Already-installed models are skipped, so only the first build
+rem downloads. Nothing here can fail the build - the app works without
+rem them. No admin rights are needed.
+rem
+rem   set FINDEX_AI_MODELS=none        before running this: skip the step
+rem   set FINDEX_AI_MODELS=gemma3:1b   just that one (or a,b,c for a list)
+rem ---------------------------------------------------------------------
+echo.
+echo == AI summary models
+set "AIRESULT=skipped"
+if not defined FINDEX_AI_MODELS set "FINDEX_AI_MODELS=all"
+if /i "%FINDEX_AI_MODELS%"=="none" goto :aiskip
+if /i "%FINDEX_AI_MODELS%"=="skip" goto :aiskip
+if /i not "%FINDEX_AI_MODELS%"=="all" goto :ailist
+echo    Installing Ollama and all five small models - about 8.7 GB the
+echo    first time, nothing after that. FINDEX_AI_MODELS=none skips this.
+goto :airun
+:ailist
+echo    Installing Ollama and: %FINDEX_AI_MODELS%
+:airun
+echo ---- ai models: %FINDEX_AI_MODELS% ---->> "%LOG%"
+"%PY%" -u "%HERE%findex.py" summarise --ai-setup --model "%FINDEX_AI_MODELS%"
+if errorlevel 1 goto :aibad
+set "AIRESULT=installed on this PC"
+echo ai models ok>> "%LOG%"
+goto :aidone
+:aibad
+set "AIRESULT=NOT all installed - see the note above"
+echo ai models: problems>> "%LOG%"
+echo    NOTE: the AI models are not all installed ^(reason above^). The app
+echo    is fine without them; AI summaries, Set up retries from inside it.
+goto :aidone
+:aiskip
+echo    Skipped: FINDEX_AI_MODELS is %FINDEX_AI_MODELS%.
+:aidone
+
 echo.
 echo Done: %EXE%
 echo.
 echo   Copy the folder anywhere and double-click findex.exe.
 echo   It keeps its index in the folder, wherever the folder is.
+echo   AI summary models: %AIRESULT%.
 echo.
 echo Log: %LOG%
 pause

@@ -302,7 +302,7 @@ class OrganiseTab:
                     "files that start with the same word, reference codes, "
                     "date-named files, then by type. Each suggested rule says "
                     "how many files it covers. Change or remove any of them.")
-        self.omore = ttk.Menubutton(step1, text="More \u25be", width=8)
+        self.omore = ttk.Menubutton(step1, text="More", width=6)
         self.omore.pack(side="left", padx=(6, 0))
         self.omore_menu = tk.Menu(self.omore, tearoff=0)
         self._menus.append(self.omore_menu)

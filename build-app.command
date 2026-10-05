@@ -3,7 +3,9 @@
 # The normal folder + findex-gui.command setup is unchanged by this.
 #
 # Everything this prints is also written to build-mac-log.txt, and the built
-# app is tested before this script claims success.
+# app is tested before this script claims success. The last step installs
+# Ollama and the small AI models the Summary tab uses (FINDEX_AI_MODELS=none
+# skips it).
 
 cd "$(dirname "$0")" || exit 1
 LOG="build-mac-log.txt"
@@ -230,6 +232,50 @@ else
     RESULT=problems
 fi
 
+# --------------------------------------------------------------------------
+# 6. The AI summary models
+#
+# The Summary tab's written summaries come from small language models run on
+# this Mac by Ollama. Fetching them here means they are simply there the
+# first time the app is opened. They are installed ON THIS MAC (in
+# ~/.ollama), not inside findex.app: Ollama is a separate program, and the
+# models are far too big to carry in the bundle. Copy the app to another
+# Mac and AI summaries > Set up fetches them there.
+#
+# Already-installed models are skipped, so only the first build downloads.
+# Nothing here can fail the build - the app works without them.
+#
+#   FINDEX_AI_MODELS=none ./build-app.command           skip this step
+#   FINDEX_AI_MODELS=gemma3:1b ./build-app.command      just that one
+#   FINDEX_AI_MODELS=gemma3:1b,llama3.2:1b ...          a list
+# --------------------------------------------------------------------------
+say "AI summary models"
+AI_MODELS="${FINDEX_AI_MODELS:-all}"
+AI_RESULT=skipped
+case "$AI_MODELS" in
+    none|skip|no|0)
+        echo "   Skipped (FINDEX_AI_MODELS=$AI_MODELS)." ;;
+    *)
+        if [ "$AI_MODELS" = all ]; then
+            echo "   Installing Ollama and all five small models - about 8.7 GB the"
+            echo "   first time, nothing after that. FINDEX_AI_MODELS=none skips this."
+        else
+            echo "   Installing Ollama and: $AI_MODELS"
+        fi
+        if ! command -v ollama >/dev/null 2>&1 \
+                && [ ! -x "/Applications/Ollama.app/Contents/Resources/ollama" ]; then
+            brew_install ollama || echo "   Homebrew could not install Ollama."
+        fi
+        if "$PY" -u findex.py summarise --ai-setup --model "$AI_MODELS"; then
+            AI_RESULT=ok
+        else
+            AI_RESULT=problems
+            echo "   NOTE: the AI models are not all installed (reason above). The"
+            echo "   app is fine without them; AI summaries > Set up retries from"
+            echo "   inside the app."
+        fi ;;
+esac
+
 echo
 if [ "$RESULT" = ok ]; then
     cat <<MSG
@@ -245,4 +291,8 @@ The app was built but the self-test above found problems, so it may not
 open properly. The whole run is in $PWD/$LOG.
 MSG
 fi
+case "$AI_RESULT" in
+    ok)       echo "AI summary models: installed on this Mac." ;;
+    problems) echo "AI summary models: NOT all installed - see the note above." ;;
+esac
 echo "Log: $PWD/$LOG"

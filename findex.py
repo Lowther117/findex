@@ -21,6 +21,9 @@ Tools built on the index (each lives in its own module beside this one):
     findex snapshot / verify    Manifest of a tree; later prove nothing changed
     findex rename               Bulk rename with a dry-run preview and undo
     findex organise             Sort a folder's files into subfolders by rules
+    findex summarise            What a folder holds: files grouped into labelled
+                                sections by subject, a card per file, and
+                                optional summaries written by a local AI model
     findex schedule             Background index refresh (Task Scheduler / launchd)
 
 EVERY file AND folder under the indexed roots is recorded by name, size and
@@ -2138,11 +2141,15 @@ def parse_query(text):
         C:   C:\\Users     only results under that drive/folder
         ext:pdf;docx      only those types
         file:  folder:    only files / only folders
+        section:word      only files in a Summary section whose name has
+                          that word (section:#12 = that exact section)
+        doctype:invoice   only files the Summary pass typed as that
         !anything         the same, negated: !draft  !ext:tmp  !C:\\Windows
     """
     q = {"name": [], "name_not": [], "content": [], "content_not": [],
          "paths": [], "paths_not": [], "exts": [], "exts_not": [],
-         "kind": None}
+         "sections": [], "sections_not": [], "doctypes": [],
+         "doctypes_not": [], "kind": None}
     for tok in _TOKEN.findall(text or ""):
         neg = tok.startswith("!")
         if neg:
@@ -2165,6 +2172,12 @@ def parse_query(text):
             rest = tok[5:].strip('"')
             if rest:
                 q["paths_not" if neg else "paths"].append(rest)
+            continue
+        if low.startswith(("section:", "doctype:")):
+            key = "sections" if low.startswith("section:") else "doctypes"
+            rest = tok[8:].strip('"').strip()
+            if rest:
+                q[key + ("_not" if neg else "")].append(rest)
             continue
         if low.startswith(("file:", "folder:", "folders:", "dir:")):
             q["kind"] = "file" if low.startswith("file:") else "folder"
@@ -2248,6 +2261,13 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
         conds.append("f.is_dir=0")
     elif q["kind"] == "folder":
         conds.append("f.is_dir=1")
+    if q["sections"] or q["sections_not"] or q["doctypes"] \
+            or q["doctypes_not"]:
+        try:
+            import findex_summary
+            findex_summary.search_conds(conn, q, conds, params)
+        except ImportError:
+            conds.append("0")       # the summary module is not installed
 
     not_params = []
     if q["content_not"]:
@@ -2528,6 +2548,12 @@ def clear_index(path):
     cur.execute("DELETE FROM docs")
     cur.execute("DELETE FROM files")
     cur.execute("DELETE FROM meta")
+    for table in ("summary", "summary_members", "summary_sections",
+                  "summary_runs"):
+        try:
+            cur.execute("DELETE FROM " + table)
+        except sqlite3.OperationalError:
+            pass                    # never summarised: no such table
     conn.commit()
     conn.execute("VACUUM")
     conn.close()
@@ -2808,6 +2834,11 @@ def tool_modules():
     try:
         import findex_schedule
         mods.append(findex_schedule)
+    except ImportError:
+        pass
+    try:
+        import findex_summary
+        mods.append(findex_summary)
     except ImportError:
         pass
     return mods

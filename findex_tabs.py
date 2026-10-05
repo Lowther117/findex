@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-findex_tabs - the tool tabs of the desktop app: Health, Duplicates, Rename
-and Verify. A mixin that findex_gui.FindexApp inherits; each tab drives one
-of the engine's tool modules (findex_report, findex_hash, findex_rename,
-findex_verify) and reuses the app's own machinery - launch() for engine
-child processes with progress, the message queue, tooltips, the palette.
+findex_tabs - the tool tabs of the desktop app: Summary, Health, Duplicates,
+Rename, Organise and Verify (Organise and Summary live in their own modules
+and are mixed in here). A mixin that findex_gui.FindexApp inherits; each tab
+drives one of the engine's tool modules (findex_report, findex_hash,
+findex_rename, findex_verify...) and reuses the app's own machinery -
+launch() for engine child processes with progress, the message queue,
+tooltips, the palette.
 
 Long jobs (hashing, snapshots, disk verification) run as engine children so
 Stop always works and the window never freezes; quick ones (the health scan,
@@ -28,9 +30,10 @@ import findex_rename
 import findex_report
 import findex_verify
 import findex_tabs_organise
+import findex_tabs_summary
 
 TOOL_KINDS = ("hash", "hash-near", "hash-images", "snapshot", "verify",
-              "report")
+              "report") + findex_tabs_summary.SUMMARY_KINDS
 
 
 def _g():
@@ -55,7 +58,8 @@ def _folder_row(parent, var, tip_fn, tip_text, label="Folder:"):
     return row
 
 
-class ToolTabs(findex_tabs_organise.OrganiseTab):
+class ToolTabs(findex_tabs_organise.OrganiseTab,
+               findex_tabs_summary.SummaryTab):
     """Mixin for findex_gui.FindexApp. Expects the app's usual attributes
     (root, nb, tip, launch, msgs, var_db, var_status, pal, log_line...)."""
 
@@ -66,6 +70,8 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
     def _build_tool_tabs(self):
         self._tool_trees = []
         self._tool_after = None
+        self.tab_summary = ttk.Frame(self.nb)
+        self.nb.add(self.tab_summary, text="  Summary  ")
         self.tab_health = ttk.Frame(self.nb)
         self.tab_dupes = ttk.Frame(self.nb)
         self.tab_rename = ttk.Frame(self.nb)
@@ -76,6 +82,7 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
         self.nb.add(self.tab_rename, text="  Rename  ")
         self.nb.add(self.tab_organise, text="  Organise  ")
         self.nb.add(self.tab_verify, text="  Verify  ")
+        self._build_summary_tab()
         self._build_health_tab()
         self._build_dupes_tab()
         self._build_rename_tab()
@@ -120,9 +127,12 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
             tree.tag_configure("head", font=(self.ui_family, self.ui_size,
                                              "bold"))
         self._theme_organise(c, pal)
+        self._theme_summary(c, pal)
 
     def _tool_tab_shown(self, name):
-        if name == "Health" and not self._health_scanned and self.proc is None:
+        if name == "Summary":
+            self._summary_tab_shown()
+        elif name == "Health" and not self._health_scanned and self.proc is None:
             self.health_scan()
         elif name == "Rename":
             self._rename_debounce()
@@ -134,6 +144,8 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
 
     def _tool_progress(self, p):
         """A @P line from a tool child: 'seen', 'done', 'total', 'elapsed'."""
+        if self.proc_kind in findex_tabs_summary.SUMMARY_KINDS:
+            self._summary_progress(p)
         total = p.get("total") or 0
         seen = p.get("seen", 0)
         if total:
@@ -149,7 +161,9 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
 
     def _tool_finished(self, kind, code):
         """The engine child for a tool tab ended."""
-        if kind in ("hash", "hash-near", "hash-images"):
+        if kind in findex_tabs_summary.SUMMARY_KINDS:
+            self._summary_finished(kind, code)
+        elif kind in ("hash", "hash-near", "hash-images"):
             if code == 0:
                 self._dupes_query()
             else:
@@ -340,14 +354,15 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
             "passwords or keys sitting in documents."))
         hint.pack(fill="x", padx=12, pady=(0, 6))
 
-        body = ttk.Frame(t)
+        # a divider you can drag between the categories and their files
+        body = ttk.PanedWindow(t, orient="horizontal")
         body.pack(fill="both", expand=True, padx=12, pady=(0, 6))
         left, self.htree_cats = self._tool_tree(
             body, ("category", "count", "size"),
             [("category", "Category", 230, "w", True),
              ("count", "Count", 80, "e", False),
              ("size", "Size", 80, "e", False)])
-        left.pack(side="left", fill="y", padx=(0, 8))
+        body.add(left, weight=1)
         self.htree_cats.configure(selectmode="browse")
         self.htree_cats.bind("<<TreeviewSelect>>",
                              lambda e: self._health_show_category())
@@ -357,7 +372,7 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
              ("modified", "Modified", 120, "w", False),
              ("folder", "Folder", 300, "w", True),
              ("detail", "Detail", 260, "w", False)])
-        right.pack(side="left", fill="both", expand=True)
+        body.add(right, weight=3)
         self._make_ctx(self.htree, "_hpaths")
         self.tip(self.htree, "The files in the selected category. Works "
                              "like the Search list: select several, right-"
