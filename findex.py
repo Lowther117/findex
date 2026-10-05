@@ -2549,7 +2549,7 @@ def clear_index(path):
     cur.execute("DELETE FROM files")
     cur.execute("DELETE FROM meta")
     for table in ("summary", "summary_members", "summary_sections",
-                  "summary_runs"):
+                  "summary_runs", "summary_digests"):
         try:
             cur.execute("DELETE FROM " + table)
         except sqlite3.OperationalError:

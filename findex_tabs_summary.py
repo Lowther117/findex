@@ -70,6 +70,9 @@ class SummaryTab:
         self._sautorun = False
         self._snote = ""              # said once, ahead of the next status
         self._swant_model = ""        # model being downloaded
+        self._sdigest = None          # this folder's "selected files" summary
+        self._sshow_digest = False    # show it as soon as it is written
+        self._scard = None            # (parts, terms) of the card on show
         self.var_sfolder = tk.StringVar(value="")
         self.var_sstatus = tk.StringVar(
             value="Choose a folder, then press Summarise.")
@@ -126,8 +129,9 @@ class SummaryTab:
         self._menus.append(self.smodel_menu)
         self.tip(self.sai, "Optional: have a small language model running "
                            "on this computer write proper summaries - of "
-                           "the files you select, or a title and a line "
-                           "for each section. Nothing is sent anywhere. "
+                           "the files you select (each one, then all of "
+                           "them together), or of the whole folder section "
+                           "by section. Nothing is sent anywhere. "
                            "The model is chosen (and downloaded) here too.")
 
         self.smore = ttk.Menubutton(top, text="More")
@@ -313,7 +317,7 @@ class SummaryTab:
         elif kind == "summary-setup":
             text = "Downloading: {:,} of {:,} MB".format(seen, total)
         else:
-            text = "Writing summaries: {:,} of {:,}".format(seen, total)
+            text = "Writing summaries: step {:,} of {:,}".format(seen, total)
         self.var_sstatus.set("{}  ({:.0f}%)".format(text, pct))
 
     def _summary_progress_end(self):
@@ -420,27 +424,29 @@ class SummaryTab:
                 own = {r["scope"] for r in fs.runs(conn)}
                 subs = [(p, n, p in own)
                         for p, n in fs.subfolders(conn, scope)]
+                digest = fs.digest_for(conn, scope)
                 in_index = conn.execute(
                     "SELECT COUNT(*) FROM files f WHERE f.is_dir=0"
                     + fs._scope_sql(scope)[0],
                     fs._scope_sql(scope)[1]).fetchone()[0]
                 self.msgs.put(("call", self._summary_show,
                                (gen, scope, run, exact, secs, subs,
-                                in_index, None)))
+                                in_index, None, digest)))
             except (sqlite3.Error, OSError) as exc:
                 self.msgs.put(("call", self._summary_show,
                                (gen, scope, None, False, [], [], 0,
-                                str(exc))))
+                                str(exc), None)))
             finally:
                 if conn is not None:
                     conn.close()
         threading.Thread(target=work, daemon=True).start()
 
     def _summary_show(self, gen, scope, run, exact, secs, subs, in_index,
-                      err):
+                      err, digest=None):
         if gen != self._sgen:
             return
         self._srun, self._sexact = run, exact
+        self._sdigest = digest
         self._ssubs = subs
         keep = self.stree_secs.selection()
         self.stree_secs.delete(*self.stree_secs.get_children())
@@ -501,8 +507,13 @@ class SummaryTab:
         self.var_sstatus.set((note + "  " if note else "") + status)
         pick = keep[0] if keep and self.stree_secs.exists(keep[0]) \
             else OVERVIEW
+        show, self._sshow_digest = self._sshow_digest, False
         self.stree_secs.selection_set(pick)
         self._summary_show_section()
+        if show and digest:
+            # just written: put it on the card - a moment later, because
+            # selecting the row above redraws the card when Tk next idles
+            self.root.after(300, self._summary_show_digest)
 
     # ------------------------------------------------------------------
     # one section / one file
@@ -543,6 +554,50 @@ class SummaryTab:
                               "found when {} was summarised.\n".format(
                                   sum(s["n"] for s in secs), len(secs),
                                   run["scope"] or "the whole index")))
+        if not run.get("ai") and self._sexact:
+            parts.append(("dim", "AI summaries > Summarise this whole "
+                                 "folder writes one summary of everything "
+                                 "in it.\n"))
+        return parts + self._summary_digest_parts()
+
+    def _summary_digest_parts(self, heading=False):
+        """The latest combined summary of hand-picked files, for the card."""
+        d = self._sdigest
+        if not d or not d.get("text"):
+            return []
+        title = "The {:,} selected files, together".format(d["n"])
+        when = time.strftime("%d %b %Y, %H:%M",
+                             time.localtime(d["created"] or 0))
+        return [("h" if heading else "key", ("" if heading else "\n")
+                 + title + "\n"),
+                ("", d["text"] + "\n"),
+                ("dim", "{}{}  -  written {} by {}\n".format(
+                    d["names"] or "", " ..." if d["n"] > 6 else "", when,
+                    d["model"] or "a local model"))]
+
+    def _summary_show_digest(self):
+        if self._sdigest:
+            self._scard = None
+            self._summary_text(self._summary_digest_parts(heading=True))
+
+    def _summary_in_short(self, rows, terms):
+        """Card lines for what a set of files adds up to (no AI): the
+        period their text mentions, recurring names, and typical files."""
+        d = fs.in_short(rows, terms)
+        parts = []
+        if d["years"]:
+            lo, hi = d["years"]
+            parts += [("key", "Covers  "),
+                      ("", (lo if lo == hi else lo + " to " + hi)
+                       + "  (years mentioned in the files)\n")]
+        if d["names"]:
+            parts += [("key", "Names that recur  "),
+                      ("", ",  ".join(d["names"]) + "\n")]
+        if d["typical"]:
+            parts.append(("key", "Typical of these files\n"))
+            for name, said in d["typical"]:
+                parts += [("", "  " + name + "  "),
+                          ("dim", said[:260] + "\n")]
         return parts
 
     def _summary_show_section(self):
@@ -551,8 +606,12 @@ class SummaryTab:
             return
         key = sel[0]
         s = self._ssections.get(key)
+        self._scard = None
         if key == OVERVIEW:
-            self._summary_text(self._summary_overview_text())
+            parts = self._summary_overview_text()
+            self._scard = (parts, ", ".join(
+                self._srun["overview"].get("keywords") or []))
+            self._summary_text(parts)
         elif s:
             parts = [("h", "{}\n".format(s["ai_title"] or s["label"]))]
             if s["ai"]:
@@ -562,6 +621,11 @@ class SummaryTab:
             if s["terms"]:
                 parts += [("key", "About  "),
                           ("", s["terms"].replace(";", ",") + "\n")]
+            if not s["ai"] and s["kind"] != "type":
+                parts.append(("dim", "AI summaries > Summarise this whole "
+                                     "folder writes one summary of all "
+                                     "these files.\n"))
+            self._scard = (parts, s["terms"])
             self._summary_text(parts)
         self._sfgen += 1
         gen = self._sfgen
@@ -603,6 +667,11 @@ class SummaryTab:
                         f["title"] or (f["keywords"] or "").replace(";", ",")))
             self._spaths[iid] = f["path"]
             self._sfiles[iid] = f
+        if self._scard and not tree.selection():
+            # the card of the section (or folder) on show: add what its
+            # files amount to, now that their cards are here
+            parts, terms = self._scard
+            self._summary_text(parts + self._summary_in_short(rows, terms))
         if total is None:
             self.var_status.set("Overview: the {:,} most recently changed "
                                 "files".format(len(rows)))
@@ -721,9 +790,11 @@ class SummaryTab:
             m.add_command(label="Not set up yet (optional)",
                           state="disabled")
         m.add_separator()
-        m.add_command(label="Summarise the selected files",
+        m.add_command(label="Summarise the selected files  "
+                            "(each one, then all of them together)",
                       command=self.summary_ai_files)
-        m.add_command(label="Name and describe the sections",
+        m.add_command(label="Summarise this whole folder  "
+                            "(every section, then the folder)",
                       command=self.summary_ai_sections)
         m.add_separator()
         sub = self.smodel_menu
@@ -794,10 +865,10 @@ class SummaryTab:
         if scope:
             cmd.append(scope)
         self._progress_est = 0
-        self.launch(cmd, "summary-ai", "Describing the sections...")
+        self.launch(cmd, "summary-ai", "Summarising the whole folder...")
         self._summary_progress_begin(
-            "summary-ai", "Describing the sections - waiting for the "
-                          "model...")
+            "summary-ai", "Summarising every section, then the folder - "
+                          "waiting for the model...")
 
     def summary_ai_files(self):
         if self._summary_busy():
@@ -826,7 +897,11 @@ class SummaryTab:
             return
         self._summary_save_prefs()
         cmd = self._summary_ai_cmd() + [
-            "--redo", "--ai-ids", ",".join(str(i) for i in ids)]
+            "--ai-ids", ",".join(str(i) for i in ids)]
+        scope = self._summary_scope()
+        if scope:
+            cmd.append(scope)       # where the combined summary is kept
+        self._sshow_digest = len(ids) > 1
         self._progress_est = 0
         self.launch(cmd, "summary-ai", "Summarising {:,} file(s) with "
                                        "AI...".format(len(ids)))

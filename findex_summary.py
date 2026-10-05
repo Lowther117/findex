@@ -640,6 +640,15 @@ CREATE TABLE IF NOT EXISTS summary_members (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_summem_file ON summary_members(file_id);
 
+CREATE TABLE IF NOT EXISTS summary_digests (
+    scope   TEXT PRIMARY KEY,
+    created REAL,
+    n       INTEGER,
+    names   TEXT,
+    text    TEXT,
+    model   TEXT
+);
+
 CREATE TRIGGER IF NOT EXISTS files_summary_ad AFTER DELETE ON files BEGIN
     DELETE FROM summary WHERE file_id = old.id;
     DELETE FROM summary_members WHERE file_id = old.id;
@@ -702,6 +711,12 @@ def _scope_sql(scope, col="f.path"):
     if not scope:
         return "", []
     return " AND {} LIKE ? ESCAPE '!'".format(col), [scope_like(scope)]
+
+
+def _base(path):
+    """A file's name, whichever kind of path it is - a Windows path in an
+    index opened on a Mac has no '/' for os.path.basename to split on."""
+    return re.split(r"[\\/]", path)[-1] or path
 
 
 def _under(path, scope):
@@ -1307,12 +1322,15 @@ def forget(conn, scope=None):
         cur.execute("DELETE FROM summary_members")
         cur.execute("DELETE FROM summary_sections")
         cur.execute("DELETE FROM summary_runs")
+        cur.execute("DELETE FROM summary_digests")
         cur.execute("DELETE FROM summary")
         n = -1
     else:
         row = cur.execute("SELECT id FROM summary_runs WHERE scope=?",
                           (norm_scope(scope),)).fetchone()
         n = 0
+        cur.execute("DELETE FROM summary_digests WHERE scope=?",
+                    (norm_scope(scope),))
         if row:
             _delete_run(cur, row[0])
             n = 1
@@ -1425,6 +1443,81 @@ def recent_files(conn, scope, limit=500):
         "c.keywords, c.gist, c.ai, c.entities FROM summary c "
         "JOIN files f ON f.id = c.file_id WHERE f.is_dir=0" + sql
         + " ORDER BY f.mtime DESC LIMIT ?", params + [int(limit)])]
+
+
+def files_by_id(conn, ids):
+    """Files with their cards, in the order of `ids`."""
+    out = {}
+    ids = list(ids)
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        for r in conn.execute(
+                "SELECT f.id, f.path, f.size, f.mtime, c.doctype, c.title, "
+                "c.keywords, c.gist, c.ai, c.entities FROM files f "
+                "LEFT JOIN summary c ON c.file_id = f.id WHERE f.id IN ({})"
+                .format(",".join("?" * len(part))), part):
+            out[r[0]] = dict(zip(FILE_COLS, r))
+    return [out[i] for i in ids if i in out]
+
+
+def save_digest(conn, scope, files, text, model):
+    """Keep the combined summary of a hand-picked set of files as the
+    folder's latest selection summary (one per folder; a new one replaces
+    it)."""
+    names = [_base(f["path"]) for f in files[:6]]
+    conn.execute(
+        "INSERT OR REPLACE INTO summary_digests (scope, created, n, names, "
+        "text, model) VALUES (?,?,?,?,?,?)",
+        (norm_scope(scope), time.time(), len(files), "; ".join(names), text,
+         model))
+    conn.commit()
+
+
+def digest_for(conn, scope):
+    """The folder's latest selection summary as a dict, or None."""
+    try:
+        r = conn.execute(
+            "SELECT scope, created, n, names, text, model FROM "
+            "summary_digests WHERE scope=?", (norm_scope(scope),)).fetchone()
+    except Exception:                                          # noqa: BLE001
+        return None
+    return dict(zip(("scope", "created", "n", "names", "text", "model"), r)) \
+        if r else None
+
+
+def in_short(rows, terms=""):
+    """What a set of files' cards add up to, without any AI: the years
+    their text mentions, the names (sites, email domains) that recur, and
+    the few files most typical of the set, each with the sentences lifted
+    from it. For the card of a section or a folder."""
+    years, names = Counter(), Counter()
+    want = set(_WORD.findall((terms or "").lower()))
+    scored = []
+    for f in rows:
+        try:
+            ent = json.loads(f["entities"]) if f.get("entities") else {}
+        except ValueError:
+            ent = {}
+        years.update({d[:4] for d in ent.get("dates", ())})
+        names.update(set(ent.get("sites", ()))
+                     | {e.split("@")[-1] for e in ent.get("emails", ())})
+        if f.get("gist") or f.get("ai"):
+            words = set(_WORD.findall((f.get("keywords") or "").lower()))
+            scored.append((len(words & want), len(scored), f))
+    floor = max(1, sum(years.values()) // 50)       # ignore stray years
+    solid = sorted(y for y, c in years.items() if c >= floor)
+    typical, seen = [], set()
+    for _, _, f in sorted(scored, key=lambda x: (-x[0], x[1])):
+        said = f.get("ai") or f.get("gist")
+        if said[:60] in seen:
+            continue
+        seen.add(said[:60])
+        typical.append((f.get("title") or _base(f["path"]), said))
+        if len(typical) >= 3:
+            break
+    return {"years": (solid[0], solid[-1]) if solid else None,
+            "names": [n for n, c in names.most_common(5) if c > 1],
+            "typical": typical}
 
 
 def card(conn, path):
@@ -1618,15 +1711,29 @@ FILE_SYSTEM = ("You write short summaries for a file index. Reply with two "
                "what it concerns, and any key dates, names or amounts. Use "
                "only what the text says. No preamble, no bullet points, no "
                "markdown.")
-SECTION_SYSTEM = ("You name groups of files for a file index. Reply in "
-                  "exactly this form and nothing else:\nTITLE: a plain 2 to "
-                  "5 word name for the group\nSUMMARY: one or two sentences "
-                  "saying what these files are and what they are for.")
-FOLDER_SYSTEM = ("You describe the contents of a folder for its owner. "
-                 "Reply with three or four plain sentences: what the folder "
-                 "mostly holds, the main groups in it, and the period it "
-                 "covers. Use only the facts given. No preamble, no bullet "
-                 "points, no markdown.")
+# Combined summaries are built in two steps so that any number of files
+# fits a small model's context: notes on the files are condensed a batch at
+# a time (PART), then the condensed parts are merged into one (WHOLE).
+PART_SYSTEM = ("You are condensing notes about a batch of files from one "
+               "collection. Write four or five plain sentences on what "
+               "these files have in common: the subjects that recur, the "
+               "people and organisations named, the dates or period, and "
+               "any amounts that matter. Use only what the notes say. No "
+               "preamble, no bullet points, no markdown.")
+WHOLE_SYSTEM = ("You write one summary of a whole collection of files from "
+                "notes about them. It must describe the collection as a "
+                "whole - not list the files one by one. Use only what the "
+                "notes say. Reply in exactly this form and nothing else:\n"
+                "{title}SUMMARY: one paragraph of three to six sentences: "
+                "what the collection is, what it covers, who and what it "
+                "concerns, and the period.\nKEY POINTS:\n- three to six "
+                "short lines, each one a specific fact or theme from the "
+                "notes")
+TITLE_LINE = "TITLE: a plain 2 to 5 word name for the collection\n"
+AI_BATCH = 25              # files' notes per request when combining
+AI_BATCH_CHARS = 6500      # ...and never more text than this
+AI_SAMPLE = 120            # files read per section for its combined summary
+AI_TOGETHER_MAX = 300      # files combined in one "selected files" summary
 
 
 def _file_text(conn, fid, chars):
@@ -1666,78 +1773,99 @@ def ai_file(conn, fid, model, url=None):
     return out
 
 
-def _parse_titled(text):
-    title, summary = "", ""
-    m = re.search(r"TITLE:\s*(.+)", text, re.I)
+def _parse_whole(text):
+    """(title, text) from a WHOLE_SYSTEM reply: the paragraph, then its key
+    points one per line. Whatever a model does with the form, nothing it
+    wrote is thrown away."""
+    title = ""
+    m = re.search(r"^\W*TITLE:\s*(.+)$", text, re.I | re.M)
     if m:
         title = m.group(1).strip().strip('"*#').strip()[:60]
-    m = re.search(r"SUMMARY:\s*(.+)", text, re.I | re.S)
-    if m:
-        summary = " ".join(m.group(1).split())
-    if not summary:
-        summary = " ".join(l for l in text.splitlines()
-                           if l.strip() and not l.upper().startswith("TITLE"))
-    return title, summary.strip()
-
-
-def ai_section(conn, section, model, url=None):
-    """A title and description for one section, from its terms and a sample
-    of its files' cards (not their full text - one short request)."""
-    files = section_files(conn, section["id"], limit=60)
-    files.sort(key=lambda f: (not f["title"], not f["gist"]))
+        text = text[:m.start()] + text[m.end():]
+    body, _, points = re.sub(r"\*\*", "", text).partition("KEY POINTS")
+    body = " ".join(re.sub(r"^\W*SUMMARY:\s*", "", body.strip(),
+                           flags=re.I).split())
     lines = []
-    for f in files[:14]:
-        line = "- " + os.path.basename(f["path"])
-        if f["title"]:
-            line += " | " + f["title"][:90]
-        if f["gist"]:
-            line += " | " + f["gist"][:170]
-        lines.append(line)
-    kinds = ", ".join("{} x{}".format(DOCTYPE_LABEL.get(k, k), c) for k, c
-                      in (section["info"].get("doctypes") or []) if k)
-    out = ai_generate(
-        "A group of {:,} files.\nKey terms: {}\nKinds of document: {}\n"
-        "Some of the files:\n{}".format(
-            section["n"], section["terms"] or section["label"],
-            kinds or "mixed", "\n".join(lines)),
-        model, SECTION_SYSTEM, url, max_tokens=140)
-    title, summary = _parse_titled(out)
-    conn.execute("UPDATE summary_sections SET ai_title=?, ai=?, ai_model=? "
-                 "WHERE id=?", (title or None, summary or None, model,
-                                section["id"]))
-    conn.commit()
-    return title, summary
+    for ln in points.split("\n"):
+        ln = ln.strip().lstrip(":").strip()
+        ln = re.sub(r"^(?:[-*•]|\d+[.)])\s*", "", ln).strip()
+        if len(ln) > 3:
+            lines.append("- " + ln)
+    return title, "\n".join(([body] if body else []) + lines[:8])
 
 
-def ai_folder(conn, run, secs, model, url=None):
-    """A paragraph about the whole folder, from the run's own figures."""
-    o = run["overview"]
-    when = ""
-    if o.get("oldest") and o.get("newest"):
-        when = "{} to {}".format(
-            time.strftime("%B %Y", time.localtime(o["oldest"])),
-            time.strftime("%B %Y", time.localtime(o["newest"])))
-    facts = [
-        "Folder: " + (run["scope"] or "everything indexed"),
-        "Files: {:,} ({:,} with readable text), {}".format(
-            run["files"], run["text_files"], findex.human(run["bytes"] or 0)),
-        "Modified: " + when,
-        "Kinds of document: " + ", ".join(
-            "{} x{}".format(k, c) for k, c in o.get("doctypes", [])),
-        "File types: " + ", ".join(
-            "{} x{}".format(k, c) for k, c in o.get("exts", [])),
-        "Recurring terms: " + ", ".join(o.get("keywords", [])),
-        "Sections found:"]
-    for s in secs[:14]:
-        facts.append("- {} ({:,} files){}".format(
-            s["ai_title"] or s["label"], s["n"],
-            ": " + s["ai"] if s.get("ai") else ""))
-    out = ai_generate("\n".join(facts), model, FOLDER_SYSTEM, url,
-                      max_tokens=200)
-    conn.execute("UPDATE summary_runs SET ai=?, ai_model=? WHERE id=?",
-                 (out or None, model, run["id"]))
-    conn.commit()
+def note_for(f):
+    """One file as a line of notes for the model: its name, kind and the
+    best account of it there is - a written summary if it has one, else the
+    sentences lifted from it, else its title and key phrases."""
+    said = f.get("ai") or f.get("gist") or " ".join(
+        x for x in (f.get("title"), f.get("keywords")) if x)
+    return "- {} [{}]: {}".format(
+        _base(f["path"]),
+        DOCTYPE_LABEL.get(f.get("doctype"), "file"),
+        " ".join((said or "").split())[:320])
+
+
+def sample_files(files, terms="", cap=AI_SAMPLE):
+    """Up to `cap` files to stand for a larger set: those with a written
+    summary first, then the ones whose key phrases sit closest to the
+    section's own, so the sample is typical rather than merely recent."""
+    files = [f for f in files if f.get("ai") or f.get("gist")
+             or f.get("title")]
+    if len(files) <= cap:
+        return files
+    want = set(_WORD.findall((terms or "").lower()))
+
+    def score(f):
+        words = set(_WORD.findall((f.get("keywords") or "").lower()))
+        return (1 if f.get("ai") else 0, len(words & want))
+    return sorted(files, key=score, reverse=True)[:cap]
+
+
+def _batches(notes):
+    out, cur, size = [], [], 0
+    for n in notes:
+        if cur and (len(cur) >= AI_BATCH or size + len(n) > AI_BATCH_CHARS):
+            out.append(cur)
+            cur, size = [], 0
+        cur.append(n)
+        size += len(n) + 1
+    if cur:
+        out.append(cur)
     return out
+
+
+def combine_calls(n_notes):
+    """How many model requests ai_combine makes for this many notes."""
+    if n_notes <= AI_BATCH:
+        return 1
+    parts = -(-n_notes // AI_BATCH)
+    return parts + combine_calls(parts) if parts > AI_BATCH else parts + 1
+
+
+def ai_combine(notes, about, model, url=None, want_title=False, tick=None):
+    """One summary of many files. `notes` are note_for() lines (or, for a
+    folder, lines about its sections); `about` says what the collection is.
+    More notes than fit one request are condensed batch by batch first and
+    the condensed parts merged. Returns (title, text)."""
+    tick = tick or (lambda: None)
+    groups = _batches(notes)
+    while len(groups) > 1:
+        parts = []
+        for i, g in enumerate(groups):
+            parts.append("Part {} of {} ({:,} items): {}".format(
+                i + 1, len(groups), len(g), ai_generate(
+                    "{}\nNotes on part {} of {}:\n{}".format(
+                        about, i + 1, len(groups), "\n".join(g)),
+                    model, PART_SYSTEM, url, max_tokens=190)))
+            tick()
+        groups = _batches(parts)
+    out = ai_generate("{}\nNotes:\n{}".format(about, "\n".join(groups[0])),
+                      model, WHOLE_SYSTEM.format(
+                          title=TITLE_LINE if want_title else ""),
+                      url, max_tokens=330)
+    tick()
+    return _parse_whole(out)
 
 
 def _need_model(model, url, log):
@@ -1758,9 +1886,14 @@ def _need_model(model, url, log):
 
 def ai_run_sections(db, scope, model=None, url=None, progress=False,
                     log=print, redo=False):
-    """AI titles/descriptions for every subject section of a folder's run,
-    then the folder's own overview. Each one is saved as it is written, so
-    stopping part-way keeps what was done."""
+    """The folder as a whole: a combined summary of each section's files
+    (with a title for it), then one of the entire folder built from those.
+
+    A section's summary comes from its files' cards - their written
+    summaries where they have them, the sentences lifted from them where
+    not - so no file is re-read; a big section is represented by its
+    AI_SAMPLE most typical files. Each summary is saved as it is written,
+    so stopping part-way keeps what was done."""
     conn = findex.open_db(db)
     try:
         ensure_schema(conn)
@@ -1772,35 +1905,93 @@ def ai_run_sections(db, scope, model=None, url=None, progress=False,
         if not model:
             return 2
         secs = sections(conn, run_["id"])
-        todo = [s for s in secs if s["kind"] != "type"
-                and (redo or not s["ai"])]
+        todo = []
+        for s in secs:
+            if s["kind"] == "type" or (s["ai"] and not redo):
+                continue
+            files = sample_files(section_files(conn, s["id"], limit=600),
+                                 s["terms"])
+            if files:
+                todo.append((s, files))
+        total = sum(combine_calls(len(f)) for _, f in todo) + 1
         t0 = time.time()
-        log("Writing {:,} section summaries with {}...".format(len(todo),
-                                                              model))
-        _emit(progress, 0, len(todo) + 1, 0, t0)
-        for i, s in enumerate(todo):
+        made = [0]
+
+        def tick():
+            made[0] += 1
+            _emit(progress, made[0], total, made[0], t0)
+        log("Summarising {:,} sections and the folder with {}...".format(
+            len(todo), model))
+        _emit(progress, 0, total, 0, t0)
+        for n, (s, files) in enumerate(todo):
+            before = made[0]
             try:
-                title, summary = ai_section(conn, s, model, url)
-                s["ai_title"], s["ai"] = title, summary
+                about = ("A group of {:,} files from one folder{}. Its "
+                         "recurring terms: {}.".format(
+                             s["n"], "" if len(files) >= s["n"] else
+                             " - these notes cover {:,} typical ones"
+                             .format(len(files)), s["terms"] or s["label"]))
+                title, text = ai_combine([note_for(f) for f in files], about,
+                                         model, url, True, tick)
+                conn.execute(
+                    "UPDATE summary_sections SET ai_title=?, ai=?, "
+                    "ai_model=? WHERE id=?", (title or None, text or None,
+                                              model, s["id"]))
+                conn.commit()
+                s["ai_title"], s["ai"] = title, text
                 log("  {}  ->  {}".format(s["label"], title or "(no title)"))
             except AIError as exc:
                 log("  {}: {}".format(s["label"], exc))
-                if i == 0:
+                if n == 0:
                     return 2
-            _emit(progress, i + 1, len(todo) + 1, i + 1, t0)
+                made[0] = before + combine_calls(len(files)) - 1
+                tick()
         try:
             ai_folder(conn, run_, secs, model, url)
         except AIError as exc:
-            log("  folder overview: {}".format(exc))
-        _emit(progress, len(todo) + 1, len(todo) + 1, len(todo) + 1, t0)
+            log("  the folder as a whole: {}".format(exc))
+        made[0] = total - 1
+        tick()
         return 0
     finally:
         conn.close()
 
 
+def ai_folder(conn, run, secs, model, url=None):
+    """One summary of the whole folder, built from its sections' combined
+    summaries and the run's own figures."""
+    o = run["overview"]
+    when = ""
+    if o.get("oldest") and o.get("newest"):
+        when = " Files modified {} to {}.".format(
+            time.strftime("%B %Y", time.localtime(o["oldest"])),
+            time.strftime("%B %Y", time.localtime(o["newest"])))
+    about = ("The folder {}: {:,} files ({:,} with readable text), {}.{} "
+             "Kinds of document: {}. Each note below is one section of the "
+             "folder.".format(
+                 run["scope"] or "(everything indexed)", run["files"],
+                 run["text_files"] or 0, findex.human(run["bytes"] or 0),
+                 when, ", ".join("{} x{}".format(k, c)
+                                 for k, c in o.get("doctypes", [])) or "mixed"))
+    notes = []
+    for s in secs[:40]:
+        said = (s.get("ai") or "").split("\n")[0] or \
+            ("about " + s["terms"].replace(";", ",") if s["terms"]
+             else "files with no readable text")
+        notes.append("- {} ({:,} files): {}".format(
+            s["ai_title"] or s["label"], s["n"], said[:420]))
+    _, text = ai_combine(notes, about, model, url)
+    conn.execute("UPDATE summary_runs SET ai=?, ai_model=? WHERE id=?",
+                 (text or None, model, run["id"]))
+    conn.commit()
+    return text
+
+
 def ai_run_files(db, ids, model=None, url=None, progress=False, log=print,
-                 redo=False):
-    """AI summaries for specific files (by index id)."""
+                 redo=False, scope=None, together=True):
+    """Written summaries of specific files (by index id) - each one, and
+    then, when there is more than one, a single combined summary of them
+    all, stored as the folder's latest "selection" summary."""
     conn = findex.open_db(db)
     try:
         ensure_schema(conn)
@@ -1809,7 +2000,10 @@ def ai_run_files(db, ids, model=None, url=None, progress=False, log=print,
             return 2
         t0 = time.time()
         done = 0
-        _emit(progress, 0, len(ids), 0, t0)
+        extra = combine_calls(min(len(ids), AI_TOGETHER_MAX)) \
+            if together and len(ids) > 1 else 0
+        total = len(ids) + extra
+        _emit(progress, 0, total, 0, t0)
         for i, fid in enumerate(ids):
             row = conn.execute(
                 "SELECT f.name, c.ai FROM files f LEFT JOIN summary c ON "
@@ -1826,9 +2020,28 @@ def ai_run_files(db, ids, model=None, url=None, progress=False, log=print,
                     log("{}: {}".format(row[0], exc))
                     if done == 0:
                         return 2
-            _emit(progress, i + 1, len(ids), done, t0)
+            _emit(progress, i + 1, total, done, t0)
         log("{:,} summaries written in {:.0f}s".format(done,
                                                        time.time() - t0))
+        if extra:
+            files = [f for f in files_by_id(conn, ids) if f["ai"]
+                     or f["gist"]][:AI_TOGETHER_MAX]
+            if len(files) > 1:
+                made = [len(ids)]
+
+                def tick():
+                    made[0] += 1
+                    _emit(progress, min(made[0], total), total, done, t0)
+                try:
+                    _, text = ai_combine(
+                        [note_for(f) for f in files],
+                        "A selection of {:,} files chosen by their owner."
+                        .format(len(files)), model, url, False, tick)
+                    save_digest(conn, scope, files, text, model)
+                    log("\nAll {:,} together:\n{}".format(len(files), text))
+                except AIError as exc:
+                    log("combined summary: {}".format(exc))
+        _emit(progress, total, total, done, t0)
         return 0
     finally:
         conn.close()
@@ -2081,7 +2294,8 @@ def write_html(run_, secs, out, rows_per_section=300):
           e(scope), sum(s["n"] for s in secs), len(secs),
           _when(run_["created"])))
     if run_.get("ai"):
-        w("<div class='ai'>{}</div>".format(e(run_["ai"])))
+        w("<div class='ai'>{}</div>".format(
+            e(run_["ai"]).replace("\n", "<br>")))
     w("<table class='toc'><tr><th>Section</th><th>Files</th><th>Size</th>"
       "<th>About</th></tr>")
     for s in secs:
@@ -2089,7 +2303,8 @@ def write_html(run_, secs, out, rows_per_section=300):
           "<td class='n'>{}</td><td>{}</td></tr>".format(
               s["id"], e(s["ai_title"] or s["label"]), s["n"],
               findex.human(s["bytes"]),
-              e(s["ai"] or s["terms"].replace(";", ","))))
+              e((s["ai"] or "").split("\n")[0]
+                or s["terms"].replace(";", ","))))
     w("</table>")
     for s in secs:
         w("<h2 id='s{}'>{} <span class='sub'>&middot; {:,} files, {}</span>"
@@ -2098,7 +2313,8 @@ def write_html(run_, secs, out, rows_per_section=300):
         if s["ai_title"]:
             w("<p class='about'>{}</p>".format(e(s["label"])))
         if s["ai"]:
-            w("<div class='ai'>{}</div>".format(e(s["ai"])))
+            w("<div class='ai'>{}</div>".format(
+                e(s["ai"]).replace("\n", "<br>")))
         desc = describe_section(s)
         if desc:
             w("<p class='about'>{}</p>".format(e(desc).replace("\n", "<br>")))
@@ -2233,8 +2449,9 @@ def _print_run(conn, run_, exact, scope):
             s["id"], s["n"], findex.human(s["bytes"]),
             (s["ai_title"] + "  [" + s["label"] + "]") if s["ai_title"]
             else s["label"]))
-        if s["ai"]:
-            print("                             " + s["ai"])
+        for line in (s["ai"] or "").split("\n"):
+            if line:
+                print("                             " + line)
 
 
 def cmd_summarise(args):
@@ -2269,7 +2486,7 @@ def cmd_summarise(args):
     if args.ai_ids:
         ids = [int(x) for x in re.split(r"[,\s]+", args.ai_ids) if x.isdigit()]
         return ai_run_files(args.db, ids, args.model, url, args.progress,
-                            log, args.redo)
+                            log, args.redo, args.folder, not args.each)
     if args.ai_files:
         conn = findex.open_db_ro(args.db)
         ids = []
@@ -2284,7 +2501,7 @@ def cmd_summarise(args):
                 print("not in the index: " + p)
         conn.close()
         return ai_run_files(args.db, ids, args.model, url, args.progress,
-                            log, args.redo)
+                            log, args.redo, args.folder, not args.each)
     if args.ai_section is not None:
         conn = findex.open_db_ro(args.db)
         ids = [f["id"] for f in section_files(
@@ -2296,7 +2513,7 @@ def cmd_summarise(args):
             print("No readable files in section #{}".format(args.ai_section))
             return 1
         return ai_run_files(args.db, ids, args.model, url, args.progress,
-                            log, args.redo)
+                            log, args.redo, args.folder, not args.each)
     if args.forget or args.forget_all:
         conn = findex.open_db(args.db)
         n = forget(conn, None if args.forget_all else args.folder or "")
@@ -2383,16 +2600,21 @@ def add_commands(sub):
     p.add_argument("--forget-all", action="store_true",
                    help="remove every summary and card")
     p.add_argument("--ai", action="store_true",
-                   help="after the run, have the local model title and "
-                        "describe each section and the folder")
+                   help="after the run, have the local model write a "
+                        "combined summary of each section's files and one "
+                        "of the whole folder")
     p.add_argument("--ai-sections", action="store_true",
                    help="only that - on the summary already stored")
     p.add_argument("--ai-files", nargs="+", metavar="PATH",
-                   help="write summaries of these files with the local model")
+                   help="write a summary of each of these files with the "
+                        "local model, then one of them all together")
     p.add_argument("--ai-ids", metavar="IDS", help=argparse.SUPPRESS)
     p.add_argument("--ai-section", type=int, metavar="ID",
                    help="write summaries of the readable files in a section "
                         "(-n caps how many)")
+    p.add_argument("--each", action="store_true",
+                   help="with --ai-files / --ai-section: only the summary "
+                        "of each file, not the combined one of them all")
     p.add_argument("--redo", action="store_true",
                    help="rewrite AI summaries that already exist")
     p.add_argument("--model", help="Ollama model to use (default: the "

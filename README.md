@@ -314,7 +314,12 @@ this folder**.
   of documents - and cards are kept, so a second run, or a run on a
   sub-folder, only reads what changed.
 - **Sections** (left) - click one to list its files; click a file for its
-  card underneath. *Overview* describes the folder as a whole. A
+  card underneath. *Overview* describes the folder as a whole. A section's
+  (or the folder's) card is a summary of all its files, not of one: what
+  they are about, the years their text mentions, the names that recur, and
+  the few files most typical of the set with the sentences lifted from them
+  - worked out from the cards with no AI. *AI summaries > Summarise this
+  whole folder* adds a written paragraph and key points on top. A
   double-click (or More > *Show this section in Search*) opens the section
   in the Search tab as `section:#n`, where the files can be copied, moved,
   renamed or narrowed further. The file list has the usual right-click menu
@@ -327,12 +332,20 @@ this folder**.
   computer through [Ollama](https://ollama.com) writes proper summaries.
   Nothing is sent anywhere; no account, no admin rights. The menu holds:
   - *Summarise the selected files* (also on the right-click menu) - two or
-    three written sentences per file. A few seconds each, so it is for the
-    files you pick, not the whole index; Stop on the Index tab cancels and
-    keeps what was done.
-  - *Name and describe the sections* - a plain title and a line for each
-    section of this folder, and a paragraph about the folder (shown under
-    *Overview*). One short request per section.
+    three written sentences for each file, **and then one combined summary
+    of them all together**: a paragraph on what the selection as a whole
+    is about, with its key points underneath. It goes on the card as soon
+    as it is written and stays under *Overview* as the folder's latest
+    selection summary. A few seconds per file; Stop on the Index tab or
+    the tab's own Stop cancels and keeps what was done.
+  - *Summarise this whole folder* - a combined summary of **each
+    section's files** (with a plain title for the section), then **one of
+    the entire folder** built from those, shown under *Overview*. Nothing
+    is re-read for this: it works from the files' cards - their written
+    summaries where they have one, the sentences lifted from them where
+    not - condensed a batch at a time and then merged, so it scales to any
+    number of files. A section of more than 120 files is represented by
+    its 120 most typical ones, and says so to the model.
   - *Model* - pick among the models installed, or download another. The
     ones offered are small and quick on purpose:
 
@@ -582,10 +595,11 @@ findex summarise D:\Shared --show      the sections found last time
 findex summarise --section 12          the files in one section, with cards
 findex summarise D:\Shared -o out.html  export (.html .csv .json .txt)
 findex summarise D:\Shared --detail high   more, narrower sections
-findex summarise D:\Shared --ai        ...then have the local model title and
-                                       describe each section and the folder
-findex summarise --ai-files a.pdf b.docx   written summaries of these files
+findex summarise D:\Shared --ai        ...then have the local model write one
+                                       summary per section and one of the folder
+findex summarise --ai-files a.pdf b.docx   a summary of each, then of them all
 findex summarise --ai-section 12 -n 20     ...of 20 files of a section
+findex summarise --ai-files a.pdf b.docx --each   each only, no combined one
 findex summarise --ai-status           is a local model available?
 findex summarise --ai-models           the small, fast models findex suggests
 findex summarise --ai-setup            install/start Ollama, download gemma3:1b
