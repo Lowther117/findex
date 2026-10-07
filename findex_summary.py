@@ -1872,14 +1872,14 @@ def ai_combine(notes, about, model, url=None, want_title=False, tick=None):
 def _need_model(model, url, log):
     st = ai_start(url, log)         # installed but not running: start it
     if not st["ok"]:
-        log("Local AI is not running at {} ({}). Install Ollama and start "
-            "it, or run: findex summarise --ai-setup".format(
+        log("Local AI is not running at {} ({}). Run: findex summarise "
+            "--ai-setup".format(
                 url or AI_URL, st["error"]))
         return ""
     chosen = pick_model(st["models"], model)
     if not chosen:
-        log("Ollama is running but has no model installed. Run: findex "
-            "summarise --ai-setup   (or: ollama pull {})".format(AI_MODEL))
+        log("The AI engine is running but has no model yet. Run: findex "
+            "summarise --ai-setup")
     elif model and not has_model([chosen], model):
         log("Model {} is not installed - using {}".format(model, chosen))
     return chosen
@@ -2048,9 +2048,51 @@ def ai_run_files(db, ids, model=None, url=None, progress=False, log=print,
         conn.close()
 
 
+# The engine. findex does not install the Ollama *app* (no installer, no
+# tray icon, nothing in Applications or the Start menu): it downloads
+# Ollama's standalone command-line build - the same engine, published by
+# Ollama beside each release - into findex's own per-user data folder, and
+# runs it hidden for as long as findex needs it.
+ENGINE_BASE = "https://github.com/ollama/ollama/releases/latest/download/"
+ENGINE_SIZES = {"ollama-windows-amd64.zip": "1.5 GB",
+                "ollama-windows-arm64.zip": "210 MB",
+                "ollama-darwin.tgz": "170 MB"}
+
+
+def engine_dir():
+    """Where findex keeps its private copy of the engine."""
+    return os.path.join(findex._user_data_dir(), "ollama")
+
+
+def engine_asset():
+    """The standalone build for this computer, or '' when there is none
+    findex can unpack (Linux ships as .tar.zst, which Python cannot read)."""
+    import platform
+    arm = "arm" in platform.machine().lower() \
+        or "aarch64" in platform.machine().lower()
+    if os.name == "nt":
+        return "ollama-windows-arm64.zip" if arm else \
+            "ollama-windows-amd64.zip"
+    if sys.platform == "darwin":
+        return "ollama-darwin.tgz"
+    return ""
+
+
+def engine_size():
+    return ENGINE_SIZES.get(engine_asset(), "")
+
+
+def _private_ollama():
+    exe = os.path.join(engine_dir(),
+                       "ollama.exe" if os.name == "nt" else "ollama")
+    return exe if os.path.isfile(exe) else ""
+
+
 def find_ollama():
-    """Path of the ollama program, or ''."""
-    exe = shutil.which("ollama")
+    """Path of the ollama program, or ''. findex's own hidden copy first;
+    failing that, an Ollama the user installed themselves is used rather
+    than downloading a second one."""
+    exe = _private_ollama() or shutil.which("ollama")
     if exe:
         return exe
     home = os.path.expanduser("~")
@@ -2065,63 +2107,130 @@ def find_ollama():
     return ""
 
 
-def _run_logged(cmd, log):
+def _download(url, dest, progress, log):
+    """Fetch url to dest (through a .part file), reporting as it goes.
+    Returns the file's SHA-256."""
+    import hashlib
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "findex"})
+    digest = hashlib.sha256()
+    t0 = time.time()
+    tenth = -1
+    with urllib.request.urlopen(req, timeout=60) as r, \
+            open(dest + ".part", "wb") as out:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            block = r.read(1 << 20)
+            if not block:
+                break
+            out.write(block)
+            digest.update(block)
+            done += len(block)
+            if not total:
+                continue
+            if progress:
+                print("@P seen={} done={} total={} elapsed={:.1f}".format(
+                    done >> 20, done >> 20, total >> 20, time.time() - t0),
+                    flush=True)
+            elif done * 10 // total > tenth:
+                tenth = done * 10 // total
+                log("  {:>3}%  of {}".format(tenth * 10, findex.human(total)))
+    os.replace(dest + ".part", dest)
+    return digest.hexdigest()
+
+
+def _install_ollama(log, progress=False):
+    """Fetch the standalone engine into findex's own data folder - no
+    installer runs, no admin rights, nothing is added to the system. The
+    download is checked against the checksum Ollama publishes with it.
+    Returns the path of the ollama program, or ''."""
+    import urllib.request
+    asset = engine_asset()
+    if not asset:
+        log("There is no standalone AI engine findex can unpack on this "
+            "system - install Ollama yourself and findex will use it.")
+        return ""
+    home = engine_dir()
+    parent = os.path.dirname(home)
+    archive = os.path.join(parent, asset)
+    fresh = home + ".new"
+    log("Getting the AI engine ({}{}) - kept in {}; no app is installed..."
+        .format(asset, ", " + ENGINE_SIZES[asset]
+                if asset in ENGINE_SIZES else "", home))
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True,
-                                encoding="utf-8", errors="replace",
-                                stdin=subprocess.DEVNULL)
-    except OSError as exc:
-        log("  could not run {}: {}".format(cmd[0], exc))
-        return 1
-    for line in proc.stdout:
-        line = line.strip()
-        if line:
-            log("  " + line)
-    return proc.wait()
-
-
-def _install_ollama(log):
-    """Install Ollama without admin rights: Homebrew on macOS; winget on
-    Windows, and failing that its own installer run silently. Returns the
-    path of the ollama program, or ''."""
-    log("Ollama is not installed - installing it...")
-    if sys.platform == "darwin":
-        brew = shutil.which("brew") or next(
-            (b for b in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew")
-             if os.path.isfile(b)), "")
-        if brew:
-            _run_logged([brew, "install", "ollama"], log)
-    elif os.name == "nt":
-        if shutil.which("winget"):
-            _run_logged(["winget", "install", "-e", "--id", "Ollama.Ollama",
-                         "--accept-source-agreements",
-                         "--accept-package-agreements"], log)
-        if not find_ollama():
-            # winget missing or its source refused (it happens): fetch the
-            # installer itself. It is per-user - no admin prompt.
-            import tempfile
-            import urllib.request
-            setup = os.path.join(tempfile.gettempdir(), "OllamaSetup.exe")
-            src = "https://ollama.com/download/OllamaSetup.exe"
-            log("  downloading {} ...".format(src))
+        os.makedirs(parent, exist_ok=True)
+        got = _download(ENGINE_BASE + asset, archive, progress, log)
+        want = ""
+        try:
+            req = urllib.request.Request(ENGINE_BASE + "sha256sum.txt",
+                                         headers={"User-Agent": "findex"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                for line in r.read().decode("utf-8", "replace").splitlines():
+                    parts = line.split()
+                    if len(parts) == 2 and parts[1].lstrip("./") == asset:
+                        want = parts[0].lower()
+        except Exception as exc:                               # noqa: BLE001
+            log("  (could not fetch the published checksum: {})".format(exc))
+        if want and want != got:
+            log("  the download does not match its published checksum - "
+                "not using it. Try again.")
+            os.remove(archive)
+            return ""
+        log("  unpacking{}...".format(" (checksum ok)" if want else ""))
+        shutil.rmtree(fresh, ignore_errors=True)
+        os.makedirs(fresh)
+        if asset.endswith(".zip"):
+            import zipfile
+            with zipfile.ZipFile(archive) as z:
+                z.extractall(fresh)
+        else:
+            # the system tar keeps the symlinks and signing attributes the
+            # macOS build relies on; Python's is the fallback
+            done = False
+            if os.path.exists("/usr/bin/tar"):
+                done = subprocess.run(["/usr/bin/tar", "-xzf", archive, "-C",
+                                       fresh], capture_output=True).returncode == 0
+            if not done:
+                import tarfile
+                with tarfile.open(archive) as t:
+                    t.extractall(fresh)
+        shutil.rmtree(home, ignore_errors=True)
+        os.replace(fresh, home)
+        exe = _private_ollama()
+        if exe and os.name != "nt":
+            os.chmod(exe, 0o755)
+        return exe
+    except Exception as exc:                                   # noqa: BLE001
+        log("  could not get the AI engine: {}".format(exc))
+        return ""
+    finally:
+        for leftover in (archive, archive + ".part"):
             try:
-                urllib.request.urlretrieve(src, setup)
-                _run_logged([setup, "/VERYSILENT", "/NORESTART",
-                             "/SUPPRESSMSGBOXES"], log)
-            except Exception as exc:                           # noqa: BLE001
-                log("  could not fetch or run the installer: {}".format(exc))
-            finally:
-                try:
-                    os.remove(setup)
-                except OSError:
-                    pass
-    return find_ollama()
+                os.remove(leftover)
+            except OSError:
+                pass
+        shutil.rmtree(fresh, ignore_errors=True)
 
 
-def ai_start(url=None, log=print, install=False):
-    """Make sure Ollama is answering: start it if it is installed but not
-    running, and (install=True) install it first if it is missing. Returns
+def engine_remove(log=print):
+    """Delete findex's private copy of the engine (stopping it first). The
+    downloaded models are separate and are not touched."""
+    ai_stop(log=log)
+    home = engine_dir()
+    if not os.path.isdir(home):
+        log("findex has no AI engine of its own installed.")
+        return False
+    shutil.rmtree(home, ignore_errors=True)
+    gone = not os.path.isdir(home)
+    log("Removed {}".format(home) if gone else
+        "Could not remove {} - is it still running?".format(home))
+    return gone
+
+
+def ai_start(url=None, log=print, install=False, progress=False):
+    """Make sure the engine is answering: start it if it is there but not
+    running, and (install=True) fetch it first if it is missing. Returns
     the ai_status dict - check its 'ok'."""
     url = (url or AI_URL).rstrip("/")
     st = ai_status(url)
@@ -2129,14 +2238,11 @@ def ai_start(url=None, log=print, install=False):
         return st
     exe = find_ollama()
     if not exe and install:
-        exe = _install_ollama(log)
-        st = ai_status(url)         # its installer may have started it
-        if st["ok"]:
-            return st
+        exe = _install_ollama(log, progress)
     if not exe:
-        st["error"] = "Ollama is not installed"
+        st["error"] = "the AI engine is not installed"
         return st
-    log("Starting Ollama ({})...".format(exe))
+    log("Starting the AI engine ({})...".format(exe))
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
               "stderr": subprocess.DEVNULL}
     if os.name == "nt":
@@ -2224,9 +2330,9 @@ def ai_stop(url=None, models=(), log=lambda *a: None):
                 except (OSError, AttributeError):
                     os.kill(pid, signal.SIGTERM)
             did = "stopped"
-            log("Stopped the Ollama findex started.")
+            log("Stopped the AI engine findex started.")
         except (OSError, subprocess.SubprocessError) as exc:
-            log("Could not stop Ollama: {}".format(exc))
+            log("Could not stop the AI engine: {}".format(exc))
     if pid:
         try:
             os.remove(_server_file())
@@ -2298,8 +2404,9 @@ def ai_pull(model, url=None, progress=False, log=print):
 
 
 def ai_setup(model=None, url=None, progress=False, log=print):
-    """Get local AI working: install Ollama if it is missing, start it, and
-    download the model(s) wanted that are not already there.
+    """Get local AI working: fetch the engine into findex's own folder if
+    there is none, start it (hidden), and download the model(s) wanted that
+    are not already there.
 
     model: one name; several separated by commas; "all" for every model in
     AI_MODELS; or None = the default small one, and only when nothing usable
@@ -2307,10 +2414,10 @@ def ai_setup(model=None, url=None, progress=False, log=print):
     or started (get it from ollama.com/download); 3 = it is running but a
     download failed."""
     url = (url or AI_URL).rstrip("/")
-    st = ai_start(url, log, install=True)
+    st = ai_start(url, log, install=True, progress=progress)
     if not st["ok"]:
-        log("Could not get Ollama running ({}). Download it from "
-            "https://ollama.com/download , open it once, then try again."
+        log("Could not get the AI engine running ({}). Check the internet "
+            "connection and try again."
             .format(st["error"] or "no answer at " + url))
         return 2
     if model is None:
@@ -2559,7 +2666,7 @@ def cmd_summarise(args):
         else:
             print("Local AI is not running at {} ({})".format(
                 url or AI_URL, st["error"]))
-            print("ollama program: " + (find_ollama() or "not found"))
+            print("engine: " + (find_ollama() or "not downloaded yet"))
         return 0 if st["ok"] else 1
     if args.ai_models:
         st = ai_status(url)
@@ -2572,6 +2679,9 @@ def cmd_summarise(args):
         other = sorted(have - {m for m, _, _ in AI_MODELS})
         if other:
             print("Also installed: " + ", ".join(other))
+        return 0
+    if args.ai_remove:
+        engine_remove(log)
         return 0
     if args.ai_stop:
         ai_stop(url, [args.model] if args.model else (), log) or print(
@@ -2722,8 +2832,12 @@ def add_commands(sub):
     p.add_argument("--ai-status", action="store_true",
                    help="is a local model available?")
     p.add_argument("--ai-setup", action="store_true",
-                   help="install/start Ollama and download a model "
+                   help="fetch the AI engine into findex's own folder (no "
+                        "app is installed), start it and download a model "
                         "(--model picks which; default {})".format(AI_MODEL))
+    p.add_argument("--ai-remove", action="store_true",
+                   help="delete findex's own copy of the AI engine (the "
+                        "downloaded models are kept)")
     p.add_argument("--ai-stop", action="store_true",
                    help="stop the Ollama findex started (one that was "
                         "already running is left alone)")

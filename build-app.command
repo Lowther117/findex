@@ -4,8 +4,8 @@
 #
 # Everything this prints is also written to build-mac-log.txt, and the built
 # app is tested before this script claims success. The last step installs
-# Ollama and the small AI models the Summary tab uses (FINDEX_AI_MODELS=none
-# skips it).
+# the AI engine and the small models the Summary tab uses - into findex's own
+# folder, no app installed (FINDEX_AI_MODELS=none skips it).
 
 cd "$(dirname "$0")" || exit 1
 LOG="build-mac-log.txt"
@@ -235,12 +235,15 @@ fi
 # --------------------------------------------------------------------------
 # 6. The AI summary models
 #
-# The Summary tab's written summaries come from small language models run on
-# this Mac by Ollama. Fetching them here means they are simply there the
-# first time the app is opened. They are installed ON THIS MAC (in
-# ~/.ollama), not inside findex.app: Ollama is a separate program, and the
-# models are far too big to carry in the bundle. Copy the app to another
-# Mac and AI summaries > Set up fetches them there.
+# The Summary tab's written summaries come from small language models, run
+# by Ollama's engine. No Ollama app is installed: findex downloads the
+# standalone engine (about 170 MB) into its own data folder
+# (~/Library/Application Support/findex/ollama) and runs it hidden, only
+# while findex is open. Fetching it and the models here means they are
+# simply there the first time the app is opened. They live ON THIS MAC
+# (models in ~/.ollama), not inside findex.app - far too big to carry in
+# the bundle. Copy the app to another Mac and AI summaries > Set up fetches
+# them there.
 #
 # Already-installed models are skipped, so only the first build downloads.
 # Nothing here can fail the build - the app works without them.
@@ -257,14 +260,11 @@ case "$AI_MODELS" in
         echo "   Skipped (FINDEX_AI_MODELS=$AI_MODELS)." ;;
     *)
         if [ "$AI_MODELS" = all ]; then
-            echo "   Installing Ollama and all five small models - about 8.7 GB the"
-            echo "   first time, nothing after that. FINDEX_AI_MODELS=none skips this."
+            echo "   Fetching the AI engine (no app is installed) and all five small"
+            echo "   models - about 8.9 GB the first time, nothing after that."
+            echo "   FINDEX_AI_MODELS=none skips this."
         else
-            echo "   Installing Ollama and: $AI_MODELS"
-        fi
-        if ! command -v ollama >/dev/null 2>&1 \
-                && [ ! -x "/Applications/Ollama.app/Contents/Resources/ollama" ]; then
-            brew_install ollama || echo "   Homebrew could not install Ollama."
+            echo "   Fetching the AI engine (no app is installed) and: $AI_MODELS"
         fi
         if "$PY" -u findex.py summarise --ai-setup --model "$AI_MODELS"; then
             AI_RESULT=ok
@@ -274,7 +274,7 @@ case "$AI_MODELS" in
             echo "   app is fine without them; AI summaries > Set up retries from"
             echo "   inside the app."
         fi
-        # The build started Ollama to do the downloading; it is not left
+        # The build started the engine to do the downloading; it is not left
         # running. (One that was already running before the build is.)
         "$PY" -u findex.py summarise --ai-stop >/dev/null 2>&1 || true ;;
 esac

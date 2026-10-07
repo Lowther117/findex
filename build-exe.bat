@@ -18,8 +18,9 @@ rem
 rem The noisy output of pip and PyInstaller goes to build-win-log.txt so this
 rem window stays readable; if anything fails, the tail of that log is shown
 rem here. The finished exe is tested before this script claims success.
-rem The last step installs Ollama and the small AI models the Summary tab
-rem uses (set FINDEX_AI_MODELS=none first to skip it).
+rem The last step fetches the AI engine and the small models the Summary tab
+rem uses - into findex's own folder, no app installed (set
+rem FINDEX_AI_MODELS=none first to skip it).
 
 setlocal
 cd /d "%~dp0"
@@ -164,12 +165,15 @@ if not "%RC%"=="0" goto :selftestbad
 rem ---------------------------------------------------------------------
 rem 5. The AI summary models
 rem
-rem The Summary tab's written summaries come from small language models run
-rem on this PC by Ollama. Fetching them here means they are simply there
-rem the first time the app is opened. They are installed ON THIS PC (in
-rem %USERPROFILE%\.ollama), not inside dist\findex: Ollama is a separate
-rem program and the models are far too big to carry in the app folder.
-rem Copy the app to another PC and AI summaries, Set up fetches them there.
+rem The Summary tab's written summaries come from small language models,
+rem run by Ollama's engine. No Ollama app is installed - no installer, no
+rem tray icon: findex downloads the standalone engine (about 1.5 GB) into
+rem its own data folder (%LOCALAPPDATA%\findex\ollama) and runs it hidden,
+rem only while findex is open. Fetching it and the models here means they
+rem are simply there the first time the app is opened. They live ON THIS PC
+rem (models in %USERPROFILE%\.ollama), not inside dist\findex - far too big
+rem to carry in the app folder. Copy the app to another PC and AI
+rem summaries, Set up fetches them there.
 rem
 rem Already-installed models are skipped, so only the first build
 rem downloads. Nothing here can fail the build - the app works without
@@ -185,11 +189,12 @@ if not defined FINDEX_AI_MODELS set "FINDEX_AI_MODELS=all"
 if /i "%FINDEX_AI_MODELS%"=="none" goto :aiskip
 if /i "%FINDEX_AI_MODELS%"=="skip" goto :aiskip
 if /i not "%FINDEX_AI_MODELS%"=="all" goto :ailist
-echo    Installing Ollama and all five small models - about 8.7 GB the
-echo    first time, nothing after that. FINDEX_AI_MODELS=none skips this.
+echo    Fetching the AI engine ^(no app is installed^) and all five small
+echo    models - about 10 GB the first time, nothing after that.
+echo    FINDEX_AI_MODELS=none skips this.
 goto :airun
 :ailist
-echo    Installing Ollama and: %FINDEX_AI_MODELS%
+echo    Fetching the AI engine ^(no app is installed^) and: %FINDEX_AI_MODELS%
 :airun
 echo ---- ai models: %FINDEX_AI_MODELS% ---->> "%LOG%"
 "%PY%" -u "%HERE%findex.py" summarise --ai-setup --model "%FINDEX_AI_MODELS%"
@@ -207,7 +212,7 @@ goto :aidone
 echo    Skipped: FINDEX_AI_MODELS is %FINDEX_AI_MODELS%.
 goto :aiend
 :aidone
-rem The build started Ollama to do the downloading; it is not left running
+rem The build started the engine to do the downloading; it is not left running
 rem (one that was already running before the build is left alone). A server
 rem left behind would also keep this folder locked against deleting.
 "%PY%" -u "%HERE%findex.py" summarise --ai-stop >nul 2>&1

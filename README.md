@@ -329,8 +329,16 @@ this folder**.
   so. Summarise it anyway for sections worked out from its files alone -
   each folder keeps its own, side by side.
 - **AI summaries** (optional) - a small language model running on this
-  computer through [Ollama](https://ollama.com) writes proper summaries.
-  Nothing is sent anywhere; no account, no admin rights. The menu holds:
+  computer writes proper summaries. Nothing is sent anywhere; no account,
+  no admin rights. The models are run by [Ollama](https://ollama.com)'s
+  engine, but **no Ollama app is installed**: findex downloads the
+  standalone engine into its own data folder
+  (`%LOCALAPPDATA%\findex\ollama` on Windows, `~/Library/Application
+  Support/findex/ollama` on a Mac), checks it against the checksum Ollama
+  publishes, and runs it hidden - no installer, no tray icon, nothing in
+  Applications or the Start menu - only while findex is open. (If you
+  already have Ollama installed yourself, findex uses that instead of
+  downloading a second copy.) The menu holds:
   - *Summarise the selected files* (also on the right-click menu) - two or
     three written sentences for each file, **and then one combined summary
     of them all together**: a paragraph on what the selection as a whole
@@ -370,10 +378,12 @@ this folder**.
     there. Any other model already in Ollama is listed too. Requests are kept
     short for speed (the first ~5,000 characters of a file plus its end, a
     4k context, "thinking" switched off for models that have it).
-  - *Set up* (shown until a model is installed) - installs Ollama when it
-    is missing (Homebrew on macOS, winget on Windows), starts it, and
-    downloads `gemma3:1b`. `FINDEX_AI_URL` points findex at an Ollama
-    running somewhere other than `http://127.0.0.1:11434`.
+  - *Set up* (shown until a model is installed) - fetches the engine when
+    there is none (about 170 MB on a Mac, 1.5 GB on Windows, once), starts
+    it, and downloads `gemma3:1b`. `findex summarise --ai-remove` deletes
+    findex's copy of the engine again (the models, in `~/.ollama`, are
+    kept). `FINDEX_AI_URL` points findex at an Ollama running somewhere
+    other than `http://127.0.0.1:11434`.
 - **More** - *Export this summary...* (`.html` is a self-contained page of
   sections and files with their kind, summary and key phrases; `.csv` is
   one file per row; `.json` and `.txt` too), *fewer / balanced / more
@@ -610,10 +620,11 @@ findex summarise --ai-section 12 -n 20     ...of 20 files of a section
 findex summarise --ai-files a.pdf b.docx --each   each only, no combined one
 findex summarise --ai-status           is a local model available?
 findex summarise --ai-models           the small, fast models findex suggests
-findex summarise --ai-setup            install/start Ollama, download gemma3:1b
+findex summarise --ai-setup            fetch the engine (no app), download gemma3:1b
 findex summarise --ai-setup --model llama3.2:1b   ...or the one you name
 findex summarise --ai-setup --model all           ...or all five (8.7 GB)
-findex summarise --ai-stop             stop the Ollama findex started
+findex summarise --ai-stop             stop the engine findex started
+findex summarise --ai-remove           delete findex's copy of the engine
 findex summarise D:\Shared --forget    drop that folder's sections
 findex tree                            export the index as a tree (Downloads)
 findex tree -o C:\out.csv --under D:\Work
@@ -790,16 +801,17 @@ wrong rather than Done if something is missing; the full run is in
 `build-win-log.txt` / `build-mac-log.txt`.
 
 **The AI summary models are installed by the build too.** As its last step
-each script installs [Ollama](https://ollama.com) if the machine has none
-(Homebrew on the Mac; winget, or failing that Ollama's own per-user
-installer, on Windows - no admin rights), starts it, and downloads the five
-small models the Summary tab offers - about 8.7 GB the first time, nothing
-on later builds because models already there are skipped. So after a build,
-AI summaries simply work the first time the app is opened.
+each script fetches the AI engine if the machine has none - Ollama's
+standalone build, into findex's own data folder, with no app installed and
+no admin rights (see the Summary tab) - starts it, and downloads the five
+small models the Summary tab offers: about 8.7 GB of models plus the engine
+the first time, nothing on later builds because whatever is already there
+is skipped. So after a build, AI summaries simply work the first time the
+app is opened.
 
-- The models go onto *that machine* (`~/.ollama`), not into `dist/`: Ollama
-  is a separate program and the models are far too big to carry inside the
-  app. Copy the app to another computer and *AI summaries > Set up* fetches
+- The engine and models go onto *that machine* (the engine in findex's
+  data folder, the models in `~/.ollama`), not into `dist/`: they are far
+  too big to carry inside the app. Copy the app to another computer and *AI summaries > Set up* fetches
   them there.
 - Nothing in this step can fail the build - the app is complete without
   the models, and says so if they are missing.

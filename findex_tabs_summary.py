@@ -28,7 +28,6 @@ import sys
 import threading
 import time
 import tkinter as tk
-import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 import findex
@@ -785,7 +784,7 @@ class SummaryTab:
             m.add_command(label="Ready - using {}".format(current),
                           state="disabled")
         elif st["ok"]:
-            m.add_command(label="Ollama is running - no model yet",
+            m.add_command(label="Ready for a model - none downloaded yet",
                           state="disabled")
         else:
             m.add_command(label="Not set up yet (optional)",
@@ -845,10 +844,12 @@ class SummaryTab:
         if messagebox.askyesno(
                 "AI summaries are not set up",
                 "Written summaries need a small language model on this "
-                "computer. Setting up downloads {} ({}) - and Ollama, the "
-                "program that runs it, if it is missing. Nothing is sent "
-                "anywhere and no admin rights are needed.\n\nSet it up now?"
-                .format(fs.AI_MODELS[0][0], fs.AI_MODELS[0][1])):
+                "computer. Setting up downloads {} ({}){}. No app is "
+                "installed - it stays in findex's own folder and runs "
+                "hidden, only while findex is open. Nothing is sent "
+                "anywhere.\n\nSet it up now?"
+                .format(fs.AI_MODELS[0][0], fs.AI_MODELS[0][1],
+                        self._summary_engine_note())):
             self.summary_ai_setup(confirm=False)
         return False
 
@@ -914,8 +915,8 @@ class SummaryTab:
                           "model...".format(len(ids)))
 
     def summary_ai_setup(self, model=None, confirm=True):
-        """Install/start Ollama if needed and download `model` (the default
-        small one when None)."""
+        """Fetch/start the engine if needed and download `model` (the
+        default small one when None)."""
         if self._summary_busy():
             return
         name = model or fs.AI_MODELS[0][0]
@@ -930,7 +931,7 @@ class SummaryTab:
                 .format("Every suggested model" if name == "all" else name,
                         " ({})".format(size) if size else "",
                         "" if self._sai["ok"] else
-                        ", and Ollama installed and started first")):
+                        self._summary_engine_note())):
             return
         self._swant_model = name
         cmd = _g().engine_command() + ["--db", self.var_db.get(), "summarise",
@@ -969,11 +970,22 @@ class SummaryTab:
             if code == 3:
                 self.var_sstatus.set("A model could not be downloaded - "
                                      "see the Index tab's Output.")
-            if code == 2 and messagebox.askyesno(
-                    "Could not set it up automatically",
-                    "Open the Ollama download page? Install it, open it "
-                    "once, then choose AI summaries > Set up again."):
-                webbrowser.open("https://ollama.com/download")
+            if code == 2:
+                messagebox.showinfo(
+                    "Could not set up AI summaries",
+                    "The AI engine could not be downloaded or started - "
+                    "the reason is in the Index tab's Output. Check the "
+                    "internet connection and try AI summaries > Set up "
+                    "again.")
+
+    def _summary_engine_note(self):
+        """' and the engine that runs it (170 MB)' when findex has no
+        engine on this computer yet, else ''."""
+        if fs.find_ollama():
+            return ""
+        size = fs.engine_size()
+        return " and the engine that runs it{}".format(
+            " ({})".format(size) if size else "")
 
     def _summary_shutdown(self):
         """The app is closing: end the Ollama findex started and the model
