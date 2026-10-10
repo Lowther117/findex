@@ -758,6 +758,7 @@ class VirtualList:
         self.window = self.WINDOW    # grows if the view shows more rows
         self._shown = 30             # rows in view, from the last scroll report
         self.sel = set()
+        self.anchor = None           # where a Shift-click range starts
         self._mod = False
         self._syncing = False
         self._pending = None
@@ -772,6 +773,7 @@ class VirtualList:
         self.tree.configure(yscrollcommand=self._yscrolled)
         t = self.tree
         t.bind("<ButtonPress-1>", self._note_mod, add="+")
+        t.bind("<Shift-ButtonPress-1>", self._shift_click)
         t.bind("<KeyPress>", self._note_mod, add="+")
         t.bind("<<TreeviewSelect>>", self._selected, add="+")
         t.bind("<Home>", lambda e: self.go(0) or "break")
@@ -781,12 +783,28 @@ class VirtualList:
     # -- the window ---------------------------------------------------------
 
     def set_rows(self, rows, keep_view=False):
-        """Show a new list. keep_view keeps the scroll position (a refresh
-        of the same list); otherwise the list starts at the top."""
+        """Show a new list. keep_view keeps the scroll position and, by
+        path, whatever of the selection is still listed (a refresh of the
+        same list after a delete, a paste or an index run); otherwise the
+        list starts at the top with nothing selected."""
         top = self.top_row() if keep_view else 0
+        sel, anchor = set(), None
+        if keep_view and self.sel:
+            old = self.rows
+            want = {old[i].path for i in self.sel if i < len(old)}
+            if self.anchor is not None and self.anchor < len(old):
+                want.add(old[self.anchor].path)
+            where = {}
+            for i, r in enumerate(rows):
+                if r.path in want:
+                    where[r.path] = i
+            sel = {where[old[i].path] for i in self.sel
+                   if i < len(old) and old[i].path in where}
+            if self.anchor is not None and self.anchor < len(old):
+                anchor = where.get(old[self.anchor].path)
         self.rows = rows
-        self.sel = {i for i in self.sel if i < len(rows)} if keep_view \
-            else set()
+        self.sel = sel
+        self.anchor = anchor
         self._place(top)
 
     def _offset_for(self, top_row):
@@ -911,6 +929,7 @@ class VirtualList:
         if not (self.offset <= i < self.offset + self._width()):
             self._place(i)
         self.sel = {i}
+        self.anchor = i
         self._syncing = True
         try:
             self.tree.selection_set(str(i))
@@ -921,6 +940,40 @@ class VirtualList:
         self.on_select()
 
     # -- selection ----------------------------------------------------------
+
+    def _shift_click(self, event):
+        """Shift-click: select from the anchor (the last plain click) to
+        this row - the whole stretch, drawn or not. The widget's own
+        version only reaches the rows it holds. Ctrl+Shift adds the
+        stretch to what is already selected."""
+        if self.tree.identify_region(event.x, event.y) in ("heading",
+                                                            "separator"):
+            return None             # sorting / column resizing as usual
+        i = self.row_at(event.y)
+        if i is None:
+            return "break"
+        a = self.anchor if self.anchor is not None else i
+        a = max(0, min(a, len(self.rows) - 1))
+        stretch = set(range(min(a, i), max(a, i) + 1))
+        ctrl = bool(event.state & (0x0004 | (0x0008 if sys.platform
+                                             == "darwin" else 0)))
+        self.sel = (self.sel | stretch) if ctrl else stretch
+        self._sync_shown(focus=i)
+        self.on_select()
+        return "break"
+
+    def _sync_shown(self, focus=None):
+        """Make the widget's selection agree with self.sel for the rows it
+        holds."""
+        lo, hi = self.offset, self.offset + self._width()
+        self._syncing = True
+        try:
+            self.tree.selection_set([str(i) for i in range(lo, hi)
+                                     if i in self.sel])
+            if focus is not None and lo <= focus < hi:
+                self.tree.focus(str(focus))
+        finally:
+            self._syncing = False
 
     def _note_mod(self, event):
         try:
@@ -945,6 +998,12 @@ class VirtualList:
             self.sel = (self.sel - inside) | shown
         else:
             self.sel = shown
+        try:                # a plain or Ctrl click moves the range anchor
+            f = int(self.tree.focus())
+            if f in shown:
+                self.anchor = f
+        except ValueError:
+            pass
         self.on_select()
 
     def select_all(self):
@@ -959,6 +1018,7 @@ class VirtualList:
     def select_only(self, i):
         """Make row i the selection (a right-click on an unselected row)."""
         self.sel = {i}
+        self.anchor = i
         self._syncing = True
         try:
             self.tree.selection_set(str(i))
@@ -1528,8 +1588,8 @@ class FindexApp(findex_tabs.ToolTabs):
 
         hint = ttk.Label(opts, style="Dim.TLabel",
                          text="names as you type  ·  content:word  ·  C:\\  ·"
-                              "  ext:pdf  ·  !leave-out  ·  folder:  ·"
-                              "  section:  ·  ~by meaning")
+                              "  ext:pdf  ·  before:2020  ·  older:3y  ·"
+                              "  size:>10mb  ·  !leave-out  ·  ~by meaning")
         hint.pack(side="left", padx=(0, 20))
         self.tip(hint, "The search understands Everything-style filters, "
                        "combined freely - e.g.  C: content:dan ext:pdf "
@@ -2116,7 +2176,15 @@ class FindexApp(findex_tabs.ToolTabs):
             exts = expanded or None
         return exts, kind
 
-    def run_search(self, live=False):
+    def refresh_results(self):
+        """Re-read the list after something changed on disk or in the
+        index (a delete, a paste, a rename, an index run) - keeping the
+        filter, the sort order, the scroll position and whatever of the
+        selection is still there, so a long clear-out can be worked down
+        in rounds."""
+        self.run_search(live=False, keep=True)
+
+    def run_search(self, live=False, keep=False):
         text = self.var_query.get().strip()
         self.search_gen += 1
         gen = self.search_gen
@@ -2128,10 +2196,11 @@ class FindexApp(findex_tabs.ToolTabs):
         exts, kind = self._type_filter()
         self.var_status.set("Searching...")
         threading.Thread(target=self._search_worker,
-                         args=(gen, db, text, limit, exts, kind, live),
+                         args=(gen, db, text, limit, exts, kind, live, keep),
                          daemon=True).start()
 
-    def _search_worker(self, gen, db, text, limit, exts, kind, live=False):
+    def _search_worker(self, gen, db, text, limit, exts, kind, live=False,
+                       keep=False):
         conn = None
         try:
             try:
@@ -2148,7 +2217,7 @@ class FindexApp(findex_tabs.ToolTabs):
                                     live=live)
             rows = [Row(r[0], r[1], r[2], r[3], r[4],
                         r[5] if len(r) > 5 else None) for r in raw]
-            self.msgs.put(("results", gen, rows, total))
+            self.msgs.put(("results", gen, rows, total, keep))
         except sqlite3.OperationalError as exc:
             self.msgs.put(("search_error", gen, str(exc)))
         except Exception as exc:                               # noqa: BLE001
@@ -2180,12 +2249,18 @@ class FindexApp(findex_tabs.ToolTabs):
             return
         self.sort_desc = not self.sort_desc if self.sort_col == col else False
         self.sort_col = col
+        self._apply_sort()
+        self.render_rows()
+
+    def _apply_sort(self):
+        """Sort self.rows by the current column (a no-op when none)."""
+        if not self.sort_col:
+            return
         key = {"name": lambda r: r.name.lower(),
                "size": lambda r: r.size or 0,
                "modified": lambda r: r.mtime or 0,
-               "folder": lambda r: r.folder.lower()}[col]
+               "folder": lambda r: r.folder.lower()}[self.sort_col]
         self.rows.sort(key=key, reverse=self.sort_desc)
-        self.render_rows()
 
     def selected_row(self):
         return self.results.current()
@@ -2306,7 +2381,7 @@ class FindexApp(findex_tabs.ToolTabs):
             self._clip = {"paths": [], "move": False}
         self.var_status.set("{} {:,} file(s) into {}".format(
             "Moved" if move else "Copied", done, dest))
-        self.run_search(live=False)
+        self.refresh_results()
 
     def delete_files(self):
         """Send the selected files to the Recycle Bin / Trash (never a
@@ -2332,7 +2407,7 @@ class FindexApp(findex_tabs.ToolTabs):
             done, bin_name,
             " - {:,} failed (see Output)".format(len(failed))
             if failed else ""))
-        self.run_search(live=False)
+        self.refresh_results()
 
     def _db_forget(self, paths):
         """Drop rows for files that no longer exist at their old path, so the
@@ -2340,18 +2415,8 @@ class FindexApp(findex_tabs.ToolTabs):
         if not paths:
             return
         try:
-            conn = sqlite3.connect(self.var_db.get(), timeout=3)
-            cur = conn.cursor()
-            for p in paths:
-                # the row itself - and, if it was a folder, everything the
-                # index holds underneath it
-                like = findex.like_escape(p.rstrip("\\/")) + os.sep + "%"
-                for (fid,) in cur.execute(
-                        "SELECT id FROM files WHERE path=? "
-                        "OR path LIKE ? ESCAPE '!'", (p, like)).fetchall():
-                    cur.execute("DELETE FROM docs WHERE rowid=?", (fid,))
-                    cur.execute("DELETE FROM files WHERE id=?", (fid,))
-            conn.commit()
+            conn = sqlite3.connect(self.var_db.get(), timeout=10)
+            findex.forget_paths(conn, paths)
             conn.close()
         except Exception:                                      # noqa: BLE001
             pass
@@ -2809,11 +2874,14 @@ class FindexApp(findex_tabs.ToolTabs):
                 msg = self.msgs.get_nowait()
                 kind = msg[0]
                 if kind == "results":
-                    _, gen, rows, total = msg
+                    _, gen, rows, total, keep = msg
                     if gen == self.search_gen:
                         self.rows = rows
-                        self.sort_col = None
-                        self.render_rows()
+                        if keep:        # a refresh: same order, same place
+                            self._apply_sort()
+                        else:
+                            self.sort_col = None
+                        self.render_rows(keep_view=keep)
                         if total is None:
                             if rows and rows[0].score is not None:
                                 self.var_status.set(
@@ -2922,7 +2990,7 @@ class FindexApp(findex_tabs.ToolTabs):
         kind = self.proc_kind
         self.proc_kind = ""
         self.refresh_stats()
-        self.run_search(live=False)      # refresh the visible list
+        self.refresh_results()           # same filter, sort and place
         if getattr(self, "_jloaded", False):
             self.refresh_journal()
         if kind in findex_tabs.TOOL_KINDS:
@@ -3306,6 +3374,12 @@ class FindexApp(findex_tabs.ToolTabs):
             "  C:   D:\\Photos    only results under that drive/folder\n"
             "  ext:pdf;docx      only those types\n"
             "  folder:   file:   only folders / only files\n"
+            "  before:2020       modified before then (also 2020-03,\n"
+            "                    2020-03-15, 15/03/2020); after:2019-06\n"
+            "                    later than that month; since:2019-06 from\n"
+            "                    its start; modified:2018..2020 within\n"
+            "  older:3y  newer:30d   by age (y w d h m)\n"
+            "  size:>10mb        also size:<1kb, size:1mb..100mb\n"
             "  section:insurance files in a Summary section named so\n"
             "  doctype:invoice   files the Summary pass typed as that\n"
             "                    (letter, cv, contract, statement, minutes,\n"
@@ -3317,7 +3391,8 @@ class FindexApp(findex_tabs.ToolTabs):
             "                    Index tab's Search by meaning); filters\n"
             "                    still apply:  ~mortgage offer ext:pdf D:\\\n"
             '  about:"a phrase"  the same, for one phrase\n\n'
-            "Example:  C: content:dan ext:pdf !draft\n\n"
+            "Example:  C: content:dan ext:pdf !draft\n"
+            "Clearing out:  D:\\Photos before:2020  then Ctrl+A, Delete\n\n"
             "content: accepts full FTS5 syntax when quoted at the box level:\n"
             "  content:budg*   prefix    |   content:\"risk policy\"  phrase\n\n"
             "Name results come back best first: exact name, then names\n"

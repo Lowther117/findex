@@ -1138,7 +1138,7 @@ class OrganiseTab:
                         len(res["failed"])) if res["failed"] else "")
         self.var_ostatus.set(msg)
         self.var_status.set(msg)
-        self.run_search(live=False)
+        self.refresh_results()
         self.refresh_stats()
         if getattr(self, "_jloaded", False):
             self.refresh_journal()
@@ -1185,7 +1185,7 @@ class OrganiseTab:
             if failed else "")
         self.var_ostatus.set(msg)
         self.var_status.set(msg)
-        self.run_search(live=False)
+        self.refresh_results()
         self.refresh_stats()
         if getattr(self, "_jloaded", False):
             self.refresh_journal()

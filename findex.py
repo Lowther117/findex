@@ -5,7 +5,8 @@ findex - local filename + full-text index for Windows.
 Commands:
     findex index [ROOT ...]     Build or update the index
     findex watch [ROOT ...]     Live updates: index changes as they happen
-    findex find "QUERY"         Everything-style search (content:, C:\\, ext:, !, ~)
+    findex find "QUERY"         Everything-style search (content:, C:\\, ext:,
+                                before:/older:/size:, !, ~)
     findex search "QUERY"       Full-text search of file contents
     findex name "PATTERN"       Filename search (substring or *wildcard*)
     findex dupes                Duplicate files (name+size, --exact, --near, --images)
@@ -1091,6 +1092,46 @@ def forget_roots(conn, roots):
     conn.commit()
 
 
+def forget_paths(conn, paths):
+    """Drop these paths from the index - and, for any that was a folder,
+    everything the index holds underneath it - as ONE transaction. The
+    desktop app calls this after it has sent files to the Recycle Bin so
+    the list is right at once; a few thousand paths take well under a
+    second. Returns the number of rows removed."""
+    paths = [p for p in paths if p]
+    if not paths:
+        return 0
+    ids = set()
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+    try:
+        for s in range(0, len(paths), 400):
+            chunk = paths[s:s + 400]
+            for fid, path, is_dir in cur.execute(
+                    "SELECT id, path, is_dir FROM files WHERE path IN ({})"
+                    .format(",".join("?" * len(chunk))), chunk).fetchall():
+                ids.add(fid)
+                if is_dir:
+                    sep = "\\" if "\\" in path or (len(path) > 1 and
+                                                   path[1] == ":") else "/"
+                    ids.update(r[0] for r in cur.execute(
+                        "SELECT id FROM files WHERE path LIKE ? ESCAPE '!'",
+                        (like_escape(path.rstrip("\\/")) + sep + "%",)))
+        todo = list(ids)
+        for s in range(0, len(todo), 400):
+            chunk = todo[s:s + 400]
+            marks = ",".join("?" * len(chunk))
+            cur.execute("DELETE FROM docs WHERE rowid IN ({})".format(marks),
+                        chunk)
+            cur.execute("DELETE FROM files WHERE id IN ({})".format(marks),
+                        chunk)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return len(ids)
+
+
 # The journal: every change findex notices inside the indexed locations -
 # a file or folder added, modified, renamed or deleted - with when it was
 # seen and by what (an index run, or live updates). Renames are only known
@@ -2149,12 +2190,25 @@ def parse_query(text):
         ~what it is about   search by MEANING (findex embed): the words
                           after ~ that are not filters describe the file;
                           about:"a phrase" does the same for one phrase
+        before:2020       modified before then (2020-03, 2020-03-15 and
+                          15/03/2020 work too); after:2019-06 = later than
+                          the whole of June 2019; since:2019-06 = from the
+                          start of it; modified:2019, modified:2018..2020
+        older:3y          untouched for 3 years (y w d h m); newer:30d
+        size:>10mb        also size:<1kb, size:>=5mb, size:1mb..100mb
+                          (kb mb gb tb; a bare size:10mb means at least)
         !anything         the same, negated: !draft  !ext:tmp  !C:\\Windows
+                          !before:2020
+
+    A date, age or size filter that is not finished yet ("before:20",
+    "size:>") is ignored rather than treated as a name, so the list does
+    not jump about while it is being typed.
     """
     q = {"name": [], "name_not": [], "content": [], "content_not": [],
          "paths": [], "paths_not": [], "exts": [], "exts_not": [],
          "sections": [], "sections_not": [], "doctypes": [],
-         "doctypes_not": [], "kind": None, "meaning": []}
+         "doctypes_not": [], "kind": None, "meaning": [],
+         "when": [], "sizes": []}
     meaning = False         # after a ~, bare words describe rather than match
     for n, tok in enumerate(_TOKEN.findall(text or "")):
         if tok.startswith("~") and tok[1:2] not in ("/", "\\") \
@@ -2181,6 +2235,14 @@ def parse_query(text):
             if term:
                 q["content_not" if neg else "content"].append(term)
             continue
+        if low.startswith(_WHEN_KEYS) or low.startswith(_SIZE_KEYS):
+            key, _, val = tok.partition(":")
+            rng = (_size_range if low.startswith(_SIZE_KEYS)
+                   else _when_range)(key.lower(), val.strip('"').strip())
+            if rng:
+                q["sizes" if low.startswith(_SIZE_KEYS)
+                  else "when"].append(rng + (neg,))
+            continue        # a half-typed one is ignored, not a name
         if low.startswith("ext:"):
             for e in re.split(r"[;,]", tok[4:]):
                 e = e.strip().lstrip(".").lower()
@@ -2211,6 +2273,154 @@ def parse_query(text):
             continue
         q["name_not" if neg else "name"].append(tok.strip('"'))
     return q
+
+
+# --- dates, ages and sizes in a query ---------------------------------------
+
+_WHEN_KEYS = ("before:", "after:", "since:", "modified:", "date:", "dm:",
+              "older:", "newer:")
+_SIZE_KEYS = ("size:",)
+_AGE = re.compile(r"^(\d+(?:\.\d+)?)\s*([a-z]+)$")
+_AGE_UNITS = {"y": 365.25 * 86400, "year": 365.25 * 86400,
+              "years": 365.25 * 86400, "yr": 365.25 * 86400,
+              "mo": 30.44 * 86400, "month": 30.44 * 86400,
+              "months": 30.44 * 86400, "w": 7 * 86400, "week": 7 * 86400,
+              "weeks": 7 * 86400, "d": 86400, "day": 86400, "days": 86400,
+              "h": 3600, "hour": 3600, "hours": 3600, "hr": 3600,
+              "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60}
+_SIZE = re.compile(r"^(\d+(?:\.\d+)?)\s*([kmgt]?)b?$")
+_SIZE_UNITS = {"": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30, "t": 1 << 40}
+
+
+def _period(text):
+    """A date as typed -> (start, end) epoch seconds, end exclusive, for
+    the whole period it names: 2020 is the year, 2020-03 the month,
+    2020-03-15 (or 15/03/2020, 15.03.2020, 15-03-2020) the day; today,
+    yesterday. None when it is not (yet) a date."""
+    import calendar
+    import datetime as _dt
+    t = text.strip().lower()
+    today = _dt.date.today()
+    if t in ("today", "yesterday"):
+        d = today - _dt.timedelta(days=1 if t == "yesterday" else 0)
+        y, m, day = d.year, d.month, d.day
+    else:
+        m = day = None
+        mt = re.match(r"^(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?$", t)
+        if mt:
+            y, m, day = (int(mt.group(1)), mt.group(2) and int(mt.group(2)),
+                         mt.group(3) and int(mt.group(3)))
+        else:
+            mt = re.match(r"^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$", t)
+            if mt:                              # British: day first
+                day, m, y = int(mt.group(1)), int(mt.group(2)), \
+                    int(mt.group(3))
+            else:
+                mt = re.match(r"^(\d{1,2})[/.-](\d{4})$", t)
+                if not mt:
+                    return None
+                m, y = int(mt.group(1)), int(mt.group(2))
+    try:
+        if day:
+            start = _dt.datetime(y, m, day)
+            end = start + _dt.timedelta(days=1)
+        elif m:
+            start = _dt.datetime(y, m, 1)
+            end = _dt.datetime(y + (m == 12), m % 12 + 1, 1)
+        else:
+            start = _dt.datetime(y, 1, 1)
+            end = _dt.datetime(y + 1, 1, 1)
+    except ValueError:
+        return None
+    return time.mktime(start.timetuple()), time.mktime(end.timetuple())
+
+
+def _age(text):
+    """'3y', '30d', '2 weeks', '6h', '15m' -> seconds, or None."""
+    mt = _AGE.match(text.strip().lower())
+    if not mt or mt.group(2) not in _AGE_UNITS:
+        return None
+    return float(mt.group(1)) * _AGE_UNITS[mt.group(2)]
+
+
+def _when_range(key, val):
+    """One date filter -> (lo, hi) on mtime (either side None = open), or
+    None when the value is not (yet) usable."""
+    key = key.rstrip(":")
+    if not val:
+        return None
+    if key in ("older", "newer"):
+        secs = _age(val)
+        if secs is None:
+            return None
+        cut = time.time() - secs
+        return (None, cut) if key == "older" else (cut, None)
+    if ".." in val:
+        a, _, b = val.partition("..")
+        pa, pb = _period(a), _period(b)
+        if not pa or not pb:
+            return None
+        return (pa[0], pb[1]) if key in ("modified", "date", "dm") else None
+    p = _period(val)
+    if not p:
+        return None
+    if key == "before":
+        return (None, p[0])
+    if key == "after":
+        return (p[1], None)
+    if key == "since":
+        return (p[0], None)
+    return p                        # modified: / date: / dm: - within it
+
+
+def _bytes(text):
+    mt = _SIZE.match(text.strip().lower())
+    if not mt:
+        return None
+    return int(float(mt.group(1)) * _SIZE_UNITS[mt.group(2)])
+
+
+def _size_range(key, val):
+    """size:>10mb  size:<1kb  size:>=5mb  size:1mb..100mb  size:10mb (at
+    least) -> (lo, hi) in bytes, or None while half-typed."""
+    v = val.strip().lower()
+    if not v:
+        return None
+    if ".." in v:
+        a, _, b = v.partition("..")
+        lo, hi = _bytes(a), _bytes(b)
+        return (lo, hi) if lo is not None and hi is not None else None
+    op = ""
+    for cand in (">=", "<=", ">", "<", "="):
+        if v.startswith(cand):
+            op, v = cand, v[len(cand):]
+            break
+    n = _bytes(v)
+    if n is None:
+        return None
+    if op == "<":
+        return (None, n)
+    if op == "<=":
+        return (None, n + 1)
+    if op == "=":
+        return (n, n + 1)
+    return (n, None)                # >, >= and bare: at least
+
+
+def _range_conds(col, ranges, conds, params):
+    """Add 'col within range' (or NOT, when negated) for each range."""
+    for lo, hi, neg in ranges:
+        parts = []
+        if lo is not None:
+            parts.append("{} >= ?".format(col))
+            params.append(lo)
+        if hi is not None:
+            parts.append("{} < ?".format(col))
+            params.append(hi)
+        if not parts:
+            continue
+        c = "(" + " AND ".join(parts) + ")"
+        conds.append("NOT " + c if neg else c)
 
 
 def _name_like(term):
@@ -2287,6 +2497,8 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
         conds.append("f.is_dir=0")
     elif q["kind"] == "folder":
         conds.append("f.is_dir=1")
+    _range_conds("f.mtime", q["when"], conds, params)
+    _range_conds("f.size", q["sizes"], conds, params)
     if q["sections"] or q["sections_not"] or q["doctypes"] \
             or q["doctypes_not"]:
         try:
@@ -3013,7 +3225,8 @@ def main(argv=None):
     p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("find", help="Everything-style search: bare words = "
-                       "names, content:word, C:\\ paths, ext:pdf, !not")
+                       "names, content:word, C:\\ paths, ext:pdf, "
+                       "before:2020, older:3y, size:>10mb, !not")
     p.add_argument("query")
     p.add_argument("-n", "--limit", type=int, default=50)
     _machine_flags(p)

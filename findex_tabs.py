@@ -288,7 +288,7 @@ class ToolTabs(findex_tabs_organise.OrganiseTab,
         mapping = getattr(self, mapping_attr)
         for iid in list(tree.get_children("")):
             self._prune_tree(tree, iid, mapping, gone)
-        self.run_search(live=False)
+        self.refresh_results()
 
     def _prune_tree(self, tree, iid, mapping, gone):
         for child in list(tree.get_children(iid)):
@@ -1157,7 +1157,7 @@ class ToolTabs(findex_tabs_organise.OrganiseTab,
         self.var_status.set(msg)
         self._rename_source = None
         self.var_rsource.set("")
-        self.run_search(live=False)
+        self.refresh_results()
         if getattr(self, "_jloaded", False):
             self.refresh_journal()
         self._rename_plan()

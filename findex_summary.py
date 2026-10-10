@@ -78,11 +78,11 @@ AI_URL = os.environ.get("FINDEX_AI_URL", "http://127.0.0.1:11434")
 # Sizes are Ollama's own figures (checked Oct 2026). All run on a laptop
 # CPU; the first is what --ai-setup fetches when nothing is installed.
 AI_MODELS = (
-    ("gemma3:1b", "815 MB", "quickest - fine for a few plain sentences"),
-    ("qwen3.5:0.8b", "1.2 GB", "newest of the tiny models"),
-    ("llama3.2:1b", "1.3 GB", "quick, plain summaries"),
-    ("granite4:micro", "2.1 GB", "steadier on business documents"),
-    ("gemma3:4b", "3.3 GB", "best of the small ones, about 3x slower"),
+    ("gemma3:1b", "815 MB", "tiny and quick; plain sentences"),
+    ("qwen3.5:0.8b", "1.2 GB", "tiny; the newest of them"),
+    ("llama3.2:1b", "1.3 GB", "tiny; plain summaries"),
+    ("granite4:micro", "2.1 GB", "small; good on business documents"),
+    ("gemma3:4b", "3.3 GB", "small; writes better, slower on a CPU"),
 )
 AI_MODEL = AI_MODELS[0][0]
 AI_MODELS_TOTAL = "8.7 GB"   # all of the above together
@@ -93,11 +93,39 @@ AI_MODELS_TOTAL = "8.7 GB"   # all of the above together
 # context and headroom), the Ollama tag, the download size, and a note.
 # The tiers are tried biggest-first against gpu_info()['vram_gb'].
 AI_TIERS = (
-    (6, "gemma3:4b", "3.3 GB", "a clear step up - for a 6 GB card"),
-    (9, "qwen3:8b", "5.2 GB", "for a 10 GB card, or a 16 GB Mac"),
-    (12, "gemma3:12b", "8.1 GB", "for a 12 GB card - the best fit for most"),
-    (22, "gemma3:27b", "17 GB", "for a 24 GB card or a 36 GB+ Mac"),
+    (6, "gemma3:4b", "3.3 GB", "small; needs a 6 GB card"),
+    (9, "qwen3:8b", "5.2 GB", "medium; needs a 10 GB card or a 16 GB Mac"),
+    (12, "gemma3:12b", "8.1 GB", "large; needs a 12 GB card"),
+    (22, "gemma3:27b", "17 GB", "largest; needs a 24 GB card or a 36 GB+ Mac"),
 )
+
+
+def model_note(model):
+    """The one-line description findex has for a model, or ''."""
+    for name, _, note in AI_MODELS:
+        if model in (name, name + ":latest"):
+            return note
+    for _, name, _, note in AI_TIERS:
+        if model in (name, name + ":latest"):
+            return note
+    if model in (EMBED_MODEL, EMBED_MODEL + ":latest"):
+        return "turns text into vectors for search by meaning"
+    return ""
+
+
+def known_models():
+    """Every model findex offers, smallest first, each once: (name, size,
+    note, needs_gb) - needs_gb is 0 for the CPU-sized ones."""
+    out, seen = [], set()
+    for name, size, note in AI_MODELS:
+        if name not in seen:
+            seen.add(name)
+            out.append((name, size, note, 0))
+    for need, name, size, note in AI_TIERS:
+        if name not in seen:
+            seen.add(name)
+            out.append((name, size, note, need))
+    return out
 # When several models are installed and none was chosen: the biggest one
 # the GPU can hold (see pick_model), then smallest-first on a CPU.
 AI_PREFERRED = tuple(m for m, _, _ in AI_MODELS) + (
@@ -3002,28 +3030,21 @@ def cmd_summarise(args):
     if args.ai_models:
         st = ai_status(url)
         have = set(st["models"])
-        g = gpu_info()
         print(gpu_line())
-        print("Small, fast models for summaries (findex summarise "
-              "--ai-setup --model NAME downloads one):")
-        for name, size, note in AI_MODELS:
+        print("Models for summaries (findex summarise --ai-setup --model "
+              "NAME downloads one):")
+        for name, size, note, _need in known_models():
             print("  {:<16} {:>7}  {}{}".format(
-                name, size, note, "   [installed]" if name in have else ""))
-        print("Bigger models for a graphics card (the one marked * fits "
-              "this computer):")
-        best = tier_model()
-        for need, name, size, note in AI_TIERS:
-            print("  {:<16} {:>7}  needs {:>2} GB  {}{}{}".format(
-                name, size, need, note,
-                "  *" if name == best else "",
-                "   [installed]" if name in have else ""))
-        print("  {:<16} {:>7}  turns text into vectors for search by "
-              "meaning (findex embed){}".format(
-                  EMBED_MODEL, EMBED_MODEL_SIZE,
-                  "   [installed]" if has_model(have, EMBED_MODEL) else ""))
+                name, size, note,
+                "   [installed]" if has_model(have, name) else ""))
+        print("  {:<16} {:>7}  {}{}".format(
+            EMBED_MODEL, EMBED_MODEL_SIZE, model_note(EMBED_MODEL),
+            "   [installed]" if has_model(have, EMBED_MODEL) else ""))
         print("--ai-setup --model auto downloads: " + ", ".join(auto_models()))
-        other = sorted(have - {m for m, _, _ in AI_MODELS}
-                       - {m for _, m, _, _ in AI_TIERS})
+        known = {m for m, _, _, _ in known_models()}
+        other = sorted(m for m in have if m not in known and
+                       m.replace(":latest", "") not in known and
+                       not is_embedding(m))
         if other:
             print("Also installed: " + ", ".join(other))
         return 0

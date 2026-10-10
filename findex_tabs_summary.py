@@ -772,18 +772,23 @@ class SummaryTab:
     # ------------------------------------------------------------------
 
     def _summary_ai_menu(self):
-        """Rebuilt each time it opens, from the last look at Ollama."""
+        """Rebuilt each time it opens, from the last look at Ollama - and
+        that look is renewed in the background when it is more than a few
+        seconds old, so a model that has just finished downloading is in
+        the list the next time the menu opens."""
         m, st = self.sai_menu, self._sai
         m.delete(0, "end")
-        models = [x for x in st["models"] if "embed" not in x.lower()]
+        if time.time() - st.get("at", 0) > 5:
+            self._summary_ai_check()
+        models = [x for x in st["models"] if not fs.is_embedding(x)]
         ready = st["ok"] and bool(models)
         gpu = fs.gpu_info()
         if ready:
             current = fs.pick_model(models, self.var_smodel.get().strip()
                                     or None)
             self.var_smodel.set(current)
-            m.add_command(label="Ready - using {}".format(current),
-                          state="disabled")
+            m.add_command(label="Using {}  -  change it under Model"
+                          .format(current), state="disabled")
             where = st.get("where")
             if where and where.get("model") == current:
                 m.add_command(label="    loaded {}".format(where["text"]),
@@ -806,49 +811,33 @@ class SummaryTab:
                             "(every section, then the folder)",
                       command=self.summary_ai_sections)
         m.add_separator()
+        # One flat list: the models on this computer (pick one - the tick
+        # marks the one in use), then the rest findex knows, smallest
+        # first, each with a line on what it is like.
         sub = self.smodel_menu
         sub.delete(0, "end")
-        for name in models:
-            sub.add_radiobutton(label=name, value=name,
-                                variable=self.var_smodel,
-                                command=self._summary_save_prefs)
         if models:
-            sub.add_separator()
-        offered = 0
-        best = fs.tier_model()
-        if best and not fs.has_model(models, best):
-            offered += 1
-            sub.add_command(
-                label="Download {}   {}  -  the best fit for this "
-                      "computer's GPU".format(best, fs.model_size(best)),
-                command=lambda n=best: self.summary_ai_setup(n))
-        for name, size, note in fs.AI_MODELS:
-            if name in models:
-                continue
-            offered += 1
-            sub.add_command(
-                label="Download {}   {}  -  {}".format(name, size, note),
-                command=lambda n=name: self.summary_ai_setup(n))
-        others = [(need, name, size, note) for need, name, size, note
-                  in fs.AI_TIERS if name != best and name not in models]
-        if others:
-            big = tk.Menu(sub, tearoff=0)
-            self._menus.append(big)
-            for need, name, size, note in others:
-                big.add_command(
-                    label="Download {}   {}  -  needs a {} GB card; {}"
-                    .format(name, size, need, note),
-                    command=lambda n=name: self.summary_ai_setup(n))
-            sub.add_cascade(label="Bigger models (need a graphics card)",
-                            menu=big)
-        if offered > 1:
-            sub.add_command(
-                label="Download all the small ones   {} in total".format(
-                    fs.AI_MODELS_TOTAL),
-                command=lambda: self.summary_ai_setup("all"))
-        if not offered:
-            sub.add_command(label="(all the suggested models are installed)",
+            sub.add_command(label="Installed - tick the one to use",
                             state="disabled")
+            for name in models:
+                note = fs.model_note(name)
+                sub.add_radiobutton(
+                    label="{}{}".format(name, "  -  " + note if note else ""),
+                    value=name, variable=self.var_smodel,
+                    command=self._summary_save_prefs)
+        offered = [k for k in fs.known_models()
+                   if not fs.has_model(models, k[0])]
+        if offered:
+            if models:
+                sub.add_separator()
+            sub.add_command(label="Download another" if models else
+                            "Download one", state="disabled")
+            for name, size, note, _need in offered:
+                sub.add_command(
+                    label="{}   {}  -  {}".format(name, size, note),
+                    command=lambda n=name: self.summary_ai_setup(n))
+        if not models and not offered:
+            sub.add_command(label="(nothing to offer)", state="disabled")
         m.add_cascade(label="Model", menu=sub)
         if not ready:
             m.add_command(label="Set up (downloads {})".format(
@@ -955,6 +944,7 @@ class SummaryTab:
         default small one when None)."""
         if self._summary_busy():
             return
+        self._swant_model = ""
         name = model or "auto"
         size = fs.model_size(name)
         if name == "all":
@@ -1008,6 +998,12 @@ class SummaryTab:
                 self._summary_save_prefs()
                 self.var_sstatus.set("{} is ready - AI summaries will use "
                                      "it.".format(want))
+                # in the list straight away, before the background look
+                # at the engine confirms it
+                if not fs.has_model(self._sai["models"], want):
+                    self._sai["models"] = sorted(self._sai["models"]
+                                                 + [want])
+                    self._sai["ok"] = True
             self._summary_ai_check()
             if code == 3:
                 self.var_sstatus.set("A model could not be downloaded - "

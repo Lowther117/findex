@@ -162,8 +162,17 @@ is remembered in `findex_gui.json`.
     `cv`, `contract`, `statement`, `payslip`, `minutes`, `report`, `manual`,
     `policy`, `form`, `certificate`, `receipt`, `email`, `code`... Both only
     match folders that have been summarised (see the Summary tab)
-  - `!anything` leaves results out: `!draft`, `!ext:tmp`, `!C:\Windows`
-  - e.g. `C: content:dan ext:pdf !draft`
+  - **dates and sizes**: `before:2020` (also `2020-03`, `2020-03-15`,
+    `15/03/2020`, `today`, `yesterday`), `after:2019-06` (later than the
+    whole of that month), `since:2019-06` (from its start),
+    `modified:2019` or `modified:2018..2020`, `older:3y` / `newer:30d`
+    (y w d h m), and `size:>10mb`, `size:<1kb`, `size:1mb..100mb`. A
+    half-typed one (`before:20`, `size:>`) is ignored until it is
+    finished, so the list does not jump about while you type
+  - `!anything` leaves results out: `!draft`, `!ext:tmp`, `!C:\Windows`,
+    `!before:2020`
+  - e.g. `C: content:dan ext:pdf !draft`, or `D:\Photos before:2020` to
+    line up everything old enough to clear out
   - **`~` searches by meaning** - see *Search by meaning* below.
     `~letter about the boiler warranty` lists the files that are *about*
     that, however they put it, best first; the filters still apply
@@ -205,7 +214,7 @@ is remembered in `findex_gui.json`.
   images`). The list rebuilds itself every time it opens, so it is never
   stale or empty. Everything by default.
 - The list works like a file manager: Ctrl/Cmd-click and Shift-click select
-  several files, Ctrl/Cmd+A selects everything shown. Copy or cut the
+  several files, Ctrl/Cmd+A selects everything listed. Copy or cut the
   selection (Ctrl/Cmd+C / X) and paste it straight into Explorer or Finder -
   or paste into a folder you pick with Ctrl/Cmd+V, including files copied
   FROM Explorer/Finder. That picker opens in your Downloads folder unless
@@ -215,6 +224,16 @@ is remembered in `findex_gui.json`.
 - Click column headers to sort. Double-click a hit to open it; right-click for
   the full menu. The pane underneath shows the matching text with the hit
   highlighted.
+- **Clearing out in bulk**: type the filter (`D:\Photos before:2020`, or
+  `older:3y ext:tmp`), sort if you want to check the ends, Ctrl/Cmd+A,
+  Delete. After every delete, paste, rename or index run the list is
+  re-read **keeping your filter, your sort order and your place in it** -
+  and whatever of the selection is still there stays selected - so you
+  can work down a long list in rounds. Shift-click selects a range
+  anywhere in the list, however far apart the two ends are (Ctrl+Shift
+  adds another range), and Ctrl-click adds or removes single rows.
+  Deleting thousands at once is one Recycle Bin operation and one
+  database transaction.
 
 **Index tab**
 
@@ -405,36 +424,32 @@ this folder**.
     memory as the GPU's share; Intel Macs and integrated graphics are CPU.
     `findex summarise --ai-check` loads the model from the command line and
     reports where it landed; `--ai-status` shows the card.
-  - *Model* - pick among the models installed, or download another. The
-    first offer is the best fit for this computer's GPU; the small ones
-    run on any CPU:
+  - *Model* - one flat list: the models installed on this computer first
+    (tick the one to use; the header says which is in use), then the
+    rest findex knows, smallest first, each with a line on what it is
+    like. A model that has just finished downloading is in the list the
+    next time the menu opens - the menu re-checks the engine whenever it
+    is a few seconds out of date. Any other model already in Ollama is
+    listed too.
 
     | Model | Download | What it is like |
     |---|---|---|
-    | `gemma3:1b` | 815 MB | quickest - fine for a few plain sentences (the CPU default) |
-    | `qwen3.5:0.8b` | 1.2 GB | newest of the tiny models |
-    | `llama3.2:1b` | 1.3 GB | quick, plain summaries |
-    | `granite4:micro` | 2.1 GB | steadier on business documents |
-    | `gemma3:4b` | 3.3 GB | best of the small ones, about 3x slower on a CPU |
+    | `gemma3:1b` | 815 MB | tiny and quick; plain sentences (the CPU default) |
+    | `qwen3.5:0.8b` | 1.2 GB | tiny; the newest of them |
+    | `llama3.2:1b` | 1.3 GB | tiny; plain summaries |
+    | `granite4:micro` | 2.1 GB | small; good on business documents |
+    | `gemma3:4b` | 3.3 GB | small; writes better, slower on a CPU (fine on a 6 GB card) |
+    | `qwen3:8b` | 5.2 GB | medium; needs a 10 GB card or a 16 GB Apple-silicon Mac |
+    | `gemma3:12b` | 8.1 GB | large; needs a 12 GB card |
+    | `gemma3:27b` | 17 GB | largest; needs a 24 GB card or a 36 GB+ Apple-silicon Mac |
 
-    and the GPU tiers, picked by the card's dedicated memory (weights plus
-    an 8k context and headroom):
-
-    | Model | Download | Needs | For |
-    |---|---|---|---|
-    | `gemma3:4b` | 3.3 GB | 6 GB | a 6 GB card |
-    | `qwen3:8b` | 5.2 GB | 9 GB | a 10 GB card, or a 16 GB Apple-silicon Mac |
-    | `gemma3:12b` | 8.1 GB | 12 GB | a 12 GB card - the best fit for most |
-    | `gemma3:27b` | 17 GB | 22 GB | a 24 GB card, or a 36 GB+ Apple-silicon Mac |
-
-    If the engine reports a model only partly on the GPU, pick the next
-    size down under *Model* - the Output pane says so when it happens.
-
-    *Download all the small ones* fetches the five CPU models (8.7 GB).
-    Any other model already in Ollama is listed too. Requests to the small
-    models are kept short for speed (the first ~5,000 characters of a file
-    plus its end, a 4k context, "thinking" switched off for models that
-    have it).
+    The "needs" figures are the dedicated graphics memory for the weights
+    plus an 8k context and headroom; *Set up* and the build scripts use
+    them to pick the biggest one the card holds. If the engine reports a
+    model only partly on the GPU, pick the next size down - the Output
+    pane says so when it happens. Requests to the small models are kept
+    short for speed (the first ~5,000 characters of a file plus its end,
+    a 4k context, "thinking" switched off for models that have it).
   - *Set up* (shown until a model is installed) - fetches the engine when
     there is none (about 170 MB on a Mac, 1.5 GB on Windows - the CUDA
     libraries for NVIDIA cards are most of that - once), starts it, and
@@ -690,6 +705,8 @@ findex roots --add F:\ --forget E:\Documents
 findex watch D:\                       live updates until stopped (Ctrl+C)
 findex find "C: content:dan ext:pdf"   Everything-style search
 findex find "budget !draft folder:"
+findex find "D:\Photos before:2020"     dates: before: after: since: modified: older: newer:
+findex find "older:3y size:>100mb ext:mp4"
 findex find "ext:pdf" --json           results as JSON on stdout (or --csv)
 findex search "quarterly AND revenue"  content search (raw FTS5)
 findex name "*.mp4" -n 100             filename search - any file type
@@ -733,7 +750,7 @@ findex summarise --ai-section 12 -n 20     ...of 20 files of a section
 findex summarise --ai-files a.pdf b.docx --each   each only, no combined one
 findex summarise --ai-status           is a local model available? what GPU?
 findex summarise --ai-check            load the model: did it land on the GPU?
-findex summarise --ai-models           the models findex suggests, marked for this GPU
+findex summarise --ai-models           the models findex offers, with what is installed
 findex summarise --ai-setup            fetch the engine (no app), download gemma3:1b
 findex summarise --ai-setup --model auto          ...or what suits this computer:
                                        gemma3:1b + the biggest GPU model that fits
