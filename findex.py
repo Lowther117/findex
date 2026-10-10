@@ -5,7 +5,7 @@ findex - local filename + full-text index for Windows.
 Commands:
     findex index [ROOT ...]     Build or update the index
     findex watch [ROOT ...]     Live updates: index changes as they happen
-    findex find "QUERY"         Everything-style search (content:, C:\\, ext:, !)
+    findex find "QUERY"         Everything-style search (content:, C:\\, ext:, !, ~)
     findex search "QUERY"       Full-text search of file contents
     findex name "PATTERN"       Filename search (substring or *wildcard*)
     findex dupes                Duplicate files (name+size, --exact, --near, --images)
@@ -24,6 +24,8 @@ Tools built on the index (each lives in its own module beside this one):
     findex summarise            What a folder holds: files grouped into labelled
                                 sections by subject, a card per file, and
                                 optional summaries written by a local AI model
+    findex embed                Search by meaning: vectors for the indexed text,
+                                then  findex find "~what you mean"
     findex schedule             Background index refresh (Task Scheduler / launchd)
 
 EVERY file AND folder under the indexed roots is recorded by name, size and
@@ -2144,19 +2146,36 @@ def parse_query(text):
         section:word      only files in a Summary section whose name has
                           that word (section:#12 = that exact section)
         doctype:invoice   only files the Summary pass typed as that
+        ~what it is about   search by MEANING (findex embed): the words
+                          after ~ that are not filters describe the file;
+                          about:"a phrase" does the same for one phrase
         !anything         the same, negated: !draft  !ext:tmp  !C:\\Windows
     """
     q = {"name": [], "name_not": [], "content": [], "content_not": [],
          "paths": [], "paths_not": [], "exts": [], "exts_not": [],
          "sections": [], "sections_not": [], "doctypes": [],
-         "doctypes_not": [], "kind": None}
-    for tok in _TOKEN.findall(text or ""):
+         "doctypes_not": [], "kind": None, "meaning": []}
+    meaning = False         # after a ~, bare words describe rather than match
+    for n, tok in enumerate(_TOKEN.findall(text or "")):
+        if tok.startswith("~") and tok[1:2] not in ("/", "\\") \
+                and (tok != "~" or n == 0):
+            # ~words (or a leading "~ words") = by meaning; ~/Documents and
+            # a ~ on its own later in the query stay the home-folder scope
+            meaning = True
+            tok = tok[1:]
+            if not tok:
+                continue
         neg = tok.startswith("!")
         if neg:
             tok = tok[1:]
         if not tok:
             continue
         low = tok.lower()
+        if low.startswith("about:"):
+            rest = tok[6:].strip('"').strip()
+            if rest:
+                q["meaning"].append(rest)
+            continue
         if low.startswith("content:"):
             term = tok[8:].strip()
             if term:
@@ -2186,6 +2205,9 @@ def parse_query(text):
                 continue
         if _is_pathish(tok):
             q["paths_not" if neg else "paths"].append(tok.strip('"'))
+            continue
+        if meaning and not neg:
+            q["meaning"].append(tok.strip('"'))
             continue
         q["name_not" if neg else "name"].append(tok.strip('"'))
     return q
@@ -2224,6 +2246,10 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
     query has content: terms. Results are weighted: content matches come back
     best-first (bm25), name matches exact-name first, then names starting
     with the term, then newest; a browse (no terms) is newest-first.
+
+    A query with a meaning part (~words, about:"phrase") returns six
+    columns - (path, size, mtime, snippet, is_dir, score) - best match
+    first, with the other terms and filters applied to those matches.
     """
     q = parse_query(text)
     if exts:
@@ -2286,6 +2312,10 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
         lim = " LIMIT ?"
         lim_params = [int(limit)]
 
+    if q["meaning"]:
+        return _meaning_rows(conn, q, conds, params + not_params, limit,
+                             live)
+
     if q["content"]:
         # content search: join through the FTS table for snippets and rank
         sql = ("SELECT f.path, f.size, f.mtime, "
@@ -2335,6 +2365,67 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
     if conds:
         sql += " WHERE " + " AND ".join(conds)
     return conn.execute(sql + order + lim, tail_params).fetchall()
+
+
+MEANING_LIVE_MIN = 4        # characters typed before a live meaning search
+
+
+def _meaning_rows(conn, q, conds, params, limit, live):
+    """Search by meaning (findex_embed), then the ordinary filters on top.
+    content: terms become a filter too - the words must be in the file and
+    it must be about the thing described."""
+    text = " ".join(q["meaning"]).strip()
+    if live and len(text) < MEANING_LIVE_MIN:
+        return []
+    import findex_embed
+    top = max(int(limit) if int(limit) > 0 else 0, findex_embed.MEANING_TOP)
+    hits = findex_embed.search(conn, text, top, db_key=_db_key(conn))
+    if not hits:
+        return []
+    conds = list(conds)
+    params = list(params)
+    if q["content"]:
+        conds.append("f.id IN (SELECT rowid FROM docs WHERE docs MATCH ?)")
+        match = " ".join(q["content"])
+        try:
+            conn.execute("SELECT rowid FROM docs WHERE docs MATCH ? LIMIT 1",
+                         [match]).fetchone()
+        except sqlite3.OperationalError:
+            match = _safe_content(q["content"]) or '"findex0nomatch0"'
+        params.append(match)
+    by_id = {fid: (sc, pos, ln) for fid, sc, pos, ln in hits}
+    out = []
+    ids = list(by_id)
+    for s in range(0, len(ids), 500):
+        chunk = ids[s:s + 500]
+        sql = ("SELECT f.id, f.path, f.size, f.mtime, f.is_dir FROM files f "
+               "WHERE f.id IN ({})".format(",".join("?" * len(chunk))))
+        if conds:
+            sql += " AND " + " AND ".join(conds)
+        for fid, path, size, mtime, is_dir in conn.execute(
+                sql, chunk + params).fetchall():
+            sc, pos, ln = by_id[fid]
+            out.append((fid, path, size, mtime, is_dir, sc, pos, ln))
+    out.sort(key=lambda r: -r[5])
+    if int(limit) > 0:
+        out = out[:int(limit)]
+    rows = []
+    for i, (fid, path, size, mtime, is_dir, sc, pos, ln) in enumerate(out):
+        snip = findex_embed.snippet(conn, fid, pos, ln) if i < 60 else ""
+        rows.append((path, size, mtime, snip, is_dir, sc))
+    return rows
+
+
+def _db_key(conn):
+    """Something that identifies the database a connection is on, for the
+    meaning index's per-process cache."""
+    try:
+        for _seq, name, path in conn.execute("PRAGMA database_list"):
+            if name == "main":
+                return path or "main"
+    except sqlite3.Error:
+        pass
+    return "main"
 
 
 def dupe_rows(conn, limit=0, exts=None):
@@ -2430,17 +2521,25 @@ def cmd_find(args):
     except sqlite3.OperationalError as exc:
         sys.stderr.write("Query error: {}\n".format(exc))
         return 1
+    except Exception as exc:                                   # noqa: BLE001
+        if type(exc).__name__ != "EmbedError":
+            raise
+        sys.stderr.write("{}\n".format(exc))        # search by meaning
+        return 1
+    q = parse_query(args.query)
     fmt = _machine_out(args)
     if fmt:
-        with_snip = bool(parse_query(args.query)["content"])
-        write_results((result_record(p, s, m, bool(d), snip if with_snip
-                                     else None)
-                       for p, s, m, snip, d in rows), sys.stdout, fmt)
+        with_snip = bool(q["content"] or q["meaning"])
+        write_results((result_record(r[0], r[1], r[2], bool(r[4]),
+                                     r[3] if with_snip else None)
+                       for r in rows), sys.stdout, fmt)
         return 0
-    for i, (path, size, mtime, snip, is_dir) in enumerate(rows, 1):
+    for i, r in enumerate(rows, 1):
+        path, size, mtime, snip, is_dir = r[:5]
         when = time.strftime("%Y-%m-%d", time.localtime(mtime))
-        print("{:>4}. {:>7}  {}  {}".format(
-            i, "folder" if is_dir else human(size), when, path))
+        print("{:>4}. {:>7}  {}  {}{}".format(
+            i, "folder" if is_dir else human(size), when, path,
+            "   [{:.0f}%]".format(r[5] * 100) if len(r) > 5 else ""))
         if snip:
             print("      {}".format(snip))
     print("\n{} result(s)".format(len(rows)))
@@ -2839,6 +2938,11 @@ def tool_modules():
     try:
         import findex_summary
         mods.append(findex_summary)
+    except ImportError:
+        pass
+    try:
+        import findex_embed
+        mods.append(findex_embed)
     except ImportError:
         pass
     return mods

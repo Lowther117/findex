@@ -66,6 +66,7 @@ DEFAULT_DB = os.path.join(HERE, "findex.db")
 
 POLL_MS = 100            # queue drain interval
 LIVE_SEARCH_MS = 120     # debounce for search-as-you-type
+MEANING_SEARCH_MS = 450  # ...when the query has a ~meaning part
 AUTO_CHECK_MS = 20000    # how often the auto re-index timer is checked
 RES_TICK_MS = 2000       # how often the CPU / memory readout refreshes
 MAX_LOG_LINES = 500
@@ -195,6 +196,7 @@ PIP_PINS = {
     "extract-msg": "extract-msg>=0.54",
     "watchdog": "watchdog>=6.0",
     "psutil": "psutil>=6.0",
+    "numpy": "numpy>=1.26",
     "pyobjc-framework-Vision": "pyobjc-framework-Vision>=10.0",
 }
 
@@ -316,6 +318,8 @@ def missing_packages():
         missing.append("watchdog")         # live index updates
     if iu.find_spec("psutil") is None:
         missing.append("psutil")           # CPU / memory readout
+    if iu.find_spec("numpy") is None:
+        missing.append("numpy")            # search by meaning (vectors)
     if sys.platform == "darwin" and iu.find_spec("Vision") is None:
         missing.append("pyobjc-framework-Vision")   # macOS built-in OCR
     if os.name == "nt":
@@ -677,6 +681,322 @@ def fmt_time(mtime):
 
 
 # ---------------------------------------------------------------------------
+# The results list
+# ---------------------------------------------------------------------------
+
+class Row:
+    """One result. A slotted object rather than a dict: with the whole
+    index on show (hundreds of thousands of rows) that is a third of the
+    memory, and the name and folder are derived from the path when a row
+    is drawn rather than stored twice. Reads like a dict (row["path"],
+    row.get("is_dir")) so the code that consumes results did not change."""
+
+    __slots__ = ("path", "size", "mtime", "snippet", "is_dir", "score")
+
+    def __init__(self, path, size=0, mtime=0.0, snippet="", is_dir=False,
+                 score=None):
+        self.path = path
+        self.size = size
+        self.mtime = mtime
+        self.snippet = snippet or ""
+        self.is_dir = bool(is_dir)
+        self.score = score          # search-by-meaning similarity, or None
+
+    @property
+    def name(self):
+        return os.path.basename(self.path)
+
+    @property
+    def folder(self):
+        return os.path.dirname(self.path)
+
+    def __getitem__(self, key):
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    def __repr__(self):
+        return "Row({!r})".format(self.path)
+
+
+class VirtualList:
+    """A Treeview that lists any number of rows while only ever holding a
+    few hundred of them.
+
+    A Treeview is slow and hungry past a few tens of thousands of items -
+    the whole index on show (300,000 rows) used to mean minutes of
+    streaming and hundreds of MB inside Tk. Here the widget holds a window
+    of WINDOW rows around the part being looked at; the scrollbar is
+    driven by hand so it describes the whole list, and whenever the view
+    nears an edge of the window the window is re-centred on it (the rows
+    in view stay where they are, so nothing jumps). Selection is kept as
+    a set of row numbers of its own, which is what lets Select all cover
+    rows the widget has never drawn.
+
+    rows:        any sequence; values_of(row, i) gives the column values.
+    on_select:   called when the selection changes.
+    on_sort:     called with the column key when a heading is clicked."""
+
+    WINDOW = 400          # rows the widget holds
+    MARGIN = 80           # re-centre when the view gets this close to an edge
+    # Keys that extend a selection: Shift and Control, plus Command on a
+    # Mac (Mod1 there). Nowhere else - on Windows/X11 the Mod bits are
+    # NumLock and Alt, and NumLock is on all day.
+    MOD_MASK = 0x0001 | 0x0004 | (0x0008 if sys.platform == "darwin" else 0)
+
+    def __init__(self, parent, columns, headings, values_of, on_select=None,
+                 on_sort=None):
+        self.values_of = values_of
+        self.on_select = on_select or (lambda: None)
+        self.on_sort = on_sort or (lambda col: None)
+        self.rows = []
+        self.offset = 0
+        self.window = self.WINDOW    # grows if the view shows more rows
+        self._shown = 30             # rows in view, from the last scroll report
+        self.sel = set()
+        self._mod = False
+        self._syncing = False
+        self._pending = None
+        self.tree = ttk.Treeview(parent, columns=columns, show="headings",
+                                 selectmode="extended")
+        for key, text, width, anchor, stretch in headings:
+            self.tree.heading(key, text=text,
+                              command=lambda k=key: self.on_sort(k))
+            self.tree.column(key, width=width, anchor=anchor, stretch=stretch)
+        self.vsb = ttk.Scrollbar(parent, orient="vertical",
+                                 command=self._scroll_cmd)
+        self.tree.configure(yscrollcommand=self._yscrolled)
+        t = self.tree
+        t.bind("<ButtonPress-1>", self._note_mod, add="+")
+        t.bind("<KeyPress>", self._note_mod, add="+")
+        t.bind("<<TreeviewSelect>>", self._selected, add="+")
+        t.bind("<Home>", lambda e: self.go(0) or "break")
+        t.bind("<End>", lambda e: self.go(len(self.rows) - 1) or "break")
+        t.bind("<Configure>", lambda e: self._update_bar(), add="+")
+
+    # -- the window ---------------------------------------------------------
+
+    def set_rows(self, rows, keep_view=False):
+        """Show a new list. keep_view keeps the scroll position (a refresh
+        of the same list); otherwise the list starts at the top."""
+        top = self.top_row() if keep_view else 0
+        self.rows = rows
+        self.sel = {i for i in self.sel if i < len(rows)} if keep_view \
+            else set()
+        self._place(top)
+
+    def _offset_for(self, top_row):
+        """Where the window would start to put the view (top_row and the
+        rows below it that are visible) in its middle."""
+        n = len(self.rows)
+        top_row = max(0, min(int(top_row), max(0, n - 1)))
+        centre = top_row + min(self._shown, self.window) // 2
+        return max(0, min(centre - self.window // 2, max(0, n - self.window)))
+
+    def _place(self, top_row):
+        """Put the window so that top_row is in view, and show it."""
+        n = len(self.rows)
+        top_row = max(0, min(int(top_row), max(0, n - 1)))
+        self.offset = self._offset_for(top_row)
+        self._fill()
+        w = self._width()
+        if w:
+            self.tree.yview_moveto((top_row - self.offset) / float(w))
+        self._update_bar()
+
+    def _width(self):
+        return min(self.window, len(self.rows) - self.offset)
+
+    def _fill(self):
+        t = self.tree
+        focus = t.focus()
+        self._syncing = True
+        try:
+            t.delete(*t.get_children())
+            insert = t.insert
+            values_of = self.values_of
+            end = self.offset + self._width()
+            for i in range(self.offset, end):
+                insert("", "end", iid=str(i), tags=("odd",) if i % 2 else (),
+                       values=values_of(self.rows[i], i))
+            if self.sel:
+                picked = [str(i) for i in range(self.offset, end)
+                          if i in self.sel]
+                if picked:
+                    t.selection_set(picked)
+            if focus and self.offset <= int(focus) < end:
+                t.focus(focus)
+        finally:
+            self._syncing = False
+
+    def top_row(self):
+        """The row number at the top of the view."""
+        w = self._width()
+        if not w:
+            return 0
+        try:
+            first = float(self.tree.yview()[0])
+        except (tk.TclError, ValueError, IndexError):
+            first = 0.0
+        return self.offset + int(round(first * w))
+
+    def _yscrolled(self, first, last):
+        """The widget's own view moved (wheel, keys, drag): describe the
+        whole list on the scrollbar, and re-centre the window if the view
+        is near one of its edges."""
+        self._update_bar(float(first), float(last))
+        if self._pending is not None:
+            return
+        n, w = len(self.rows), self._width()
+        if not w:
+            return
+        shown = (float(last) - float(first)) * w      # rows in view
+        if w == self.window:        # a full window: a true measure
+            self._shown = max(1, int(round(shown)))
+        need = int(2 * shown + 2 * self.MARGIN + 99) // 100 * 100
+        if need > self.window and w == self.window:
+            # a tall window shows more rows than the window leaves room
+            # for on either side: hold more, or every step would refill
+            self.window = need
+            self._pending = self.tree.after_idle(self._recentre)
+            return
+        top = float(first) * w
+        bottom = (1.0 - float(last)) * w
+        if (top < self.MARGIN and self.offset > 0) or \
+                (bottom < self.MARGIN and self.offset + w < n):
+            # only when re-centring would actually move the window: a view
+            # taller than the margins allow would otherwise refill forever
+            if self._offset_for(self.offset + top) != self.offset:
+                self._pending = self.tree.after_idle(self._recentre)
+
+    def _recentre(self):
+        self._pending = None
+        self._place(self.top_row())
+
+    def _update_bar(self, first=None, last=None):
+        n, w = len(self.rows), self._width()
+        if not n or not w:
+            self.vsb.set(0.0, 1.0)
+            return
+        if first is None:
+            try:
+                first, last = (float(x) for x in self.tree.yview())
+            except (tk.TclError, ValueError):
+                first, last = 0.0, 1.0
+        self.vsb.set((self.offset + first * w) / n,
+                     min(1.0, (self.offset + last * w) / n))
+
+    def _scroll_cmd(self, *args):
+        """The scrollbar was used: it speaks in terms of the whole list."""
+        n = len(self.rows)
+        if not n or not args:
+            return
+        if args[0] == "moveto":
+            self._place(float(args[1]) * n)
+        elif args[0] == "scroll":
+            try:
+                self.tree.yview_scroll(int(float(args[1])), args[2])
+            except tk.TclError:
+                pass
+
+    def go(self, i):
+        """Scroll to row i, select it and give it the focus."""
+        if not self.rows:
+            return
+        i = max(0, min(i, len(self.rows) - 1))
+        if not (self.offset <= i < self.offset + self._width()):
+            self._place(i)
+        self.sel = {i}
+        self._syncing = True
+        try:
+            self.tree.selection_set(str(i))
+            self.tree.focus(str(i))
+            self.tree.see(str(i))
+        finally:
+            self._syncing = False
+        self.on_select()
+
+    # -- selection ----------------------------------------------------------
+
+    def _note_mod(self, event):
+        try:
+            self._mod = bool(event.state & self.MOD_MASK)
+        except (AttributeError, TypeError):
+            self._mod = False
+
+    def _selected(self, _event=None):
+        if self._syncing:
+            return
+        shown = set()
+        for iid in self.tree.selection():
+            try:
+                shown.add(int(iid))
+            except ValueError:
+                pass
+        lo, hi = self.offset, self.offset + self._width()
+        inside = {i for i in self.sel if lo <= i < hi}
+        if shown == inside:
+            return          # the widget caught up with us - nothing new
+        if self._mod:       # extending: rows outside the window stay picked
+            self.sel = (self.sel - inside) | shown
+        else:
+            self.sel = shown
+        self.on_select()
+
+    def select_all(self):
+        self.sel = set(range(len(self.rows)))
+        self._syncing = True
+        try:
+            self.tree.selection_set(self.tree.get_children())
+        finally:
+            self._syncing = False
+        self.on_select()
+
+    def select_only(self, i):
+        """Make row i the selection (a right-click on an unselected row)."""
+        self.sel = {i}
+        self._syncing = True
+        try:
+            self.tree.selection_set(str(i))
+            self.tree.focus(str(i))
+        finally:
+            self._syncing = False
+
+    def row_at(self, y):
+        """The row number under a widget y co-ordinate, or None."""
+        iid = self.tree.identify_row(y)
+        try:
+            return int(iid) if iid else None
+        except ValueError:
+            return None
+
+    def current(self):
+        """The row the user is 'on': the focused one if selected, else the
+        first selected one. None when nothing is selected."""
+        if not self.sel:
+            return None
+        try:
+            f = int(self.tree.focus())
+            if f in self.sel:
+                return self.rows[f]
+        except (ValueError, IndexError):
+            pass
+        return self.rows[min(self.sel)]
+
+    def selected(self):
+        """The selected rows, in list order."""
+        n = len(self.rows)
+        return [self.rows[i] for i in sorted(self.sel) if i < n]
+
+    def count(self):
+        return len(self.rows)
+
+
+# ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 
@@ -704,7 +1024,6 @@ class FindexApp(findex_tabs.ToolTabs):
         self._menus = []                 # classic tk menus, recoloured on toggle
         self._spins = []                 # classic tk Spinboxes (Tk 8.5 fallback)
         self._clip = {"paths": [], "move": False}
-        self._render_gen = 0
         self._progress_est = 0
 
         root.title("findex")
@@ -829,6 +1148,8 @@ class FindexApp(findex_tabs.ToolTabs):
         self.var_bg_note = tk.StringVar(value="")
         self.var_watch = tk.BooleanVar(value=bool(c.get("watch", False)))
         self.var_watch_note = tk.StringVar(value="")
+        self.var_embed = tk.BooleanVar(value=bool(c.get("embed", False)))
+        self.var_embed_note = tk.StringVar(value="")
         self.var_counts = tk.StringVar(value="Idle")
         self.var_stats = tk.StringVar(value="")
 
@@ -1208,7 +1529,7 @@ class FindexApp(findex_tabs.ToolTabs):
         hint = ttk.Label(opts, style="Dim.TLabel",
                          text="names as you type  ·  content:word  ·  C:\\  ·"
                               "  ext:pdf  ·  !leave-out  ·  folder:  ·"
-                              "  section:")
+                              "  section:  ·  ~by meaning")
         hint.pack(side="left", padx=(0, 20))
         self.tip(hint, "The search understands Everything-style filters, "
                        "combined freely - e.g.  C: content:dan ext:pdf "
@@ -1224,31 +1545,27 @@ class FindexApp(findex_tabs.ToolTabs):
         self._track_spin(spin)
         for w in (lbl, spin):
             self.tip(w, "How many results to list. 0 means ALL of them - "
-                        "the full list streams in behind the first screenful. "
-                        "Set a number to cap very broad searches.")
+                        "the list only ever draws the part you are looking "
+                        "at, so even the whole index shows up at once. Set a "
+                        "number to cap very broad searches.")
 
         body = ttk.Frame(self.tab_search)
         body.pack(fill="both", expand=True, padx=12, pady=(8, 10))
 
         holder = ttk.Frame(body)
         cols = ("name", "size", "modified", "folder")
-        self.tree = ttk.Treeview(holder, columns=cols, show="headings",
-                                 selectmode="extended")
-        headings = (("name", "Name", 320), ("size", "Size", 80),
-                    ("modified", "Modified", 130), ("folder", "Folder", 460))
-        for key, text, width in headings:
-            self.tree.heading(key, text=text,
-                              command=lambda k=key: self.sort_by(k))
-            anchor = "e" if key == "size" else "w"
-            self.tree.column(key, width=width, anchor=anchor,
-                             stretch=(key == "folder"))
-        vsb = ttk.Scrollbar(holder, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
+        headings = (("name", "Name", 320, "w", False),
+                    ("size", "Size", 80, "e", False),
+                    ("modified", "Modified", 130, "w", False),
+                    ("folder", "Folder", 460, "w", True))
+        self.results = VirtualList(holder, cols, headings, self._row_values,
+                                   on_select=self.show_preview,
+                                   on_sort=self.sort_by)
+        self.tree = self.results.tree
         self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+        self.results.vsb.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", lambda e: self.open_selected())
         self.tree.bind("<Return>", lambda e: self.open_selected())
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self.show_preview())
         self.tree.bind("<Button-3>", self.popup_menu)
         self.tree.bind("<Button-2>", self.popup_menu)      # mac right-click
         if sys.platform == "darwin":
@@ -1670,6 +1987,31 @@ class FindexApp(findex_tabs.ToolTabs):
         ttk.Label(live, textvariable=self.var_watch_note,
                   style="Accent.TLabel").pack(side="left", padx=12)
 
+        emb = ttk.Frame(opts)
+        emb.pack(fill="x", padx=8, pady=(0, 8))
+        chk = ttk.Checkbutton(emb, text="Search by meaning - after each run, "
+                                        "vectorise new and changed text "
+                                        "with the local AI",
+                              variable=self.var_embed,
+                              command=self._embed_toggled)
+        chk.pack(side="left")
+        self.tip(chk, "Find files by what they are ABOUT, not just the words "
+                      "in them: type ~ then a description in the search "
+                      "box (~letter about the boiler warranty). A small "
+                      "local embedding model (274 MB, nothing leaves this "
+                      "computer) turns the text findex extracted into "
+                      "vectors; with this ticked that happens on its own "
+                      "after every index run, for new and changed files "
+                      "only. Minutes on a graphics card, hours on a CPU "
+                      "the first time.")
+        b = ttk.Button(emb, text="Update now", command=self.embed_now)
+        b.pack(side="left", padx=(10, 0))
+        self.tip(b, "Vectorise everything with text that has not been done "
+                    "yet, right now. The first time this fetches the "
+                    "embedding model (and the AI engine, if findex has none).")
+        ttk.Label(emb, textvariable=self.var_embed_note,
+                  style="Accent.TLabel").pack(side="left", padx=12)
+
         run = ttk.Frame(self.tab_index)
         run.pack(fill="x", padx=8, pady=8)
         self.btn_start = ttk.Button(run, text="Start indexing", width=16,
@@ -1738,6 +2080,10 @@ class FindexApp(findex_tabs.ToolTabs):
 
         self.update_auto_label()
         self.root.after(1200, self.refresh_bg_state)
+        # the GPU lookup runs a helper program once; do it before any menu
+        # or dialog needs the answer on the UI thread
+        import findex_summary as _fs
+        threading.Thread(target=_fs.gpu_info, daemon=True).start()
 
     # -- searching ---------------------------------------------------------
 
@@ -1745,7 +2091,11 @@ class FindexApp(findex_tabs.ToolTabs):
         if self.search_after:
             self.root.after_cancel(self.search_after)
             self.search_after = None
-        self.search_after = self.root.after(LIVE_SEARCH_MS,
+        text = self.var_query.get()
+        wait = LIVE_SEARCH_MS
+        if "~" in text or "about:" in text.lower():
+            wait = MEANING_SEARCH_MS    # each one is a trip to the model
+        self.search_after = self.root.after(wait,
                                             lambda: self.run_search(live=True))
 
     def _type_filter(self):
@@ -1796,72 +2146,59 @@ class FindexApp(findex_tabs.ToolTabs):
                     "SELECT COUNT(*) FROM files").fetchone()[0]
             raw = findex.query_rows(conn, text, limit, exts=exts, kind=kind,
                                     live=live)
-            rows = [{"path": r[0], "name": os.path.basename(r[0]),
-                     "size": r[1], "mtime": r[2], "snippet": r[3],
-                     "is_dir": bool(r[4])} for r in raw]
+            rows = [Row(r[0], r[1], r[2], r[3], r[4],
+                        r[5] if len(r) > 5 else None) for r in raw]
             self.msgs.put(("results", gen, rows, total))
         except sqlite3.OperationalError as exc:
             self.msgs.put(("search_error", gen, str(exc)))
         except Exception as exc:                               # noqa: BLE001
-            self.msgs.put(("search_error", gen,
-                           "{}: {}".format(type(exc).__name__, exc)))
+            if type(exc).__name__ == "EmbedError":
+                self.msgs.put(("search_error", gen, str(exc)))
+            else:
+                self.msgs.put(("search_error", gen,
+                               "{}: {}".format(type(exc).__name__, exc)))
         finally:
             if conn is not None:
                 conn.close()
 
-    def render_rows(self):
-        """Show results without ever freezing the window: the first screenful
-        appears at once, the rest streams in between keystrokes, and a newer
-        search abandons the old stream mid-way."""
-        self._render_gen += 1
-        self.tree.delete(*self.tree.get_children())
-        self.set_preview("")
-        self._render_chunk(self._render_gen, 0)
+    def _row_values(self, row, _i):
+        """The columns of one result, worked out as it is drawn."""
+        return (row.name,
+                "folder" if row.is_dir else findex.human(row.size),
+                fmt_time(row.mtime),
+                row.folder)
 
-    def _render_chunk(self, gen, start):
-        if gen != self._render_gen:
-            return                       # superseded by a newer result set
-        end = min(start + (300 if start == 0 else 800), len(self.rows))
-        insert = self.tree.insert
-        human = findex.human
-        for i in range(start, end):
-            row = self.rows[i]
-            insert("", "end", iid=str(i),
-                   tags=("odd",) if i % 2 else (),
-                   values=(row["name"],
-                           "folder" if row.get("is_dir")
-                           else human(row["size"]),
-                           fmt_time(row["mtime"]),
-                           os.path.dirname(row["path"])))
-        if end < len(self.rows):
-            self.root.after(5, lambda: self._render_chunk(gen, end))
+    def render_rows(self, keep_view=False):
+        """Show self.rows. However many there are, this is instant: the
+        list widget only ever holds the few hundred rows around the part
+        being looked at (see VirtualList)."""
+        self.results.set_rows(self.rows, keep_view=keep_view)
+        self.set_preview("")
 
     def sort_by(self, col):
         if not self.rows:
             return
         self.sort_desc = not self.sort_desc if self.sort_col == col else False
         self.sort_col = col
-        key = {"name": lambda r: r["name"].lower(),
-               "size": lambda r: r["size"] or 0,
-               "modified": lambda r: r["mtime"] or 0,
-               "folder": lambda r: os.path.dirname(r["path"]).lower()}[col]
+        key = {"name": lambda r: r.name.lower(),
+               "size": lambda r: r.size or 0,
+               "modified": lambda r: r.mtime or 0,
+               "folder": lambda r: r.folder.lower()}[col]
         self.rows.sort(key=key, reverse=self.sort_desc)
         self.render_rows()
 
     def selected_row(self):
-        sel = self.tree.selection()
-        if not sel:
-            return None
-        try:
-            return self.rows[int(sel[0])]
-        except (ValueError, IndexError):
-            return None
+        return self.results.current()
 
     def show_preview(self):
         row = self.selected_row()
         if not row:
             return
-        self.set_preview(row["snippet"], row["path"])
+        snippet = row.snippet
+        if row.score is not None:
+            snippet = "match {:.0f}%{}".format(
+                row.score * 100, "  ·  " + snippet if snippet else "")
+        self.set_preview(snippet, row.path)
 
     def set_preview(self, snippet, path=""):
         self.preview.configure(state="normal")
@@ -1889,24 +2226,17 @@ class FindexApp(findex_tabs.ToolTabs):
         self.preview.configure(height=max(2, min(8, shown)))
 
     def _focus_results(self, _event):
-        kids = self.tree.get_children()
-        if kids:
+        if self.rows:
             self.tree.focus_set()
-            self.tree.selection_set(kids[0])
-            self.tree.focus(kids[0])
+            self.results.go(0)
         return "break"
 
     def selected_rows(self):
-        out = []
-        for iid in self.tree.selection():
-            try:
-                out.append(self.rows[int(iid)])
-            except (ValueError, IndexError):
-                pass
-        return out
+        return self.results.selected()
 
     def select_all(self):
-        self.tree.selection_set(self.tree.get_children())
+        self.results.select_all()
+        self.var_status.set("{:,} selected".format(len(self.results.sel)))
 
     def copy_files(self, move=False):
         """Put the selected files on the clipboard - the real files, so they
@@ -2027,11 +2357,12 @@ class FindexApp(findex_tabs.ToolTabs):
             pass
 
     def popup_menu(self, event):
-        iid = self.tree.identify_row(event.y)
-        if not iid:
+        i = self.results.row_at(event.y)
+        if i is None:
             return
-        if iid not in self.tree.selection():
-            self.tree.selection_set(iid)
+        if i not in self.results.sel:
+            self.results.select_only(i)
+            self.show_preview()
         self.ctx.tk_popup(event.x_root, event.y_root)
 
     def open_selected(self):
@@ -2310,8 +2641,9 @@ class FindexApp(findex_tabs.ToolTabs):
         if not path:
             return
         fmt = os.path.splitext(path)[1].lstrip(".").lower() or "csv"
-        # the snippet column only means something in a content: search
-        with_snip = bool(findex.parse_query(self.var_query.get())["content"])
+        # the snippet column only means something in a content: or ~ search
+        q = findex.parse_query(self.var_query.get())
+        with_snip = bool(q["content"] or q["meaning"])
         records = [findex.result_record(
             r["path"], r["size"], r["mtime"], r.get("is_dir", False),
             r.get("snippet", "") if with_snip else None) for r in self.rows]
@@ -2483,8 +2815,13 @@ class FindexApp(findex_tabs.ToolTabs):
                         self.sort_col = None
                         self.render_rows()
                         if total is None:
-                            self.var_status.set(
-                                "{:,} result(s)".format(len(rows)))
+                            if rows and rows[0].score is not None:
+                                self.var_status.set(
+                                    "{:,} closest match(es) by meaning - "
+                                    "best first".format(len(rows)))
+                            else:
+                                self.var_status.set(
+                                    "{:,} result(s)".format(len(rows)))
                         elif total > len(rows):
                             self.var_status.set(
                                 "Showing the {:,} most recent of {:,} indexed "
@@ -2528,7 +2865,8 @@ class FindexApp(findex_tabs.ToolTabs):
                                       "(exit {}) --".format(code))
                 elif kind == "progress":
                     p = msg[1]
-                    if self.proc_kind in findex_tabs.TOOL_KINDS:
+                    if self.proc_kind in findex_tabs.TOOL_KINDS \
+                            or self.proc_kind == "embed":
                         self._tool_progress(p)
                         continue
                     pct_txt = ""
@@ -2589,6 +2927,10 @@ class FindexApp(findex_tabs.ToolTabs):
             self.refresh_journal()
         if kind in findex_tabs.TOOL_KINDS:
             self._tool_finished(kind, code)
+        elif kind == "embed":
+            self._embed_finished(code)
+        elif kind == "index" and code == 0 and self.var_embed.get():
+            self.embed_now(auto=True)    # vectorise what the run changed
         self._maybe_start_watch()        # live updates waiting on setup/run
 
     def log_line(self, text):
@@ -2837,6 +3179,80 @@ class FindexApp(findex_tabs.ToolTabs):
             self.var_stats.set(text)
         except Exception as exc:                               # noqa: BLE001
             self.var_stats.set("Index not readable: {}".format(exc))
+        self._embed_refresh_note()
+
+    # -- search by meaning (findex embed) -----------------------------------
+
+    def _embed_refresh_note(self):
+        def work():
+            try:
+                import findex_embed
+                conn = findex.open_db_ro(self.var_db.get())
+                try:
+                    st = findex_embed.status(conn, stale=self.var_embed.get())
+                finally:
+                    conn.close()
+            except Exception:                                  # noqa: BLE001
+                return
+            if not st["model"] or not st["files"]:
+                note = "" if not self.var_embed.get() else "not built yet"
+            else:
+                note = "{:,} of {:,} files with text".format(
+                    st["files"], st["text_files"])
+                if st["stale"]:
+                    note += "  ({:,} to do)".format(st["stale"])
+            err = getattr(self, "_embed_err", "")
+            if err:
+                note = err + ("  -  " + note if note else "")
+            self.msgs.put(("call", self.var_embed_note.set, (note,)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _embed_toggled(self):
+        self.cfg["embed"] = bool(self.var_embed.get())
+        self._embed_refresh_note()
+
+    def embed_now(self, auto=False):
+        """Run findex embed as an engine child. auto=True is the follow-on
+        after an index run: silent, and skipped if anything is running."""
+        if self.proc is not None:
+            if not auto:
+                messagebox.showinfo("Busy", "Something is already running - "
+                                            "wait for it to finish.")
+            return
+        import findex_embed
+        import findex_summary as fs
+        if auto and not (fs.find_ollama() or self._sai.get("ok")):
+            # never fetch a 1.5 GB engine behind the user's back - Update
+            # now (which asks first) or a build puts it there
+            self._embed_err = "needs the AI engine - press Update now"
+            self._embed_refresh_note()
+            return
+        if not auto and not (fs.find_ollama() or fs.ai_status()["ok"]):
+            if not messagebox.askyesno(
+                    "Set up search by meaning?",
+                    "This downloads the embedding model {} ({}) and the AI "
+                    "engine that runs it ({}) into findex's own folder - no "
+                    "app is installed, nothing leaves this computer.\n\n"
+                    "{}\n\nGo ahead?".format(
+                        findex_embed.MODEL, findex_embed.MODEL_SIZE,
+                        fs.engine_size() or "about 170 MB", fs.gpu_line())):
+                return
+        try:
+            self._sused.add(findex_embed.MODEL)   # unloaded when we close
+        except AttributeError:
+            pass
+        self._embed_err = ""
+        cmd = engine_command() + ["--db", self.var_db.get(), "embed",
+                                  "--progress"]
+        self._progress_est = 0
+        self.launch(cmd, "embed", "Vectorising text for search by meaning...")
+
+    def _embed_finished(self, code):
+        self._embed_err = ("the AI engine is not available - see Output"
+                           if code == 2 else
+                           "stopped early - Update now carries on"
+                           if code else "")
+        self._embed_refresh_note()
 
     def choose_db(self):
         path = filedialog.asksaveasfilename(
@@ -2895,7 +3311,12 @@ class FindexApp(findex_tabs.ToolTabs):
             "                    (letter, cv, contract, statement, minutes,\n"
             "                     report, manual, email, code...)\n"
             "  !draft            leave out names containing draft\n"
-            "  !ext:tmp  !C:\\Windows   ...works on filters too\n\n"
+            "  !ext:tmp  !C:\\Windows   ...works on filters too\n"
+            "  ~boiler warranty letter   search by MEANING: files about\n"
+            "                    that, however they put it (needs the\n"
+            "                    Index tab's Search by meaning); filters\n"
+            "                    still apply:  ~mortgage offer ext:pdf D:\\\n"
+            '  about:"a phrase"  the same, for one phrase\n\n'
             "Example:  C: content:dan ext:pdf !draft\n\n"
             "content: accepts full FTS5 syntax when quoted at the box level:\n"
             "  content:budg*   prefix    |   content:\"risk policy\"  phrase\n\n"
@@ -2940,6 +3361,7 @@ class FindexApp(findex_tabs.ToolTabs):
             "auto_minutes": int_of(self.var_auto_mins, 60) or 60,
             "bg_hours": int_of(self.var_bg_hours, 6) or 6,
             "watch": bool(self.var_watch.get()),
+            "embed": bool(self.var_embed.get()),
             "limit": max(0, int_of(self.var_limit)),
             "exts": self.var_exts.get(),
             "save_dir": portable(self.cfg.get("save_dir") or ""),

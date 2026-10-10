@@ -4,8 +4,9 @@
 #
 # Everything this prints is also written to build-mac-log.txt, and the built
 # app is tested before this script claims success. The last step installs
-# the AI engine and the small models the Summary tab uses - into findex's own
-# folder, no app installed (FINDEX_AI_MODELS=none skips it).
+# the AI engine and the models the Summary tab and search by meaning use,
+# sized to this Mac - into findex's own folder, no app installed
+# (FINDEX_AI_MODELS=none skips it).
 
 cd "$(dirname "$0")" || exit 1
 LOG="build-mac-log.txt"
@@ -181,6 +182,7 @@ if ! "$PY" -c "import watchdog" >/dev/null 2>&1; then
     fi
 fi
 pipget "psutil>=6.0"                   "resource monitor"
+pipget "numpy>=1.26"                   "search by meaning"
 pipget "pyobjc-framework-Vision>=10.0" "built-in OCR"
 if [ -n "$MISSING" ]; then
     printf '\n   NOTE: these could not be installed and will be absent from\n'
@@ -195,6 +197,7 @@ rm -rf build dist findex.spec
 "$PY" -m PyInstaller --noconfirm --clean --windowed --name findex \
     --osx-bundle-identifier com.lowther.findex \
     --collect-submodules watchdog \
+    --collect-submodules numpy \
     --collect-submodules mutagen \
     --collect-all extract_msg \
     --collect-all pymupdf \
@@ -233,27 +236,36 @@ else
 fi
 
 # --------------------------------------------------------------------------
-# 6. The AI summary models
+# 6. The AI models
 #
-# The Summary tab's written summaries come from small language models, run
-# by Ollama's engine. No Ollama app is installed: findex downloads the
-# standalone engine (about 170 MB) into its own data folder
-# (~/Library/Application Support/findex/ollama) and runs it hidden, only
-# while findex is open. Fetching it and the models here means they are
-# simply there the first time the app is opened. They live ON THIS MAC
-# (models in ~/.ollama), not inside findex.app - far too big to carry in
+# The Summary tab's written summaries come from language models run by
+# Ollama's engine, and search by meaning (findex embed) from its embedding
+# model. No Ollama app is installed: findex downloads the standalone engine
+# (about 170 MB; it uses the GPU through Metal on Apple silicon) into its
+# own data folder (~/Library/Application Support/findex/ollama) and runs it
+# hidden, only while findex is open. Fetching it and the models here means
+# they are simply there the first time the app is opened. They live ON THIS
+# MAC (models in ~/.ollama), not inside findex.app - far too big to carry in
 # the bundle. Copy the app to another Mac and AI summaries > Set up fetches
 # them there.
+#
+# "auto" (the default) looks at this Mac's memory and fetches what suits
+# it: the quick model (gemma3:1b, 815 MB), the biggest model the GPU's share
+# of unified memory (about two thirds) can hold - qwen3:8b on a 16 GB Mac,
+# gemma3:12b on 24 GB, gemma3:27b on 36 GB+; nothing extra on an Intel Mac -
+# and the embedding model (274 MB).
+# It then loads the model and prints whether the engine put it on the GPU.
 #
 # Already-installed models are skipped, so only the first build downloads.
 # Nothing here can fail the build - the app works without them.
 #
 #   FINDEX_AI_MODELS=none ./build-app.command           skip this step
+#   FINDEX_AI_MODELS=all ./build-app.command            every small CPU model
 #   FINDEX_AI_MODELS=gemma3:1b ./build-app.command      just that one
 #   FINDEX_AI_MODELS=gemma3:1b,llama3.2:1b ...          a list
 # --------------------------------------------------------------------------
-say "AI summary models"
-AI_MODELS="${FINDEX_AI_MODELS:-all}"
+say "AI models"
+AI_MODELS="${FINDEX_AI_MODELS:-auto}"
 AI_RESULT=skipped
 case "$AI_MODELS" in
     none|skip|no|0)
@@ -263,6 +275,10 @@ case "$AI_MODELS" in
             echo "   Fetching the AI engine (no app is installed) and all five small"
             echo "   models - about 8.9 GB the first time, nothing after that."
             echo "   FINDEX_AI_MODELS=none skips this."
+        elif [ "$AI_MODELS" = auto ]; then
+            echo "   Fetching the AI engine (no app is installed) and the models that"
+            echo "   suit this Mac - up to about 11 GB the first time, nothing after"
+            echo "   that. FINDEX_AI_MODELS=none skips this."
         else
             echo "   Fetching the AI engine (no app is installed) and: $AI_MODELS"
         fi
@@ -295,7 +311,7 @@ open properly. The whole run is in $PWD/$LOG.
 MSG
 fi
 case "$AI_RESULT" in
-    ok)       echo "AI summary models: installed on this Mac." ;;
-    problems) echo "AI summary models: NOT all installed - see the note above." ;;
+    ok)       echo "AI models: installed on this Mac." ;;
+    problems) echo "AI models: NOT all installed - see the note above." ;;
 esac
 echo "Log: $PWD/$LOG"

@@ -31,7 +31,8 @@ and no machine-specific path is ever stored.
 | `findex_tabs.py` | the app | the app | The Health, Duplicates, Rename and Verify tabs. Part of the app; not run directly. |
 | `findex_tabs_organise.py` | the app | the app | The Organise tab. Part of the app; not run directly. |
 | `findex_tabs_summary.py` | the app | the app | The Summary tab. Part of the app; not run directly. |
-| `findex_summary.py` | engine | engine | What a folder holds: files sorted into labelled sections by subject, a card per file, optional summaries from a local AI model: `findex summarise`. |
+| `findex_summary.py` | engine | engine | What a folder holds: files sorted into labelled sections by subject, a card per file, optional summaries from a local AI model (GPU-aware): `findex summarise`. |
+| `findex_embed.py` | engine | engine | Search by meaning: vectors for the indexed text from a local embedding model, `~words` in a query: `findex embed`. |
 | `findex_organise.py` | engine | engine | Sort a folder into subfolders by rules, with suggestions, a rule check, preview and undo: `findex organise`. |
 | `findex_hash.py` | engine | engine | Content fingerprints and type detection: `findex hash`, `findex dupes --exact / --near / --images`. |
 | `findex_report.py` | engine | engine | The health report: `findex report`. |
@@ -163,9 +164,25 @@ is remembered in `findex_gui.json`.
     match folders that have been summarised (see the Summary tab)
   - `!anything` leaves results out: `!draft`, `!ext:tmp`, `!C:\Windows`
   - e.g. `C: content:dan ext:pdf !draft`
+  - **`~` searches by meaning** - see *Search by meaning* below.
+    `~letter about the boiler warranty` lists the files that are *about*
+    that, however they put it, best first; the filters still apply
+    (`~mortgage offer ext:pdf D:\Docs`), and `content:word` becomes a
+    must-contain filter on the matches. `about:"a phrase"` is the same for
+    one phrase inside an ordinary query. Needs the Index tab's *Search by
+    meaning* to have run.
 - **Weighted results**: name matches come back exact-name first, then names
   starting with the term, then newest; content matches are relevance-ranked
-  (bm25). Browsing with no terms is newest-first.
+  (bm25). Browsing with no terms is newest-first. Meaning results carry a
+  match percentage, shown in the pane underneath with the best-matching
+  passage.
+- **Any size, instantly.** The list never draws more than a few hundred
+  rows: it holds a window around the part you are looking at and slides it
+  as you scroll, while the scrollbar describes the whole list. So the
+  whole index - 300,000 files - appears at once instead of streaming in,
+  uses a fraction of the memory it used to, and sorting or selecting
+  everything (Ctrl/Cmd+A) covers every row, drawn or not. Home / End jump
+  to the ends.
 - Right-click > **Rename these...** hands the selected files to the Rename
   tab as a hand-picked selection.
 - Right-click > **Summarise this folder** takes the selected folder (or the
@@ -226,6 +243,14 @@ is remembered in `findex_gui.json`.
   current without waiting for the next run. Runs quietly alongside normal
   indexing and is shut down with the app. (Uses the OS's own change
   notifications via the `watchdog` component, installed automatically.)
+- *Search by meaning* - tick it and, after every index run, findex turns
+  the text of new and changed files into vectors with a local embedding
+  model, so `~what you mean` works in the search box (details under
+  *Search by meaning* below). **Update now** does it straight away; the
+  first time it fetches the model (274 MB) and, if findex has no AI engine
+  yet, the engine. The note beside it shows the coverage ("54,210 of
+  55,615 files with text") and how many are still to do. Progress shows on
+  this tab's bar and Stop works; what was done is kept.
 - *Export file tree...* writes everything the index knows - every folder and
   file under every indexed location - to a file, straight from the database,
   so it takes seconds even for hundreds of thousands of entries and needs no
@@ -362,28 +387,66 @@ this folder**.
     left alone; findex just unloads the models it used from it. The build
     scripts likewise stop the Ollama they started once the models are in.
     `findex summarise --ai-stop` does the same from the command line.
+  - **The graphics card is used when there is one.** The menu's header
+    says what findex found (`NVIDIA GeForce RTX 3080 Ti - 12.0 GB for
+    models`, or *No graphics card found - models run on the CPU*) and,
+    once a model is loaded, where the engine actually put it - *loaded on
+    the GPU*, *on the CPU*, or split. That second line is the real check:
+    it comes from the engine's own account of the loaded model, not from
+    the hardware being present, so a driver too old for the engine's CUDA
+    build shows up as "on the CPU" and the Output pane says so. With no
+    model chosen, findex picks the **biggest installed model the card can
+    hold** (see the tiers below), and gives such a model more of each file
+    (14,000 characters and an 8k context instead of 5,000 and 4k) - on a
+    GPU a 12B model answers about as fast as a 1B one does on a CPU, and
+    writes far better summaries. NVIDIA cards are read through
+    `nvidia-smi`, AMD cards from the display adapter's registry entry
+    (Windows); an Apple-silicon Mac counts about two thirds of its unified
+    memory as the GPU's share; Intel Macs and integrated graphics are CPU.
+    `findex summarise --ai-check` loads the model from the command line and
+    reports where it landed; `--ai-status` shows the card.
   - *Model* - pick among the models installed, or download another. The
-    ones offered are small and quick on purpose:
+    first offer is the best fit for this computer's GPU; the small ones
+    run on any CPU:
 
     | Model | Download | What it is like |
     |---|---|---|
-    | `gemma3:1b` | 815 MB | quickest - fine for a few plain sentences (the default) |
+    | `gemma3:1b` | 815 MB | quickest - fine for a few plain sentences (the CPU default) |
     | `qwen3.5:0.8b` | 1.2 GB | newest of the tiny models |
     | `llama3.2:1b` | 1.3 GB | quick, plain summaries |
     | `granite4:micro` | 2.1 GB | steadier on business documents |
-    | `gemma3:4b` | 3.3 GB | best of the small ones, about 3x slower |
+    | `gemma3:4b` | 3.3 GB | best of the small ones, about 3x slower on a CPU |
 
-    *Download all of them* fetches the lot (8.7 GB) - which is also what
-    the standalone build scripts do, so after a build they are already
-    there. Any other model already in Ollama is listed too. Requests are kept
-    short for speed (the first ~5,000 characters of a file plus its end, a
-    4k context, "thinking" switched off for models that have it).
+    and the GPU tiers, picked by the card's dedicated memory (weights plus
+    an 8k context and headroom):
+
+    | Model | Download | Needs | For |
+    |---|---|---|---|
+    | `gemma3:4b` | 3.3 GB | 6 GB | a 6 GB card |
+    | `qwen3:8b` | 5.2 GB | 9 GB | a 10 GB card, or a 16 GB Apple-silicon Mac |
+    | `gemma3:12b` | 8.1 GB | 12 GB | a 12 GB card - the best fit for most |
+    | `gemma3:27b` | 17 GB | 22 GB | a 24 GB card, or a 36 GB+ Apple-silicon Mac |
+
+    If the engine reports a model only partly on the GPU, pick the next
+    size down under *Model* - the Output pane says so when it happens.
+
+    *Download all the small ones* fetches the five CPU models (8.7 GB).
+    Any other model already in Ollama is listed too. Requests to the small
+    models are kept short for speed (the first ~5,000 characters of a file
+    plus its end, a 4k context, "thinking" switched off for models that
+    have it).
   - *Set up* (shown until a model is installed) - fetches the engine when
-    there is none (about 170 MB on a Mac, 1.5 GB on Windows, once), starts
-    it, and downloads `gemma3:1b`. `findex summarise --ai-remove` deletes
-    findex's copy of the engine again (the models, in `~/.ollama`, are
-    kept). `FINDEX_AI_URL` points findex at an Ollama running somewhere
-    other than `http://127.0.0.1:11434`.
+    there is none (about 170 MB on a Mac, 1.5 GB on Windows - the CUDA
+    libraries for NVIDIA cards are most of that - once), starts it, and
+    downloads **what suits this computer**: `gemma3:1b` always (so the
+    index still summarises on a laptop), the biggest GPU-tier model the
+    card can hold, and the embedding model for *Search by meaning*. That
+    is `findex summarise --ai-setup --model auto`, and it is what the
+    build scripts run. It finishes by loading the model and saying where
+    it landed. `findex summarise --ai-remove` deletes findex's copy of the
+    engine again (the models, in `~/.ollama`, are kept). `FINDEX_AI_URL`
+    points findex at an Ollama running somewhere other than
+    `http://127.0.0.1:11434`.
 - **More** - *Export this summary...* (`.html` is a self-contained page of
   sections and files with their kind, summary and key phrases; `.csv` is
   one file per row; `.json` and `.txt` too), *fewer / balanced / more
@@ -392,6 +455,56 @@ this folder**.
   leaves the index takes its card with it; a file that changes gets a new
   card on the next run (and loses its AI summary, which described the old
   text).
+
+**Search by meaning** (`~` in the search box; `findex embed`)
+
+Keyword search finds the words you remember. This finds what you *mean*:
+`~letter about the boiler warranty` lists the letter that says "Worcester
+Bosch guarantee" and never uses the word boiler. It is the one thing in
+findex that a graphics card changes from impractical to routine.
+
+- **How it works.** The text findex has already extracted is turned into
+  vectors by a local embedding model - Ollama's `nomic-embed-text` (274
+  MB), run by the same hidden engine the Summary tab uses, so nothing
+  leaves the computer. A search embeds your words the same way and ranks
+  files by how closely their vectors point the same way (cosine
+  similarity), then applies whatever else was in the query - `ext:`, a
+  drive or folder, `!word`, and `content:word` as a must-contain filter.
+  The best 300 files are listed, best first, each with its match
+  percentage and the passage that matched in the pane underneath.
+- **What is stored.** Each file with text gets pieces of about 1,200
+  characters - all of it up to 12 pieces (a few pages, which is most
+  files), otherwise 12 pieces spread evenly through the first 90,000
+  characters, start and end included. Each piece is 768 numbers at one
+  byte each plus a scale: about 780 bytes, so roughly two thirds of the
+  size of the text for short files, far less for long ones, in two tables
+  (`embeds`, `embedded`) in the same database. 55,000 documents come to a
+  few hundred MB on disk; searching holds the vectors in memory as a
+  matrix (about 120 MB for 150,000 pieces), loaded on the first `~` search
+  after the app opens (a second or so) and kept while they are unchanged.
+  Scoring 150,000 pieces takes well under a tenth of a second.
+- **Keeping it current.** A run only touches files whose text changed
+  since their vectors were made, and drops the vectors of files that have
+  gone - so with the Index tab's *Search by meaning* ticked, each index run
+  is followed by a short embedding run. The first run is the big one:
+  minutes for tens of thousands of documents on a graphics card, hours on
+  a CPU. Stop keeps what was done.
+- **Honest limits.** A long document is sampled, not read whole - what sits
+  between two pieces is invisible to meaning search (keyword search still
+  sees every word). Meaning search is ranking, not matching: there is
+  always a "best" result, which is why the percentage is shown; the list
+  stops where matches fall clearly short of the best one (20 points
+  below it, or under 35% outright), so a query nothing is about returns a
+  handful of rows, not 300. Files with no extracted text
+  (pictures, archives, names-only files) are not in it. Live typing waits
+  450 ms rather than 120 ms before searching, because each search is a
+  trip to the model.
+- **Command line.** `findex embed [FOLDER]` makes or updates the vectors
+  (`--rebuild` remakes them all; `--status` shows coverage and the model;
+  `--setup` fetches the engine and model; `--forget` drops them; `-q
+  "words"` tries a search). `findex find "~boiler warranty ext:pdf"`
+  searches, with `--json` / `--csv` as usual. Needs the `numpy` package,
+  which the app installs on its next start and the build scripts bake in.
 
 **Health tab** - what is wrong with the tree, read from the index
 
@@ -618,14 +731,26 @@ findex summarise D:\Shared --ai        ...then have the local model write one
 findex summarise --ai-files a.pdf b.docx   a summary of each, then of them all
 findex summarise --ai-section 12 -n 20     ...of 20 files of a section
 findex summarise --ai-files a.pdf b.docx --each   each only, no combined one
-findex summarise --ai-status           is a local model available?
-findex summarise --ai-models           the small, fast models findex suggests
+findex summarise --ai-status           is a local model available? what GPU?
+findex summarise --ai-check            load the model: did it land on the GPU?
+findex summarise --ai-models           the models findex suggests, marked for this GPU
 findex summarise --ai-setup            fetch the engine (no app), download gemma3:1b
+findex summarise --ai-setup --model auto          ...or what suits this computer:
+                                       gemma3:1b + the biggest GPU model that fits
+                                       + the embedding model (what the builds do)
 findex summarise --ai-setup --model llama3.2:1b   ...or the one you name
-findex summarise --ai-setup --model all           ...or all five (8.7 GB)
+findex summarise --ai-setup --model all           ...or all five small ones (8.7 GB)
 findex summarise --ai-stop             stop the engine findex started
 findex summarise --ai-remove           delete findex's copy of the engine
 findex summarise D:\Shared --forget    drop that folder's sections
+findex embed                           search by meaning: vectorise the indexed text
+findex embed D:\Shared                 ...just one folder (new/changed files only)
+findex embed --status                  coverage and model
+findex embed --setup                   fetch the engine and nomic-embed-text
+findex embed -q "boiler warranty"      try a meaning search
+findex embed --forget                  drop the vectors
+findex find "~boiler warranty letter"  search by meaning (filters still apply)
+findex find "~mortgage offer ext:pdf D:\Docs"
 findex tree                            export the index as a tree (Downloads)
 findex tree -o C:\out.csv --under D:\Work
 findex journal                         what changed, newest first
@@ -800,25 +925,35 @@ Each build ends by running the built app's own self-test and says what is
 wrong rather than Done if something is missing; the full run is in
 `build-win-log.txt` / `build-mac-log.txt`.
 
-**The AI summary models are installed by the build too.** As its last step
-each script fetches the AI engine if the machine has none - Ollama's
-standalone build, into findex's own data folder, with no app installed and
-no admin rights (see the Summary tab) - starts it, and downloads the five
-small models the Summary tab offers: about 8.7 GB of models plus the engine
-the first time, nothing on later builds because whatever is already there
-is skipped. So after a build, AI summaries simply work the first time the
-app is opened.
+**The AI models are installed by the build too, sized to the machine.** As
+its last step each script fetches the AI engine if the machine has none -
+Ollama's standalone build, into findex's own data folder, with no app
+installed and no admin rights (see the Summary tab) - starts it, looks at
+the graphics card, and downloads what suits the computer (`findex summarise
+--ai-setup --model auto`): the quick CPU model `gemma3:1b` (815 MB), the
+biggest GPU-tier model the card can hold (`gemma3:12b`, 8.1 GB, on a 12 GB
+card; nothing extra on a machine with no usable GPU) and the embedding
+model for search by meaning (`nomic-embed-text`, 274 MB). It then loads the
+model and prints whether the engine put it on the GPU - the honest check.
+Whatever is already there is skipped, so later builds download nothing. So
+after a build, AI summaries and search by meaning simply work the first
+time the app is opened.
 
 - The engine and models go onto *that machine* (the engine in findex's
   data folder, the models in `~/.ollama`), not into `dist/`: they are far
   too big to carry inside the app. Copy the app to another computer and *AI summaries > Set up* fetches
-  them there.
+  them there, sized to that computer.
 - Nothing in this step can fail the build - the app is complete without
   the models, and says so if they are missing.
 - Choose what is fetched with `FINDEX_AI_MODELS` before running the script:
-  `none` skips the step, `gemma3:1b` fetches just that one (815 MB), and
+  `none` skips the step, `all` fetches the five small CPU models instead
+  (8.7 GB), `gemma3:1b` fetches just that one (815 MB), and
   `gemma3:1b,llama3.2:1b` a list. Windows: `set FINDEX_AI_MODELS=none`
   then `build-exe.bat`; Mac: `FINDEX_AI_MODELS=none ./build-app.command`.
+- The Windows engine download (1.5 GB) carries Ollama's CUDA libraries,
+  which is why it is big - that is what makes an NVIDIA card usable
+  without installing anything else. The Mac build uses Metal on Apple
+  silicon as it is.
 
 ### The exe on a managed PC
 
@@ -847,7 +982,8 @@ so under `--only-binary` pip declares the whole thing impossible. Both builds
 allow an sdist for that one package - it is pure Python, so nothing compiles.
 
 Everything with compiled parts - PyMuPDF for PDF text, watchdog for live
-updates, the WinRT or Vision OCR bindings - is pip-installed at build time,
+updates, numpy for search by meaning, the WinRT or Vision OCR bindings - is
+pip-installed at build time,
 **one package per call, each with a lower bound**. Asked for together with no
 floors, pip walks backwards through dozens of releases re-checking every other
 package against each, and on Python 3.14 gives up with `resolution-too-deep`
@@ -886,7 +1022,18 @@ Explorer, which has its own opinions about long paths.)
   archives) can only be grouped by type and folder, and a folder of very
   short or very mixed documents leaves more in *Unsorted*. Document kinds and
   dates are read the British/English way (`03/04/2024` is 3 April). Written
-  summaries need Ollama running locally and take seconds per file.
+  summaries need the local AI engine running and take seconds per file on a
+  CPU - on a graphics card a much bigger model runs at the same speed, and
+  findex picks it automatically.
+- Search by meaning samples long documents (12 pieces of ~1,200 characters)
+  rather than reading them whole, needs the AI engine running to embed the
+  query, and holds the vectors in memory while searching (about 120 MB per
+  150,000 pieces). It is ranking, not matching - the percentage says how
+  close a result is.
+- Whether a model runs on the GPU is the engine's decision: an old graphics
+  driver, or a card the engine's build does not support (AMD on Windows
+  without ROCm, Intel Macs), leaves it on the CPU. The AI summaries menu
+  and `findex summarise --ai-check` say which happened.
 
 ## Licence
 

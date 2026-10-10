@@ -106,6 +106,7 @@ def selftest():
         print("engine     : FAILED - {}".format(exc))
 
     for label, mod in (("watchdog (live updates)", "watchdog.observers"),
+                       ("numpy (search by meaning)", "numpy"),
                        ("Vision (macOS OCR)", "Vision"),
                        ("winrt (Windows OCR)", "winrt.windows.media.ocr")):
         if mod == "Vision" and sys.platform != "darwin":
@@ -124,6 +125,14 @@ def selftest():
     except Exception as exc:
         ok = False
         print("desktop app: FAILED - {}".format(exc))
+    try:
+        import findex_summary
+        g = findex_summary.gpu_info()
+        print("GPU        : {}".format(
+            "{} ({} GB)".format(g["name"], g["vram_gb"]) if g["kind"]
+            else "none found - AI models run on the CPU"))
+    except Exception as exc:
+        print("GPU        : could not check - {}".format(exc))
 
     print("RESULT: {}".format("ok" if ok else "PROBLEMS FOUND"))
 

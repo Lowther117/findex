@@ -86,14 +86,33 @@ AI_MODELS = (
 )
 AI_MODEL = AI_MODELS[0][0]
 AI_MODELS_TOTAL = "8.7 GB"   # all of the above together
-# When several models are installed and none was chosen: smallest first.
+# Bigger models for a computer with a graphics card (or an Apple-silicon
+# Mac, whose memory the GPU shares). On a GPU a 12B model answers about as
+# fast as a 1B one does on a CPU, and writes far better summaries. Each
+# entry: the dedicated memory it needs in GB (weights plus an 8k-token
+# context and headroom), the Ollama tag, the download size, and a note.
+# The tiers are tried biggest-first against gpu_info()['vram_gb'].
+AI_TIERS = (
+    (6, "gemma3:4b", "3.3 GB", "a clear step up - for a 6 GB card"),
+    (9, "qwen3:8b", "5.2 GB", "for a 10 GB card, or a 16 GB Mac"),
+    (12, "gemma3:12b", "8.1 GB", "for a 12 GB card - the best fit for most"),
+    (22, "gemma3:27b", "17 GB", "for a 24 GB card or a 36 GB+ Mac"),
+)
+# When several models are installed and none was chosen: the biggest one
+# the GPU can hold (see pick_model), then smallest-first on a CPU.
 AI_PREFERRED = tuple(m for m, _, _ in AI_MODELS) + (
     "llama3.2", "gemma3", "qwen3.5", "qwen3", "granite4", "phi4-mini",
     "qwen2.5", "phi3", "mistral")
-AI_FILE_CHARS = 5000       # text sent for one file's summary
+AI_FILE_CHARS = 5000       # text sent for one file's summary (CPU models)
 AI_TAIL_CHARS = 1000       # ...plus the end of a long one
 AI_CONTEXT = 4096          # tokens of context asked for - small is fast
+AI_GPU_FILE_CHARS = 14000  # a GPU-tier model is given more of the file...
+AI_GPU_CONTEXT = 8192      # ...and the context to hold it
 AI_KEEP_ALIVE = "15m"      # keep the model loaded between requests
+# The model that turns text into vectors for "search by meaning" (findex
+# embed). Pulled by --ai-setup --model auto alongside the summary models.
+EMBED_MODEL = "nomic-embed-text"
+EMBED_MODEL_SIZE = "274 MB"
 
 
 # ----------------------------------------------------------------------------
@@ -1650,10 +1669,191 @@ def ai_status(url=None, timeout=1.5):
         return {"ok": False, "models": [], "error": str(exc)}
 
 
-def pick_model(models, wanted=None):
-    """The model to use: the one asked for if installed, else the first
-    installed one from a list of small general-purpose models, else
-    whatever is there. '' when nothing is installed."""
+def _run_quiet(cmd, timeout=8):
+    """stdout of a helper program, '' when it is missing or fails."""
+    kwargs = {"stdin": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x08000000           # no console flash
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, **kwargs).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _nvidia_smi():
+    exe = shutil.which("nvidia-smi")
+    if exe:
+        return exe
+    if os.name == "nt":
+        for cand in (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                  "System32", "nvidia-smi.exe"),
+                     os.path.join(os.environ.get("ProgramFiles", ""),
+                                  "NVIDIA Corporation", "NVSMI",
+                                  "nvidia-smi.exe")):
+            if os.path.isfile(cand):
+                return cand
+    return ""
+
+
+def _windows_gpus():
+    """[(name, dedicated bytes)] from the display adapters' registry keys -
+    the one place Windows records a card's full memory (WMI caps it at 4 GB)."""
+    out = []
+    try:
+        import winreg
+    except ImportError:
+        return out
+    base = (r"SYSTEM\CurrentControlSet\Control\Class"
+            r"\{4d36e968-e325-11ce-bfc1-08002be10318}")
+    try:
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base)
+    except OSError:
+        return out
+    with root:
+        for i in range(32):
+            try:
+                sub = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            try:
+                with winreg.OpenKey(root, sub) as k:
+                    name = winreg.QueryValueEx(k, "DriverDesc")[0]
+                    try:
+                        raw = winreg.QueryValueEx(
+                            k, "HardwareInformation.qwMemorySize")[0]
+                    except OSError:
+                        raw = winreg.QueryValueEx(
+                            k, "HardwareInformation.MemorySize")[0]
+                    if isinstance(raw, bytes):
+                        raw = int.from_bytes(raw[:8], "little")
+                    out.append((str(name), int(raw)))
+            except (OSError, ValueError, TypeError):
+                continue
+    return out
+
+
+_GPU = None
+
+
+def gpu_info(refresh=False):
+    """What there is to run a model on, looked up once per process:
+
+        {'kind': 'nvidia' | 'amd' | 'apple' | '',   ('' = CPU only)
+         'name': 'NVIDIA GeForce RTX 3080 Ti',
+         'vram_gb': 12.0,          dedicated memory a model can use
+         'unified': False}         Apple silicon: shared with the system
+
+    Only a description of the hardware - whether Ollama actually put a
+    model on it is a different question, answered by ai_placement()."""
+    global _GPU
+    if _GPU is not None and not refresh:
+        return _GPU
+    info = {"kind": "", "name": "", "vram_gb": 0.0, "unified": False}
+    import platform
+    if sys.platform == "darwin":
+        if "arm" in platform.machine().lower():
+            mem = _run_quiet(["/usr/sbin/sysctl", "-n", "hw.memsize"]).strip()
+            try:
+                total = int(mem) / float(1 << 30)
+            except ValueError:
+                total = 0.0
+            # Metal may take roughly two thirds of the unified memory; the
+            # rest is the system's. Intel Macs: Ollama runs them on the CPU.
+            info.update(kind="apple", name="Apple silicon ({:.0f} GB unified "
+                        "memory)".format(total), vram_gb=round(total * 0.67, 1),
+                        unified=True)
+        _GPU = info
+        return info
+    smi = _nvidia_smi()
+    if smi:
+        best = (0, "")
+        for line in _run_quiet([smi, "--query-gpu=name,memory.total",
+                                "--format=csv,noheader,nounits"]).splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 2 and parts[-1].isdigit():
+                mb = int(parts[-1])
+                if mb > best[0]:
+                    best = (mb, ",".join(parts[:-1]))
+        if best[0]:
+            info.update(kind="nvidia", name=best[1],
+                        vram_gb=round(best[0] / 1024.0, 1))
+            _GPU = info
+            return info
+    if os.name == "nt":
+        for name, size in sorted(_windows_gpus(), key=lambda x: -x[1]):
+            low = name.lower()
+            if size < (2 << 30):
+                continue                # integrated graphics: CPU territory
+            kind = "nvidia" if "nvidia" in low or "geforce" in low else \
+                "amd" if "amd" in low or "radeon" in low else ""
+            if kind:
+                info.update(kind=kind, name=name,
+                            vram_gb=round(size / float(1 << 30), 1))
+                break
+    _GPU = info
+    return info
+
+
+def gpu_line():
+    """One line about the GPU for logs and menus."""
+    g = gpu_info()
+    if not g["kind"]:
+        return "No graphics card the AI can use was found - models run on the CPU."
+    if g["unified"]:
+        return "{} - about {} GB of it available to models".format(
+            g["name"], g["vram_gb"])
+    return "{} with {} GB of memory".format(g["name"], g["vram_gb"])
+
+
+def tier_model(vram_gb=None):
+    """The biggest GPU-tier model that fits this much dedicated memory
+    ('' when none does - the CPU-sized default is the right one)."""
+    if vram_gb is None:
+        vram_gb = gpu_info()["vram_gb"]
+    chosen = ""
+    for need, name, _, _ in AI_TIERS:
+        if need <= vram_gb:
+            chosen = name
+    return chosen
+
+
+def is_tier(model):
+    """Is this one of the GPU-tier models (or the same family and size)?"""
+    base = (model or "").split(":")[0]
+    return any(model == m or model == m + ":latest" or
+               (base and m.startswith(base + ":") and
+                model.split(":")[-1] == m.split(":")[-1])
+               for _, m, _, _ in AI_TIERS)
+
+
+def auto_models(vram_gb=None):
+    """What --ai-setup --model auto downloads: the quick CPU model (always,
+    so summaries work everywhere the index goes), the best model this
+    computer's GPU can hold, and the embedding model for search by
+    meaning."""
+    out = [AI_MODEL]
+    big = tier_model(vram_gb)
+    if big:
+        out.append(big)
+    out.append(EMBED_MODEL)
+    return out
+
+
+def model_profile(model):
+    """How much to send a model and how much context to ask for: GPU-tier
+    models get more of each file - there is room, and they use it well."""
+    if is_tier(model):
+        return {"ctx": AI_GPU_CONTEXT, "file_chars": AI_GPU_FILE_CHARS}
+    return {"ctx": AI_CONTEXT, "file_chars": AI_FILE_CHARS}
+
+
+def pick_model(models, wanted=None, vram_gb=None):
+    """The model to use: the one asked for if installed; else the biggest
+    installed GPU-tier model this computer's graphics memory can hold; else
+    the first installed one from the list of small general-purpose models;
+    else whatever is there. '' when nothing is installed. Embedding
+    models are never picked for writing."""
     if not models:
         return ""
     def match(name):
@@ -1664,11 +1864,69 @@ def pick_model(models, wanted=None):
         return ""
     if wanted and match(wanted):
         return match(wanted)
+    if vram_gb is None:
+        vram_gb = gpu_info()["vram_gb"]
+    for need, name, _, _ in reversed(AI_TIERS):
+        if need <= vram_gb and match(name):
+            return match(name)
     for name in AI_PREFERRED:
         if match(name):
             return match(name)
-    usable = [m for m in models if "embed" not in m.lower()]
-    return (usable or models)[0]
+    usable = [m for m in models if not is_embedding(m)]
+    return usable[0] if usable else ""
+
+
+def is_embedding(model):
+    """Is this a model that only makes vectors (no /api/generate)?"""
+    low = (model or "").lower()
+    return "embed" in low or low.startswith(("bge-", "mxbai-", "snowflake-"))
+
+
+def ai_placement(url=None, model=None, timeout=5):
+    """Where the loaded model(s) actually sit, from Ollama's own account
+    (/api/ps): {'model': name, 'gpu_pct': 0-100, 'size_gb', 'text'}, or
+    None when nothing is loaded. This is the real GPU check - the
+    hardware being there means nothing if the engine fell back to the
+    CPU (a driver too old for its CUDA build, say)."""
+    url = (url or AI_URL).rstrip("/")
+    try:
+        with _http(url + "/api/ps", timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:                                          # noqa: BLE001
+        return None
+    loaded = data.get("models") or []
+    if model:
+        loaded = [m for m in loaded if m.get("name") in (model, model
+                                                          + ":latest")]
+    if not loaded:
+        return None
+    m = loaded[0]
+    size = int(m.get("size") or 0)
+    vram = int(m.get("size_vram") or 0)
+    pct = int(round(100.0 * vram / size)) if size else 0
+    pct = max(0, min(100, pct))
+    where = ("on the GPU" if pct >= 95 else
+             "split - {}% on the GPU, the rest on the CPU".format(pct)
+             if pct else "on the CPU")
+    return {"model": m.get("name", ""), "gpu_pct": pct,
+            "size_gb": round(size / float(1 << 30), 1), "text": where}
+
+
+def ai_warm(model, url=None):
+    """Load a model (a one-token request - or one tiny embedding for an
+    embedding model, which cannot generate) and say where it landed.
+    Returns the ai_placement dict, or None if the request failed."""
+    try:
+        if is_embedding(model):
+            with _http((url or AI_URL).rstrip("/") + "/api/embed",
+                       {"model": model, "input": "ok",
+                        "keep_alive": AI_KEEP_ALIVE}, timeout=300) as r:
+                r.read()
+        else:
+            ai_generate("Say OK.", model, url=url, max_tokens=1, timeout=300)
+    except Exception:                                          # noqa: BLE001
+        return None
+    return ai_placement(url, model)
 
 
 _THINK = re.compile(r"<think>.*?</think>", re.S | re.I)
@@ -1682,7 +1940,7 @@ def ai_generate(prompt, model, system=None, url=None, max_tokens=220,
     payload = {"model": model, "prompt": prompt, "stream": False,
                "think": False, "keep_alive": AI_KEEP_ALIVE,
                "options": {"temperature": 0.2, "num_predict": max_tokens,
-                           "num_ctx": AI_CONTEXT}}
+                           "num_ctx": model_profile(model)["ctx"]}}
     if system:
         payload["system"] = system
     data = None
@@ -1737,11 +1995,11 @@ AI_SAMPLE = 120            # files read per section for its combined summary
 AI_TOGETHER_MAX = 300      # files combined in one "selected files" summary
 
 
-def _file_text(conn, fid, chars):
+def _file_text(conn, fid, chars, head=AI_FILE_CHARS):
     row = conn.execute("SELECT substr(body, 1, ?) FROM docs WHERE rowid=?",
-                       (AI_FILE_CHARS, fid)).fetchone()
+                       (head, fid)).fetchone()
     text = (row[0] if row else "") or ""
-    if chars and chars > AI_FILE_CHARS + 2 * AI_TAIL_CHARS:
+    if chars and chars > head + 2 * AI_TAIL_CHARS:
         tail = conn.execute("SELECT substr(body, ?) FROM docs WHERE rowid=?",
                             (-AI_TAIL_CHARS, fid)).fetchone()
         if tail and tail[0]:
@@ -1758,7 +2016,7 @@ def ai_file(conn, fid, model, url=None):
     if not row or not row[1]:
         return ""
     name, chars, dt = row
-    text = _file_text(conn, fid, chars)
+    text = _file_text(conn, fid, chars, model_profile(model)["file_chars"])
     if not text.strip():
         return ""
     out = ai_generate("File name: {}\nKind: {}\n\nText:\n{}".format(
@@ -1882,7 +2140,26 @@ def _need_model(model, url, log):
             "summarise --ai-setup")
     elif model and not has_model([chosen], model):
         log("Model {} is not installed - using {}".format(model, chosen))
+    if chosen:
+        _say_placement(chosen, url, log)
     return chosen
+
+
+def _say_placement(model, url, log):
+    """One line, once a run: which model, and whether it is on the GPU."""
+    where = ai_warm(model, url)
+    if where:
+        log("Model {} ({} GB) is loaded {}.".format(
+            where["model"], where["size_gb"], where["text"]))
+        g = gpu_info()
+        if g["kind"] and where["gpu_pct"] < 95:
+            log("  ({} is present but the engine is not using {}it - {})"
+                .format(g["name"], "all of " if where["gpu_pct"] else "",
+                        "a smaller model (AI summaries > Model) would fit "
+                        "entirely" if where["gpu_pct"] else
+                        "a graphics driver update usually fixes that"))
+    else:
+        log("Using model {}.".format(model))
 
 
 def ai_run_sections(db, scope, model=None, url=None, progress=False,
@@ -2342,15 +2619,34 @@ def ai_stop(url=None, models=(), log=lambda *a: None):
         url = (url or AI_URL).rstrip("/")
         for m in models:
             try:
-                with _http(url + "/api/generate",
-                           {"model": m, "keep_alive": 0}, timeout=3) as r:
-                    r.read()
+                if is_embedding(m):     # cannot generate: unload via embed
+                    with _http(url + "/api/embed",
+                               {"model": m, "input": "", "keep_alive": 0},
+                               timeout=3) as r:
+                        r.read()
+                else:
+                    with _http(url + "/api/generate",
+                               {"model": m, "keep_alive": 0}, timeout=3) as r:
+                        r.read()
                 did = "unloaded"
-            except Exception:                                  # noqa: BLE001
+            except OSError as exc:
+                import urllib.error
+                if isinstance(exc, urllib.error.HTTPError):
+                    continue            # this model refused; try the rest
                 break                   # nothing answering: nothing loaded
+            except Exception:                                  # noqa: BLE001
+                continue
         if did:
             log("Unloaded the model findex was using.")
     return did
+
+
+def model_size(model):
+    """The download size findex knows for a model, or ''."""
+    sizes = dict((m, sz) for m, sz, _ in AI_MODELS)
+    sizes.update((m, sz) for _, m, sz, _ in AI_TIERS)
+    sizes[EMBED_MODEL] = EMBED_MODEL_SIZE
+    return sizes.get(model, "")
 
 
 def has_model(models, name):
@@ -2366,7 +2662,7 @@ def has_model(models, name):
 def ai_pull(model, url=None, progress=False, log=print):
     """Download one model through the running Ollama. True on success."""
     url = (url or AI_URL).rstrip("/")
-    size = dict((m, sz) for m, sz, _ in AI_MODELS).get(model)
+    size = model_size(model)
     log("Downloading the model {}{}...".format(
         model, " ({})".format(size) if size else ""))
     t0 = time.time()
@@ -2408,11 +2704,13 @@ def ai_setup(model=None, url=None, progress=False, log=print):
     there is none, start it (hidden), and download the model(s) wanted that
     are not already there.
 
-    model: one name; several separated by commas; "all" for every model in
-    AI_MODELS; or None = the default small one, and only when nothing usable
-    is installed yet. Returns 0 = ready; 2 = Ollama could not be installed
-    or started (get it from ollama.com/download); 3 = it is running but a
-    download failed."""
+    model: one name; several separated by commas; "all" for every small
+    model in AI_MODELS; "auto" for what suits this computer (the quick
+    CPU model, the biggest GPU-tier model its graphics card can hold, and
+    the embedding model for search by meaning); or None = the default
+    small one, and only when nothing usable is installed yet. Returns 0 =
+    ready; 2 = Ollama could not be installed or started (get it from
+    ollama.com/download); 3 = it is running but a download failed."""
     url = (url or AI_URL).rstrip("/")
     st = ai_start(url, log, install=True, progress=progress)
     if not st["ok"]:
@@ -2427,6 +2725,13 @@ def ai_setup(model=None, url=None, progress=False, log=print):
         wanted = [AI_MODEL]
     elif model.strip().lower() == "all":
         wanted = [m for m, _, _ in AI_MODELS]
+    elif model.strip().lower() == "auto":
+        log(gpu_line())
+        wanted = auto_models()
+        big = tier_model()
+        log("Models for this computer: {}{}".format(
+            ", ".join(wanted), "" if big else
+            " (no GPU-size model - nothing here could hold one)"))
     else:
         wanted = [m.strip() for m in model.split(",") if m.strip()]
     failed = []
@@ -2441,6 +2746,11 @@ def ai_setup(model=None, url=None, progress=False, log=print):
     log("Local AI {}: {}".format(
         "is ready" if st["models"] else "has no models",
         ", ".join(st["models"]) or "-"))
+    chosen = pick_model(st["models"])
+    if chosen:
+        # The honest GPU check: load the model that will be used and ask
+        # the engine where it put it.
+        _say_placement(chosen, url, log)
     return 3 if failed else 0
 
 
@@ -2658,25 +2968,62 @@ def cmd_summarise(args):
     url = args.ai_url
     if args.ai_status:
         st = ai_status(url)
+        print(gpu_line())
         if st["ok"]:
             print("Local AI is running at {} - models: {}".format(
                 url or AI_URL, ", ".join(st["models"]) or "none installed"))
-            print("Would use: " + (pick_model(st["models"], args.model)
-                                   or "(nothing - run --ai-setup)"))
+            chosen = pick_model(st["models"], args.model)
+            print("Would use: " + (chosen or "(nothing - run --ai-setup)"))
+            where = ai_placement(url, chosen) if chosen else None
+            if where:
+                print("Loaded now: {} ({} GB) {}".format(
+                    where["model"], where["size_gb"], where["text"]))
+            elif chosen:
+                print("Not loaded at the moment - the next summary loads "
+                      "it (findex summarise --ai-check tells you where it "
+                      "lands).")
         else:
             print("Local AI is not running at {} ({})".format(
                 url or AI_URL, st["error"]))
             print("engine: " + (find_ollama() or "not downloaded yet"))
         return 0 if st["ok"] else 1
+    if args.ai_check:
+        st = ai_start(url, log)
+        if not st["ok"]:
+            print("Local AI is not running ({}).".format(st["error"]))
+            return 1
+        print(gpu_line())
+        chosen = pick_model(st["models"], args.model)
+        if not chosen:
+            print("No model installed - run --ai-setup first.")
+            return 1
+        _say_placement(chosen, url, print)
+        return 0
     if args.ai_models:
         st = ai_status(url)
         have = set(st["models"])
+        g = gpu_info()
+        print(gpu_line())
         print("Small, fast models for summaries (findex summarise "
               "--ai-setup --model NAME downloads one):")
         for name, size, note in AI_MODELS:
             print("  {:<16} {:>7}  {}{}".format(
                 name, size, note, "   [installed]" if name in have else ""))
-        other = sorted(have - {m for m, _, _ in AI_MODELS})
+        print("Bigger models for a graphics card (the one marked * fits "
+              "this computer):")
+        best = tier_model()
+        for need, name, size, note in AI_TIERS:
+            print("  {:<16} {:>7}  needs {:>2} GB  {}{}{}".format(
+                name, size, need, note,
+                "  *" if name == best else "",
+                "   [installed]" if name in have else ""))
+        print("  {:<16} {:>7}  turns text into vectors for search by "
+              "meaning (findex embed){}".format(
+                  EMBED_MODEL, EMBED_MODEL_SIZE,
+                  "   [installed]" if has_model(have, EMBED_MODEL) else ""))
+        print("--ai-setup --model auto downloads: " + ", ".join(auto_models()))
+        other = sorted(have - {m for m, _, _ in AI_MODELS}
+                       - {m for _, m, _, _ in AI_TIERS})
         if other:
             print("Also installed: " + ", ".join(other))
         return 0
@@ -2830,11 +3177,16 @@ def add_commands(sub):
     p.add_argument("--ai-url", default=None,
                    help="Ollama address (default {})".format(AI_URL))
     p.add_argument("--ai-status", action="store_true",
-                   help="is a local model available?")
+                   help="is a local model available, and what GPU is there?")
+    p.add_argument("--ai-check", action="store_true",
+                   help="load the model that would be used and report "
+                        "whether the engine put it on the GPU or the CPU")
     p.add_argument("--ai-setup", action="store_true",
                    help="fetch the AI engine into findex's own folder (no "
                         "app is installed), start it and download a model "
-                        "(--model picks which; default {})".format(AI_MODEL))
+                        "(--model picks which: a name, a list, 'all' for "
+                        "every small one, or 'auto' for what suits this "
+                        "computer's GPU; default {})".format(AI_MODEL))
     p.add_argument("--ai-remove", action="store_true",
                    help="delete findex's own copy of the AI engine (the "
                         "downloaded models are kept)")

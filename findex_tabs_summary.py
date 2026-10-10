@@ -777,18 +777,27 @@ class SummaryTab:
         m.delete(0, "end")
         models = [x for x in st["models"] if "embed" not in x.lower()]
         ready = st["ok"] and bool(models)
+        gpu = fs.gpu_info()
         if ready:
             current = fs.pick_model(models, self.var_smodel.get().strip()
                                     or None)
             self.var_smodel.set(current)
             m.add_command(label="Ready - using {}".format(current),
                           state="disabled")
+            where = st.get("where")
+            if where and where.get("model") == current:
+                m.add_command(label="    loaded {}".format(where["text"]),
+                              state="disabled")
         elif st["ok"]:
             m.add_command(label="Ready for a model - none downloaded yet",
                           state="disabled")
         else:
             m.add_command(label="Not set up yet (optional)",
                           state="disabled")
+        m.add_command(label="    " + (
+            "{} - {} GB for models".format(gpu["name"], gpu["vram_gb"])
+            if gpu["kind"] else "No graphics card found - models run on "
+                                "the CPU"), state="disabled")
         m.add_separator()
         m.add_command(label="Summarise the selected files  "
                             "(each one, then all of them together)",
@@ -806,6 +815,13 @@ class SummaryTab:
         if models:
             sub.add_separator()
         offered = 0
+        best = fs.tier_model()
+        if best and not fs.has_model(models, best):
+            offered += 1
+            sub.add_command(
+                label="Download {}   {}  -  the best fit for this "
+                      "computer's GPU".format(best, fs.model_size(best)),
+                command=lambda n=best: self.summary_ai_setup(n))
         for name, size, note in fs.AI_MODELS:
             if name in models:
                 continue
@@ -813,9 +829,21 @@ class SummaryTab:
             sub.add_command(
                 label="Download {}   {}  -  {}".format(name, size, note),
                 command=lambda n=name: self.summary_ai_setup(n))
+        others = [(need, name, size, note) for need, name, size, note
+                  in fs.AI_TIERS if name != best and name not in models]
+        if others:
+            big = tk.Menu(sub, tearoff=0)
+            self._menus.append(big)
+            for need, name, size, note in others:
+                big.add_command(
+                    label="Download {}   {}  -  needs a {} GB card; {}"
+                    .format(name, size, need, note),
+                    command=lambda n=name: self.summary_ai_setup(n))
+            sub.add_cascade(label="Bigger models (need a graphics card)",
+                            menu=big)
         if offered > 1:
             sub.add_command(
-                label="Download all of them   {} in total".format(
+                label="Download all the small ones   {} in total".format(
                     fs.AI_MODELS_TOTAL),
                 command=lambda: self.summary_ai_setup("all"))
         if not offered:
@@ -823,9 +851,18 @@ class SummaryTab:
                             state="disabled")
         m.add_cascade(label="Model", menu=sub)
         if not ready:
-            m.add_command(label="Set up (downloads {}, {})".format(
-                fs.AI_MODELS[0][0], fs.AI_MODELS[0][1]),
+            m.add_command(label="Set up (downloads {})".format(
+                self._summary_auto_text()),
                 command=self.summary_ai_setup)
+
+    def _summary_auto_text(self):
+        """'gemma3:1b (815 MB) and gemma3:12b (8.1 GB), plus nomic-embed-text
+        (274 MB) for search by meaning' - what Set up fetches here."""
+        names = [m for m in fs.auto_models() if m != fs.EMBED_MODEL]
+        return " and ".join("{} ({})".format(n, fs.model_size(n))
+                            for n in names) + \
+            ", plus {} ({}) for search by meaning".format(
+                fs.EMBED_MODEL, fs.EMBED_MODEL_SIZE)
 
     def _summary_ai_cmd(self):
         cmd = _g().engine_command() + ["--db", self.var_db.get(), "summarise",
@@ -843,13 +880,12 @@ class SummaryTab:
             return True
         if messagebox.askyesno(
                 "AI summaries are not set up",
-                "Written summaries need a small language model on this "
-                "computer. Setting up downloads {} ({}){}. No app is "
-                "installed - it stays in findex's own folder and runs "
-                "hidden, only while findex is open. Nothing is sent "
-                "anywhere.\n\nSet it up now?"
-                .format(fs.AI_MODELS[0][0], fs.AI_MODELS[0][1],
-                        self._summary_engine_note())):
+                "Written summaries need a language model on this computer. "
+                "Setting up downloads {}{}. No app is installed - it stays "
+                "in findex's own folder and runs hidden, only while findex "
+                "is open. Nothing is sent anywhere.\n\n{}\n\nSet it up now?"
+                .format(self._summary_auto_text(),
+                        self._summary_engine_note(), fs.gpu_line())):
             self.summary_ai_setup(confirm=False)
         return False
 
@@ -919,17 +955,20 @@ class SummaryTab:
         default small one when None)."""
         if self._summary_busy():
             return
-        name = model or fs.AI_MODELS[0][0]
-        size = dict((m, s) for m, s, _ in fs.AI_MODELS).get(name, "")
+        name = model or "auto"
+        size = fs.model_size(name)
         if name == "all":
-            name, size = "all", fs.AI_MODELS_TOTAL + " in total"
+            size = fs.AI_MODELS_TOTAL + " in total"
+        what = ("Every suggested small model" if name == "all" else
+                self._summary_auto_text() if name == "auto" else name)
         if confirm and not messagebox.askyesno(
                 "Download {}?".format("all the suggested models"
-                                      if name == "all" else name),
+                                      if name == "all" else
+                                      "the models for this computer"
+                                      if name == "auto" else name),
                 "{}{} will be downloaded{}. It all runs on this "
                 "computer.\n\nProgress shows on the Index tab. Go ahead?"
-                .format("Every suggested model" if name == "all" else name,
-                        " ({})".format(size) if size else "",
+                .format(what, " ({})".format(size) if size else "",
                         "" if self._sai["ok"] else
                         self._summary_engine_note())):
             return
@@ -938,11 +977,11 @@ class SummaryTab:
                                        "--ai-setup", "--model", name,
                                        "--progress"]
         self._progress_est = 0
-        self.launch(cmd, "summary-setup", "Getting {}...".format(
-            "the AI models" if name == "all" else name))
+        what = ("the AI models" if name == "all" else
+                "the models for this computer" if name == "auto" else name)
+        self.launch(cmd, "summary-setup", "Getting {}...".format(what))
         self._summary_progress_begin(
-            "summary-setup", "Getting {} ready...".format(
-                "the AI models" if name == "all" else name))
+            "summary-setup", "Getting {} ready...".format(what))
 
     def _summary_finished(self, kind, code):
         """The engine child for this tab ended."""
@@ -955,12 +994,15 @@ class SummaryTab:
             if code == 2:
                 self._snote = ("The AI model could not be reached - see "
                                "the Index tab's Output.")
-                self._summary_ai_check()
+            self._summary_ai_check()    # also notes where the model landed
             self.summary_load()
         elif kind == "summary-setup":
             want, self._swant_model = self._swant_model, ""
-            if code == 0 and want == "all":
+            if code == 0 and want in ("all", "auto"):
                 self.var_sstatus.set("The AI models are installed.")
+                if want == "auto":
+                    self.var_smodel.set("")     # let pick_model choose
+                    self._summary_save_prefs()
             elif code == 0 and want:
                 self.var_smodel.set(want)
                 self._summary_save_prefs()
@@ -1001,11 +1043,14 @@ class SummaryTab:
         self._sai["at"] = time.time()
 
         def work():
+            fs.gpu_info()               # looked up once, off the UI thread
             st = fs.ai_status()
             if not st["ok"] and fs.find_ollama():
                 # installed (a build does that) but not running: start it,
                 # so the models it already has are simply there to use
                 st = fs.ai_start(log=lambda *a: None)
+            if st["ok"]:
+                st["where"] = fs.ai_placement()     # None unless loaded
             self.msgs.put(("call", self._summary_ai_state, (st,)))
         threading.Thread(target=work, daemon=True).start()
 
