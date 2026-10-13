@@ -27,7 +27,7 @@ and no machine-specific path is ever stored.
 | `findex.py` | engine | engine | The indexer and search engine, and the CLI itself (`python findex.py ...`). The app runs this in the background. |
 | `findex_gui.py` | the app | the app | The Tkinter window. The launchers run it; `python findex_gui.py` works too. |
 | `findex_app.py` | build only | build only | Entry point compiled into the standalone exe/app. Not run directly. |
-| `theme.py` | the app | the app | The shared light/dark palette and ttk styling the window uses. Not run directly. |
+| `theme.py` | the app | the app | The shared house palettes (Phosphor purple, Dark, Light) and ttk styling the window uses. Not run directly. |
 | `findex_tabs.py` | the app | the app | The Health, Duplicates, Rename and Verify tabs. Part of the app; not run directly. |
 | `findex_tabs_organise.py` | the app | the app | The Organise tab. Part of the app; not run directly. |
 | `findex_tabs_summary.py` | the app | the app | The Summary tab. Part of the app; not run directly. |
@@ -65,7 +65,7 @@ Findex/
   findex_tabs.py      the Health, Duplicates, Rename and Verify tabs
   findex_tabs_organise.py   the Organise tab
   findex_tabs_summary.py    the Summary tab
-  theme.py            light/dark palette + styling for the app
+  theme.py            phosphor/dark/light palettes + styling for the app
   findex_app.py       entry point for the optional standalone build
   findex.bat          CLI launcher (Windows)
   findex-gui.bat      GUI launcher (Windows) - double-click this
@@ -139,9 +139,9 @@ PDFs and OCR are not re-run for this.)
 
 Every control describes itself: hover over it and the description appears
 immediately as grey text in the status bar, with a balloon after a short pause.
-Help > Search syntax has the query cheat-sheet. The app opens in dark mode;
-Appearance > Dark mode (or Ctrl+D) switches to light and back, and the choice
-is remembered in `findex_gui.json`.
+Help > Search syntax has the query cheat-sheet. The app opens in the Phosphor purple
+theme (the same look as Winnow); the Appearance menu picks Phosphor purple, Dark
+or Light, Ctrl+D cycles them, and the choice is remembered in `findex_gui.json`.
 
 **Search tab**
 

@@ -52,7 +52,7 @@ if not getattr(sys, "frozen", False) and _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 import findex  # noqa: E402
-import theme   # noqa: E402  - the shared light/dark palettes + ttk styling
+import theme   # noqa: E402  - the shared house palettes (phosphor/dark/light) + ttk styling
 import findex_tabs  # noqa: E402  - the Health / Duplicates / Rename / Verify tabs
 import findex_schedule  # noqa: E402  - the background refresh (OS scheduler)
 
@@ -82,6 +82,7 @@ DEFAULTS = {
     "include_cloud": False,
     "ocr": False,
     "dark": True,
+    "theme": "",                  # phosphor | dark | light; "" = decide from "dark"
     "auto_index": False,
     "auto_minutes": 60,
     "bg_hours": 6,
@@ -137,9 +138,12 @@ def load_settings():
             # settings written by the old three-way Appearance menu
             if "dark" not in saved and saved.get("theme") == "light":
                 data["dark"] = False
+            if "dark" not in saved:     # that menu's "theme" meant light/dark/system
+                data["theme"] = ""
     except (OSError, ValueError):
         pass
     data["dark"] = bool(data.get("dark", True))
+    data["theme"] = theme.from_settings(data)   # phosphor purple by default
     # Relative paths resolve against this folder. An absolute one that no longer
     # exists - the folder was moved, or the index was pointed somewhere else on
     # another machine - falls back to the index next to this script rather than
@@ -1080,7 +1084,8 @@ class FindexApp(findex_tabs.ToolTabs):
         self._tip_win = None
         self._setup_retried = False
         self._pending_index = False
-        self.pal = dict(theme.DARK, **palette_extras(theme.DARK))
+        _p = theme.palette(theme.from_settings(settings))
+        self.pal = dict(_p, **palette_extras(_p))
         self._menus = []                 # classic tk menus, recoloured on toggle
         self._spins = []                 # classic tk Spinboxes (Tk 8.5 fallback)
         self._clip = {"paths": [], "move": False}
@@ -1118,7 +1123,7 @@ class FindexApp(findex_tabs.ToolTabs):
         self._build_layout()
         self.apply_theme()
         self._fit_window()
-        # Ctrl+D toggles dark mode. Entry/Text widgets have an emacs-style
+        # Ctrl+D cycles the theme (Phosphor -> Dark -> Light). Entry/Text widgets have an emacs-style
         # Ctrl+D (delete a character) class binding, which is replaced so the
         # toggle is the only thing that happens.
         toggle = lambda e: (self.toggle_dark(), "break")[1]   # noqa: E731
@@ -1199,7 +1204,7 @@ class FindexApp(findex_tabs.ToolTabs):
         self.var_rebuild = tk.BooleanVar(value=bool(c.get("rebuild", False)))
         self.var_cloud = tk.BooleanVar(value=bool(c.get("include_cloud", False)))
         self.var_ocr = tk.BooleanVar(value=bool(c.get("ocr", False)))
-        self.var_dark = tk.BooleanVar(value=bool(c.get("dark", True)))
+        self.var_theme = tk.StringVar(value=theme.from_settings(c))
         self.var_auto = tk.BooleanVar(value=bool(c.get("auto_index", False)))
         self.var_auto_mins = tk.IntVar(value=int(c.get("auto_minutes", 60)))
         self.var_auto_next = tk.StringVar(value="")
@@ -1262,8 +1267,12 @@ class FindexApp(findex_tabs.ToolTabs):
 
         m = tk.Menu(bar, tearoff=0)
         self._menus.append(m)
-        m.add_checkbutton(label="Dark mode", accelerator="Ctrl+D",
-                          variable=self.var_dark, command=self.apply_theme)
+        for key in theme.ORDER:
+            m.add_radiobutton(label=theme.label(key), value=key,
+                              variable=self.var_theme, command=self.apply_theme)
+        m.add_separator()
+        m.add_command(label="Next theme", accelerator="Ctrl+D",
+                      command=self.toggle_dark)
         bar.add_cascade(label="Appearance", menu=m)
 
         m = tk.Menu(bar, tearoff=0)
@@ -1278,16 +1287,15 @@ class FindexApp(findex_tabs.ToolTabs):
     # -- appearance --------------------------------------------------------
 
     def toggle_dark(self):
-        self.var_dark.set(not self.var_dark.get())
+        self.var_theme.set(theme.next_theme(self.var_theme.get()))
         self.apply_theme()
 
     def apply_theme(self):
         """One coherent, high-contrast look drawn entirely from the shared
-        palette (theme.py) - dark by default, light on request, remembered
-        between runs. The ttk styles come from theme.apply; everything that
+        palette (theme.py) - Phosphor purple by default, Dark and Light on
+        request (Ctrl+D cycles them), remembered between runs. The ttk styles come from theme.apply; everything that
         is a classic tk widget is recoloured here to match."""
-        dark = bool(self.var_dark.get())
-        c = theme.apply(self.root, dark)
+        c = theme.apply(self.root, self.var_theme.get())
         pal = dict(c, **palette_extras(c))
         self.pal = pal
         style = ttk.Style(self.root)
@@ -3431,7 +3439,8 @@ class FindexApp(findex_tabs.ToolTabs):
             "workers": int_of(self.var_workers),
             "include_cloud": bool(self.var_cloud.get()),
             "ocr": bool(self.var_ocr.get()),
-            "dark": bool(self.var_dark.get()),
+            "theme": theme.resolve(self.var_theme.get()),
+            "dark": theme.is_dark(self.var_theme.get()),
             "auto_index": bool(self.var_auto.get()),
             "auto_minutes": int_of(self.var_auto_mins, 60) or 60,
             "bg_hours": int_of(self.var_bg_hours, 6) or 6,
