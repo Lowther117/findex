@@ -488,6 +488,10 @@ def cmd_snapshot(args):
 
 
 def cmd_verify(args):
+    if args.disk and not args.folder and not args.against:
+        sys.stderr.write("--disk walks a folder on disk: give it with "
+                         "--folder FOLDER.\n")
+        return 2
     try:
         head, a = read_snapshot(args.snapshot)
     except (OSError, ValueError) as exc:

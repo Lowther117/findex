@@ -46,7 +46,9 @@ import sqlite3
 import sys
 import time
 import zipfile
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import TimeoutError as FuturesTimeout
+from concurrent.futures.process import BrokenProcessPool
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -139,6 +141,9 @@ OCR_MAX_SIDE = 2500      # an image is shrunk to this many px on its longest
                          # side before OCR - plenty for text, kind to the engine
 OCR_MIN_SIDE = 64        # anything smaller is an icon or a button, not a page
 OCR_ENABLED = os.environ.get("FINDEX_OCR") == "1"
+# Stored in the error column of an ok/empty row read with OCR on (the column
+# is only ever shown for status='error' rows).
+OCR_MARK = "ocr"
 
 DOC_EXTS = {".pdf", ".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".rtf",
             ".epub", ".odt", ".ods", ".odp",     # ebooks + LibreOffice
@@ -887,17 +892,34 @@ def _pptx(path):
     return _zip_parts(path, wanted)
 
 
-_RTF_HEX = re.compile(r"\\'[0-9a-fA-F]{2}")
+_RTF_HEX = re.compile(r"\\'([0-9a-fA-F]{2})")
 _RTF_CTRL = re.compile(r"\\[a-zA-Z]+-?\d* ?")
 _RTF_BRACE = re.compile(r"[{}]")
+_RTF_CPG = re.compile(r"\\ansicpg(\d+)")
+# \uN is a UTF-16 unit as a signed decimal, followed by one fallback
+# character for readers without Unicode (\uc1, the default) - dropped here.
+_RTF_UNI = re.compile(r"\\u(-?\d+) ?(?:\\'[0-9a-fA-F]{2}|[^\\{}])?")
+_RTF_UNI0 = re.compile(r"\\u(-?\d+) ?")
 
 
 def _rtf(path):
     with open(path, "rb") as fh:
         raw = fh.read(MAX_TEXT_CHARS * 4).decode("latin-1", "ignore")
-    raw = _RTF_HEX.sub(" ", raw)
+    # \'e9 is a byte in the document's code page (\ansicpg, else 1252)
+    m = _RTF_CPG.search(raw[:2000])
+    codepage = "cp" + m.group(1) if m else "cp1252"
+    try:
+        b"a".decode(codepage)
+    except LookupError:
+        codepage = "cp1252"
+    raw = _RTF_HEX.sub(
+        lambda h: bytes([int(h.group(1), 16)]).decode(codepage, "ignore"), raw)
+    uni = _RTF_UNI0 if "\\uc0" in raw else _RTF_UNI
+    raw = uni.sub(lambda u: chr(int(u.group(1)) % 65536), raw)
     raw = _RTF_CTRL.sub(" ", raw)
-    return _RTF_BRACE.sub(" ", raw)
+    raw = _RTF_BRACE.sub(" ", raw)
+    # characters beyond U+FFFF arrive as two \uN halves: join them
+    return raw.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
 
 
 def _plain(path):
@@ -905,7 +927,28 @@ def _plain(path):
         raw = fh.read(MAX_TEXT_CHARS * 4)
     if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
         return raw.decode("utf-16", "ignore")
-    return raw.decode("utf-8", "ignore")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", "ignore")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.reason == "unexpected end of data" \
+                and len(raw) == MAX_TEXT_CHARS * 4:
+            # valid UTF-8, a character cut in two by the read cap
+            return raw.decode("utf-8", "ignore")
+    # not UTF-8: the usual Windows legacy encoding (cafe with an acute
+    # accent saved by Notepad, older Office exports)
+    return raw.decode("cp1252", "ignore")
+
+
+_SCRIPT_STYLE = re.compile(rb"<(script|style)\b.*?</\1\s*>", re.S | re.I)
+
+
+def _html(path):
+    """A web page as its words: tags, scripts and styles dropped, entities
+    decoded - the same flattening EPUB chapters get."""
+    data = _plain(path).encode("utf-8")
+    return _xml_text(_SCRIPT_STYLE.sub(b" ", data))
 
 
 def _clean(text):
@@ -945,12 +988,18 @@ def extract_one(path):
             text = _audio(p)
         elif ext in IMAGE_EXTS:
             text = _image(p)
+        elif ext in (".html", ".htm"):
+            text = _html(p)
         else:
             text = _plain(p)
     except Exception as exc:
         return path, "error", (type(exc).__name__ + ": " + str(exc))[:200], ""
     text = _clean(text)[:MAX_TEXT_CHARS]
-    return path, ("ok" if text else "empty"), "", text
+    # A PDF or picture read with OCR on is noted, so turning OCR on later
+    # re-reads the ones read without it - and only those.
+    note = OCR_MARK if OCR_ENABLED and (ext == ".pdf" or ext in IMAGE_EXTS) \
+        else ""
+    return path, ("ok" if text else "empty"), note, text
 
 
 # ----------------------------------------------------------------------------
@@ -1267,11 +1316,14 @@ def open_db(path, timeout=60):
 # Filesystem walk
 # ----------------------------------------------------------------------------
 
-def walk(roots):
+def walk(roots, unlistable=None):
     """Yield (path, name, ext, size, mtime, is_cloud_placeholder, is_dir) for
     EVERY file AND folder under the roots. Folders are yielded too - ext ''
     and size 0 - so folder names are searchable, the way Everything mixes
-    files and folders. What to do with each entry is the caller's decision."""
+    files and folders. What to do with each entry is the caller's decision.
+    A folder that cannot be listed (permissions, a share dropping out) is
+    appended to `unlistable` when a list is given: what is under it is
+    unknown, not gone."""
     stack = [os.path.abspath(r) for r in roots]
     while stack:
         d = stack.pop()
@@ -1280,6 +1332,8 @@ def walk(roots):
             # it: entry.path would carry \\?\ into the index and the GUI.
             it = os.scandir(lp(d))
         except OSError:
+            if unlistable is not None:
+                unlistable.append(d)
             continue
         with it:
             for entry in it:
@@ -1350,7 +1404,109 @@ DROP_TEXT = ("DELETE FROM docs WHERE rowid IN "
              "(SELECT id FROM files WHERE path=? AND chars>0)")
 
 
-def flush(conn, executor, batch, stats):
+def _stall_limit():
+    """Seconds an extraction batch may go without a single result before the
+    workers are taken to be hung. Generous: an OCR'd scan is up to
+    OCR_MAX_PAGES pages at tesseract's 120 s per page."""
+    return OCR_MAX_PAGES * 120 + 60 if OCR_ENABLED else 300
+
+
+class ExtractPool:
+    """The worker processes, replaceable: a worker that crashes (a native
+    library falling over on one bad file) breaks a ProcessPoolExecutor for
+    good, and one that hangs never hands its result back. Either used to end
+    or stall the whole run - and, the file still being there, every later
+    run too."""
+
+    def __init__(self, workers):
+        self.workers = workers
+        self.ex = ProcessPoolExecutor(max_workers=workers)
+
+    def reset(self):
+        self.close(kill=True)
+        self.ex = ProcessPoolExecutor(max_workers=self.workers)
+
+    def close(self, kill=False):
+        ex = self.ex
+        if kill:
+            # A hung worker would otherwise keep the run (and its exit)
+            # waiting for it forever.
+            for proc in list((getattr(ex, "_processes", None) or {}).values()):
+                try:
+                    proc.terminate()
+                except Exception:                              # noqa: BLE001
+                    pass
+        try:
+            ex.shutdown(wait=not kill, cancel_futures=True)
+        except Exception:                                      # noqa: BLE001
+            pass
+
+
+def _extract_many(paths):
+    """Worker entry point for a small group of files (fewer round trips)."""
+    return [extract_one(p) for p in paths]
+
+
+def _extract_round(pool, parts, limit):
+    """Extract each group of paths in `parts` across the pool, yielding
+    results as they arrive. Returns the groups still outstanding, in the
+    order they were submitted, if the pool broke or stalled - [] otherwise."""
+    pending = {}
+    submitted = 0
+    try:
+        for part in parts:
+            pending[pool.ex.submit(_extract_many, part)] = submitted
+            submitted += 1
+    except (BrokenProcessPool, RuntimeError):
+        pass                           # a worker already died: retried below
+    failed = []
+    while pending:
+        done, _ = wait(pending, timeout=limit, return_when=FIRST_COMPLETED)
+        if not done:                   # nothing finished in `limit` seconds
+            break
+        for fut in done:
+            i = pending.pop(fut)
+            if fut.exception() is not None:
+                failed.append(i)
+                continue
+            for result in fut.result():
+                yield result
+    left = sorted(failed + list(pending.values()))
+    left.extend(range(submitted, len(parts)))
+    return [parts[i] for i in left]
+
+
+def extract_batch(pool, paths):
+    """Yield (path, status, error, text) for every path, whatever the
+    workers do. After a crash or a stall the pool is rebuilt; the files
+    that were in flight (the oldest outstanding ones) are re-run one at a
+    time to find the culprit, which is recorded as an error, and the rest
+    go back to the pool."""
+    limit = _stall_limit()
+    parts = [paths[i:i + 8] for i in range(0, len(paths), 8)]
+    while parts:
+        parts = yield from _extract_round(pool, parts, limit)
+        if not parts:
+            return
+        pool.reset()
+        # At most every worker, plus the queue in front of them, held work.
+        n = pool.workers * 2 + 1
+        suspects, parts = parts[:n], parts[n:]
+        for path in (p for part in suspects for p in part):
+            try:
+                yield pool.ex.submit(extract_one, path).result(timeout=limit)
+                continue
+            except FuturesTimeout:
+                why = ("extractor timed out on this file (no result in "
+                       "{} s)".format(limit))
+            except Exception:                                  # noqa: BLE001
+                why = "extractor crashed on this file"
+            sys.stderr.write("{}: {}\n".format(why, path))
+            pool.reset()
+            yield path, "error", why, ""
+
+
+def flush(conn, pool, batch, stats):
     """Extract a batch in parallel and write the results in one transaction."""
     meta = {}
     for rec in batch:
@@ -1359,7 +1515,7 @@ def flush(conn, executor, batch, stats):
     now = time.time()
     cur = conn.cursor()
     cur.execute("BEGIN")
-    for path, status, error, text in executor.map(extract_one, paths, chunksize=8):
+    for path, status, error, text in extract_batch(pool, paths):
         _, name, ext, size, mtime = meta[path]
         values = (path, name, ext, size, mtime, now,
                   len(text), status, error or None, 0)
@@ -1533,11 +1689,15 @@ def _cmd_index(args):
     roots = args.roots or saved_roots(conn)
     # Files read by an older, worse extractor are read once more even though
     # they have not changed - only the cheap zip-based formats, never PDFs/OCR.
-    try:
-        stale_exts = (REEXTRACT_EXTS if int(get_meta(conn, "extract_version") or 1)
-                      < EXTRACT_VERSION else frozenset())
-    except (TypeError, ValueError):
-        stale_exts = REEXTRACT_EXTS
+    # Recorded per location walked (extract_version:<root>) as well as for
+    # the whole index, so one location being away does not make the others
+    # re-read theirs on every run.
+    def meta_version(key):
+        try:
+            return int(get_meta(conn, key) or 0)
+        except (TypeError, ValueError):
+            return 0
+    index_version = meta_version("extract_version") or 1
     roots_before = [os.path.normcase(os.path.abspath(r)) for r in saved_roots(conn)]
     if not roots:
         sys.stderr.write("No folders given and none remembered - indexing "
@@ -1577,9 +1737,19 @@ def _cmd_index(args):
 
     print("Loading existing index...", flush=True)
     known = {}
-    for fid, path, size, mtime, status in conn.execute(
-            "SELECT id, path, size, mtime, status FROM files"):
-        known[path] = (fid, size, mtime, status)
+    # `retry`: an unchanged file worth reading again - one that failed last
+    # time (a lock, a missing library), except one that crashed or hung a
+    # worker; and, with OCR on, a PDF or picture with next to no text that
+    # was read without OCR.
+    ocr_exts = sorted(IMAGE_EXTS | {".pdf"})
+    retry_sql = ("(status='error' AND COALESCE(error,'') NOT LIKE 'extractor %')"
+                 " OR (? AND status IN ('ok','empty') AND chars<100"
+                 " AND COALESCE(error,'')<>? AND ext IN ({}))"
+                 .format(",".join("?" * len(ocr_exts))))
+    for fid, path, size, mtime, status, retry in conn.execute(
+            "SELECT id, path, size, mtime, status, " + retry_sql + " FROM files",
+            [int(OCR_ENABLED), OCR_MARK] + ocr_exts):
+        known[path] = (fid, size, mtime, status, retry)
     print("  {:,} files already indexed".format(len(known)))
 
     # Journal only for locations the index already knew about: the first
@@ -1604,6 +1774,11 @@ def _cmd_index(args):
                 return pfx
         return None
 
+    stale_pfx = {pfx for pfx in prefixes
+                 if max(index_version, meta_version("extract_version:" + pfx))
+                 < EXTRACT_VERSION}
+    stale_exts = REEXTRACT_EXTS if stale_pfx else frozenset()
+
     journal = []          # (ts, event, path, old_path, size, is_dir, source)
 
     workers = args.workers or max(1, (os.cpu_count() or 4))
@@ -1617,8 +1792,11 @@ def _cmd_index(args):
     progress = getattr(args, "progress", False)
     last_emit = 0.0
 
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        for path, name, ext, size, mtime, cloud, is_dir in walk(roots):
+    unlistable = []       # folders scandir refused: their rows are kept
+    pool = ExtractPool(workers)
+    try:
+        for path, name, ext, size, mtime, cloud, is_dir in walk(roots,
+                                                                unlistable):
             stats["seen"] += 1
             if progress and time.time() - last_emit > 0.4:
                 last_emit = time.time()
@@ -1639,9 +1817,12 @@ def _cmd_index(args):
             if (prev and not args.rebuild
                     and prev[1] == size and abs(prev[2] - mtime) < 1e-6
                     and not (wants_text and prev[3] == "listed")
-                    and not (wants_text and ext in stale_exts)):
+                    and not (wants_text and prev[4])
+                    and not (wants_text and ext in stale_exts
+                             and root_of(path) in stale_pfx)):
                 # Unchanged - and not a name-only row that newly qualifies for
-                # extraction (e.g. --include-cloud turned on).
+                # extraction (e.g. --include-cloud turned on), nor one worth
+                # another try (see `retry` above).
                 stats["unchanged"] += 1
                 continue
 
@@ -1656,7 +1837,7 @@ def _cmd_index(args):
 
             batch.append((path, name, ext, size, mtime))
             if len(batch) >= CHUNK:
-                flush(conn, executor, batch, stats)
+                flush(conn, pool, batch, stats)
                 batch = []
                 elapsed = time.time() - start
                 rate = stats["done"] / elapsed if elapsed else 0
@@ -1666,19 +1847,33 @@ def _cmd_index(args):
                     last_emit = time.time()
                     emit_progress(stats, start)
         if batch:
-            flush(conn, executor, batch, stats)
+            flush(conn, pool, batch, stats)
         if name_batch:
             flush_names(conn, name_batch, stats)
         if progress:
             emit_progress(stats, start)
+    finally:
+        pool.close()
 
     # Anything left in `known` was not seen during this run. Only prune rows
     # that live UNDER the roots actually walked - otherwise indexing one drive
     # would wipe the rows for every other drive, and a portable copy would lose
     # its index every time it ran with fewer drives attached.
+    # Nor rows under a folder that could not be listed this time: unseen is
+    # not the same as deleted.
+    blind = tuple(os.path.normcase(d).rstrip(os.sep) + os.sep
+                  for d in unlistable)
+    if unlistable:
+        print("\nCould not list {:,} folder(s) - what is indexed under them "
+              "is kept as it was:".format(len(unlistable)))
+        for d in unlistable[:10]:
+            print("  " + d)
+        if len(unlistable) > 10:
+            print("  ...and {:,} more".format(len(unlistable) - 10))
     if known:
         stale = [(path, meta) for path, meta in known.items()
-                 if root_of(path) is not None]
+                 if root_of(path) is not None
+                 and not os.path.normcase(path).startswith(blind)]
         if stale:
             cur = conn.cursor()
             cur.execute("BEGIN")
@@ -1692,8 +1887,8 @@ def _cmd_index(args):
         print("\nPruned {:,} files that no longer exist".format(len(stale)))
         kept = len(known) - len(stale)
         if kept:
-            print("Kept   {:,} indexed files outside the folders scanned"
-                  .format(kept))
+            print("Kept   {:,} indexed files outside the folders scanned{}"
+                  .format(kept, " or listed" if unlistable else ""))
 
     if journal:
         cur = conn.cursor()
@@ -1710,6 +1905,8 @@ def _cmd_index(args):
            for r in roots_before):
         # every remembered location was covered, so nothing old is left behind
         set_meta(conn, "extract_version", EXTRACT_VERSION)
+    for pfx in prefixes:
+        set_meta(conn, "extract_version:" + pfx, EXTRACT_VERSION)
     remember_roots(conn, all_roots, indexed=True)
     set_meta(conn, "last_summary",
              "{:,} seen, {:,} updated, {:,} unchanged".format(
@@ -2129,10 +2326,8 @@ def name_rows(conn, pattern, limit=50, exts=None):
     """Filename search over every recorded file: [(path, size, mtime)].
     Uses the trigram filename index when the database has one - instant even
     at hundreds of thousands of files - and falls back to a plain scan."""
-    if "*" in pattern or "?" in pattern:
-        like = pattern.replace("*", "%").replace("?", "_")
-    else:
-        like = "%" + pattern + "%"
+    like = _name_like(pattern)           # trigram prefilter (unescaped)
+    exact = _name_like_exact(pattern)    # ...and the literal test
     where_ext, ext_params = "", []
     if exts:
         norm = ["." + e.lstrip(".").lower() for e in exts]
@@ -2148,14 +2343,15 @@ def name_rows(conn, pattern, limit=50, exts=None):
             return conn.execute(
                 "SELECT f.path, f.size, f.mtime FROM names "
                 "JOIN files f ON f.id = names.rowid "
-                "WHERE names.name LIKE ?" + where_ext + tail,
-                [like] + ext_params + tail_params).fetchall()
+                "WHERE names.name LIKE ? AND f.name LIKE ? ESCAPE '!'"
+                + where_ext + tail,
+                [like, exact] + ext_params + tail_params).fetchall()
         except sqlite3.OperationalError:
             pass
     return conn.execute(
         "SELECT f.path, f.size, f.mtime FROM files f "
-        "WHERE f.name LIKE ?" + where_ext + tail,
-        [like] + ext_params + tail_params).fetchall()
+        "WHERE f.name LIKE ? ESCAPE '!'" + where_ext + tail,
+        [exact] + ext_params + tail_params).fetchall()
 
 
 # ----------------------------------------------------------------------------
@@ -2265,7 +2461,7 @@ def parse_query(text):
             tok = tok.split(":", 1)[1]
             if not tok:
                 continue
-        if _is_pathish(tok):
+        if _is_pathish(tok.strip('"')):     # "C:\My Docs" is a scope too
             q["paths_not" if neg else "paths"].append(tok.strip('"'))
             continue
         if meaning and not neg:
@@ -2424,6 +2620,18 @@ def _range_conds(col, ranges, conds, params):
 
 
 def _name_like(term):
+    """The LIKE pattern for a name term, unescaped: what the trigram index
+    can use. '_' and '%' in the term act as wildcards here, so it finds a
+    superset - pair it with _name_like_exact for the real test."""
+    if "*" in term or "?" in term:
+        return term.replace("*", "%").replace("?", "_")
+    return "%" + term + "%"
+
+
+def _name_like_exact(term):
+    """The same pattern with the term's own '_', '%' and '!' taken literally
+    (pair it with ESCAPE '!'): my_file must not find myXfile."""
+    term = like_escape(term)
     if "*" in term or "?" in term:
         return term.replace("*", "%").replace("?", "_")
     return "%" + term + "%"
@@ -2474,11 +2682,11 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
 
     conds, params = [], []
     for t in q["name"]:
-        conds.append("f.name LIKE ?")
-        params.append(_name_like(t))
+        conds.append("f.name LIKE ? ESCAPE '!'")
+        params.append(_name_like_exact(t))
     for t in q["name_not"]:
-        conds.append("f.name NOT LIKE ?")
-        params.append(_name_like(t))
+        conds.append("f.name NOT LIKE ? ESCAPE '!'")
+        params.append(_name_like_exact(t))
     if q["paths"]:
         conds.append("(" + " OR ".join(["f.path LIKE ? ESCAPE '!'"]
                                         * len(q["paths"])) + ")")
@@ -2557,20 +2765,24 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
     if q["name"]:
         first = q["name"][0].strip("*?").lower()
         if first:
-            order = (" ORDER BY (lower(f.name) = ? OR lower(f.name) LIKE ?) "
-                     "DESC, (f.name LIKE ?) DESC, f.mtime DESC")
-            order_params = [first, first + ".%", first + "%"]
+            order = (" ORDER BY (lower(f.name) = ? OR lower(f.name) LIKE ? "
+                     "ESCAPE '!') DESC, (f.name LIKE ? ESCAPE '!') DESC, "
+                     "f.mtime DESC")
+            order_params = [first, like_escape(first) + ".%",
+                            like_escape(first) + "%"]
 
     tail_params = params + not_params + order_params + lim_params
     if q["name"] and get_meta(conn, "names_ready") == "1" \
             and _name_like(q["name"][0]).strip("%_"):
-        tri = list(conds)
-        tri[0] = tri[0].replace("f.name", "names.name", 1)
+        # The trigram index cannot take an ESCAPE clause, so it narrows with
+        # the unescaped pattern and the exact test in `conds` decides.
+        tri = ["names.name LIKE ?"] + conds
         try:
             return conn.execute(
                 "SELECT f.path, f.size, f.mtime, '', f.is_dir FROM names "
                 "JOIN files f ON f.id = names.rowid WHERE "
-                + " AND ".join(tri) + order + lim, tail_params).fetchall()
+                + " AND ".join(tri) + order + lim,
+                [_name_like(q["name"][0])] + tail_params).fetchall()
         except sqlite3.OperationalError:
             pass    # no trigram support - the plain scan below still works
     sql = "SELECT f.path, f.size, f.mtime, '', f.is_dir FROM files f"
@@ -2841,7 +3053,19 @@ def cmd_gui(args):
 
 def clear_index(path):
     """Start fresh: delete the index - every recorded file, all extracted
-    text, and the run history. The files on your disk are untouched."""
+    text, and the run history. The remembered folder list is kept. The
+    files on your disk are untouched."""
+    roots = []
+    if os.path.exists(path):
+        try:
+            conn = sqlite3.connect(path, timeout=5)
+            try:
+                roots = conn.execute(
+                    "SELECT path, added FROM roots").fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass                    # no roots table, or not a database
     try:
         if os.path.exists(path):
             os.remove(path)
@@ -2850,6 +3074,12 @@ def clear_index(path):
                 os.remove(path + suffix)
             except OSError:
                 pass
+        if roots:                   # a fresh index, but the same folders
+            conn = open_db(path)
+            conn.executemany("INSERT OR IGNORE INTO roots(path, added) "
+                             "VALUES (?, ?)", roots)
+            conn.commit()
+            conn.close()
         return "index deleted - the next run starts from scratch"
     except OSError:
         pass

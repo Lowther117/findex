@@ -146,6 +146,42 @@ def new_name(name, ops, mtime=0, is_dir=False):
     return result
 
 
+def _case_only(old, new):
+    """Is old -> new just a change of letter case of the same file? On
+    Windows normcase says so; on macOS (case-insensitive, case-preserving)
+    the two names are one file on disk, which samefile confirms - without
+    it, the file's own current name read as "already taken"."""
+    if os.path.normcase(old) == os.path.normcase(new):
+        return True
+    if old == new or old.lower() != new.lower():
+        return False
+    try:
+        return os.path.samefile(findex.lp(old), findex.lp(new))
+    except OSError:
+        return False
+
+
+def _move(old, new):
+    """os.rename, made to stick for a case-only change: a volume that takes
+    that rename as a no-op gets it via a temporary name instead."""
+    os.rename(findex.lp(old), findex.lp(new))
+    if old == new or old.lower() != new.lower():
+        return
+    folder, name = os.path.split(new)
+    try:
+        if name in os.listdir(findex.lp(folder or ".")):
+            return
+    except OSError:
+        return
+    tmp = new + ".findex-case-tmp"
+    os.rename(findex.lp(new), findex.lp(tmp))
+    try:
+        os.rename(findex.lp(tmp), findex.lp(new))
+    except OSError:
+        os.rename(findex.lp(tmp), findex.lp(old))   # put it back as it was
+        raise
+
+
 def plan(rows, ops, conn=None):
     """rows: [(path, size, mtime, is_dir)] -> [(old, new, status, note)]
     status: ok / unchanged / collision / invalid / skipped.
@@ -179,7 +215,7 @@ def plan(rows, ops, conn=None):
             out.append((path, new_path, "collision",
                         "same target as " + os.path.basename(targets[key])))
             continue
-        case_only = os.path.normcase(path) == key
+        case_only = _case_only(path, new_path)
         if not case_only:
             exists = os.path.exists(findex.lp(new_path))
             if not exists and have_index:
@@ -235,10 +271,10 @@ def apply(conn, planned, log=None):
             continue
         is_dir = os.path.isdir(findex.lp(old))
         try:
-            if (os.path.normcase(old) != os.path.normcase(new)
+            if (not _case_only(old, new)
                     and os.path.exists(findex.lp(new))):
                 raise FileExistsError("target appeared: " + new)
-            os.rename(findex.lp(old), findex.lp(new))
+            _move(old, new)
         except OSError as exc:
             failed.append((old, str(exc)))
             if log:
@@ -349,11 +385,11 @@ def undo(conn, batch=None, log=None):
             if not os.path.exists(findex.lp(new)) and not os.path.lexists(
                     findex.lp(new)):
                 raise FileNotFoundError("no longer at " + new)
-            if (os.path.normcase(old) != os.path.normcase(new)
+            if (not _case_only(new, old)
                     and os.path.exists(findex.lp(old))):
                 raise FileExistsError("original name is taken again: " + old)
             os.makedirs(os.path.dirname(findex.lp(old)), exist_ok=True)
-            os.rename(findex.lp(new), findex.lp(old))
+            _move(new, old)
         except OSError as exc:
             failed.append((new, str(exc)))
             if log:

@@ -121,7 +121,13 @@ The index is a file (`findex.db`) that lives beside the scripts and persists
 between runs. Indexing again only touches files that are **new, or whose size
 or timestamp changed**; everything else is counted as *unchanged* and skipped,
 so a repeat run over an unchanged drive takes seconds rather than hours.
-Deleted files are dropped from the index as they are noticed.
+Deleted files are dropped from the index as they are noticed. Two things are
+read again even when unchanged: a file that could not be read last time (a
+lock, a missing component) - though one that crashed or hung the reader is
+recorded as an error and left alone until it changes - and, with OCR on, a
+near-textless PDF or picture read without OCR. A folder that cannot be listed
+on this run (permissions, a share dropping out) keeps everything indexed
+under it; it is not treated as deleted.
 
 The Index tab shows the counts live while it runs, and underneath the
 statistics line tells you when the index was last updated and what that run
@@ -249,7 +255,8 @@ or Light, Ctrl+D cycles them, and the choice is remembered in `findex_gui.json`.
 - *OCR scanned PDFs and images* makes the words in scans and pictures
   searchable - see OCR under *What gets recorded*.
 - *Auto re-index every N minutes* re-runs the same folders on a timer while the
-  app is open.
+  app is open - without asking anything: a folder that is not there is left
+  alone and noted in the Output pane.
 - *Keep the index fresh in the background, every N hours* does the same
   **whether or not the app is open**, by registering a job with the
   operating system's own scheduler - and removing it again when unticked.
@@ -734,6 +741,7 @@ findex rename "D:\Shared" --normalise --apply
 findex rename --undo                   reverse the last batch
 findex organise D:\Downloads --suggest -o tidy.rules     draft rules
 findex organise D:\Downloads --rules tidy.rules          preview (dry run)
+findex organise D:\Downloads --rules tidy.rules --save-template tidy
 findex organise D:\Downloads --rules tidy.rules --sweep --remove-empty --apply
 findex organise D:\Downloads --template tidy --copy --apply
 findex organise --undo
@@ -824,7 +832,8 @@ the settings file the first time the app opens it, and keeps it from then on.
     so you can find which archive holds a file without opening anything
   - audio/video tags (artist, album, title...) for mp3, m4a, flac, ogg, mp4
     and more, with the `mutagen` library
-  - plain-text and code files
+  - plain-text and code files (UTF-8, UTF-16 or Windows-1252), and web
+    pages `.html/.htm` as their words, tags and scripts dropped
 
   400k characters per file, 300 MB ceiling (tag reading is exempt - it only
   touches the file header). Contents of OneDrive online-only files are only
@@ -846,8 +855,8 @@ the settings file the first time the app opens it, and keeps it from then on.
   to install. Tesseract is used as a fallback when neither is available.
   Much slower than normal indexing, so leave it off for huge photo
   collections. With OCR off, images are recorded by name only, as ever;
-  turn it on and the next run picks up every image already in the index
-  (no re-extract needed); turn it off again and the text already read is
+  turn it on and the next run picks up every image, and every PDF with next
+  to no text, already in the index (no re-extract needed); turn it off again and the text already read is
   kept until the file changes, exactly as it is for PDFs.
 - **Self-contained**: tag and .msg support is bundled in `vendor/`; PyMuPDF
   is installed automatically by the app when missing. Until a component is

@@ -1258,12 +1258,16 @@ def cmd_organise(args):
         with open(args.rules, encoding="utf-8") as fh:
             rules_text = fh.read()
     elif args.template:
-        row = conn.execute("SELECT rules FROM organise_templates WHERE name=?",
-                           (args.template,)).fetchone()
+        saved = templates(conn)     # [] when none was ever saved
+        row = next((r for r in saved if r[0] == args.template), None)
         if not row:
-            sys.stderr.write("No template called {!r}.\n".format(args.template))
+            conn.close()
+            sys.stderr.write("No template called {!r}{}.\n".format(
+                args.template,
+                " - saved: " + ", ".join(r[0] for r in saved) if saved else
+                " - none saved yet (save one with --save-template NAME)"))
             return 2
-        rules_text = row[0]
+        rules_text = row[1]
     elif args.rules_text:
         rules_text = args.rules_text.replace("\\n", "\n")
     if rules_text is None:

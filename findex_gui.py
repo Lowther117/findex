@@ -51,6 +51,12 @@ _SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 if not getattr(sys, "frozen", False) and _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
+# The tab modules reach back into this module as sys.modules["findex_gui"].
+# When this file is run directly (findex-gui.bat / .command, run.*) it is
+# loaded as __main__, so register it under its own name too - otherwise that
+# lookup fails and the window never opens.
+sys.modules.setdefault("findex_gui", sys.modules[__name__])
+
 import findex  # noqa: E402
 import theme   # noqa: E402  - the shared house palettes (phosphor/dark/light) + ttk styling
 import findex_tabs  # noqa: E402  - the Health / Duplicates / Rename / Verify tabs
@@ -2502,16 +2508,24 @@ class FindexApp(findex_tabs.ToolTabs):
                 folded)
         self.var_status.set(msg)
 
-    def start_index(self):
+    def start_index(self, auto=False):
+        """auto=True is the timed re-index: nobody asked for it, so it never
+        opens a dialog - what would have been asked is logged instead."""
         if self.proc is not None:
-            messagebox.showinfo("Busy", "Something is already running.")
+            if not auto:
+                messagebox.showinfo("Busy", "Something is already running.")
             return
         roots = self.current_roots()
         if not roots:
-            messagebox.showwarning("No folders",
-                                   "Add at least one folder to index.")
+            if not auto:
+                messagebox.showwarning("No folders",
+                                       "Add at least one folder to index.")
             return
-        if self.var_rebuild.get() and not messagebox.askyesno(
+        rebuild = self.var_rebuild.get() and not auto
+        if auto and self.var_rebuild.get():
+            self.log_line("-- auto re-index: 'Re-extract everything' is "
+                          "only done when you start it --")
+        if rebuild and not messagebox.askyesno(
                 "Re-extract everything?",
                 "This ignores what is already indexed and reads every file "
                 "again, which can take hours on a large drive.\n\n"
@@ -2523,13 +2537,20 @@ class FindexApp(findex_tabs.ToolTabs):
         if missing:
             keep = [r for r in roots if os.path.isdir(r)]
             listed = "\n".join("    " + m for m in missing[:8])
-            if not keep:
+            if auto:
+                self.log_line("-- auto re-index: not found, left alone: "
+                              + ", ".join(missing) + " --")
+                if not keep:
+                    # try again next interval, not on every timer tick
+                    self.last_index_finished = time.time()
+                    return
+            elif not keep:
                 messagebox.showwarning(
                     "Folders not found",
                     "None of these folders are on this machine right now:\n\n"
                     + listed + "\n\nNothing to index.")
                 return
-            if not messagebox.askyesno(
+            elif not messagebox.askyesno(
                     "Folders not found",
                     "These folders are not on this machine right now:\n\n"
                     + listed + "\n\nTheir entries in the index will be left "
@@ -2537,7 +2558,7 @@ class FindexApp(findex_tabs.ToolTabs):
                 return
             roots = keep
         if self.var_ocr.get() and not findex.have_ocr_backend():
-            if self._offer_tesseract():
+            if not auto and self._offer_tesseract():
                 return    # tesseract is installing; indexing follows by itself
             self.log_line("-- tesseract not installed: OCR will be skipped "
                           "this run --")
@@ -2551,7 +2572,7 @@ class FindexApp(findex_tabs.ToolTabs):
             pass
         cmd = engine_command() + ["--db", self.var_db.get(),
                                   "index"] + roots + ["--progress"]
-        if self.var_rebuild.get():
+        if rebuild:
             cmd.append("--rebuild")
         if self.var_cloud.get():
             cmd.append("--include-cloud")
@@ -3170,7 +3191,7 @@ class FindexApp(findex_tabs.ToolTabs):
                 mins = max(5, int_of(self.var_auto_mins, 60) or 60)
                 if time.time() - self.last_index_finished >= mins * 60:
                     self.log_line("-- auto re-index --")
-                    self.start_index()
+                    self.start_index(auto=True)
             self.update_auto_label()
         except Exception:                                      # noqa: BLE001
             pass

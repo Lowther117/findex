@@ -74,11 +74,14 @@ _PLACEHOLDER = re.compile(
     re.I)
 
 # What to ask the FTS index for before running the patterns: any document
-# that mentions a password-ish word or carries a key-shaped token.
+# that mentions a password-ish word or carries a key-shaped token. The index
+# splits words at "_" and ".", so a token's prefix is a word of its own:
+# ghp_abc... is indexed as "ghp" + "abc...", SG.abc.def as "sg" + ...
 FTS_QUERY = ('password OR passwd OR passphrase OR pwd OR secret OR token OR '
              '"private key" OR apikey OR AKIA* OR xox* OR AIza* OR sk* OR '
              'eyJ* OR AccountKey OR github OR npm* OR bearer OR sig OR '
-             'hooks OR accesstoken OR pat')
+             'hooks OR accesstoken OR pat OR ghp OR gho OR ghu OR ghs OR '
+             'ghr OR rk OR sg')
 
 
 def mask(value):
