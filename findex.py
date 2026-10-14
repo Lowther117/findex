@@ -243,6 +243,11 @@ try:
 except ImportError:
     HAVE_MSG = False
 
+try:
+    import findex_volumes              # drives whose letter / mount moved
+except ImportError:
+    findex_volumes = None
+
 
 def can_extract(ext):
     """Is content extraction possible for this type on this machine?
@@ -1035,9 +1040,12 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 CREATE TABLE IF NOT EXISTS roots (
-    path       TEXT PRIMARY KEY,
-    added      REAL,
-    last_index REAL
+    path         TEXT PRIMARY KEY,
+    added        REAL,
+    last_index   REAL,
+    volume_id    TEXT,     -- the drive it sits on (findex_volumes): the
+    volume_label TEXT,     -- index follows the drive when its letter or
+    mount        TEXT      -- mount point changes
 );
 
 CREATE TABLE IF NOT EXISTS journal (
@@ -1123,6 +1131,11 @@ def remember_roots(conn, roots, indexed=False):
                      "ON CONFLICT(path) DO UPDATE SET last_index = "
                      "CASE WHEN ? THEN excluded.last_index ELSE last_index END",
                      (r, now, now if indexed else None, 1 if indexed else 0))
+    if findex_volumes is not None:
+        try:    # which drive each one is on, so the index can follow it
+            findex_volumes.stamp(conn, roots, commit=False)
+        except Exception:                                      # noqa: BLE001
+            pass
     conn.commit()
 
 
@@ -1191,7 +1204,8 @@ def forget_paths(conn, paths):
 # would be "added", which is true but useless. From the second run on, and
 # whenever live updates are on, changes are recorded.
 
-JOURNAL_EVENTS = ("added", "modified", "renamed", "deleted")
+JOURNAL_EVENTS = ("added", "modified", "renamed", "deleted",
+                  "remapped")        # a drive followed to a new letter
 JOURNAL_DAYS = 90             # default retention; "journal_days" in meta
 
 
@@ -1300,6 +1314,10 @@ def open_db(path, timeout=60):
                       ("dhash", "INTEGER")):
         if col not in have:
             conn.execute("ALTER TABLE files ADD COLUMN {} {}".format(col, decl))
+    have = {row[1] for row in conn.execute("PRAGMA table_info(roots)")}
+    for col in ("volume_id", "volume_label", "mount"):
+        if col not in have:
+            conn.execute("ALTER TABLE roots ADD COLUMN {} TEXT".format(col))
     # Indexes over columns the migration may only just have added.
     conn.executescript(
         "CREATE INDEX IF NOT EXISTS idx_files_size ON files(size);"
@@ -1686,7 +1704,24 @@ def _cmd_index(args):
                 "install tesseract yourself.\n\n")
 
     conn = open_db(args.db)
+    # A drive whose letter (or mount point) has changed since it was
+    # indexed: its rows are rewritten to the new location first, so the
+    # walk finds them unchanged instead of pruning the lot and reading
+    # the whole drive again. A location whose path exists but is some
+    # OTHER drive now is left out of the run - indexing it would replace
+    # the real drive's entries with the stranger's.
+    away = []
+    if findex_volumes is not None:
+        moved, away = findex_volumes.remap(conn, sys.stdout)
+        args.roots = findex_volumes.translate(moved, args.roots or [])
     roots = args.roots or saved_roots(conn)
+    if away:
+        skip = {os.path.normcase(a) for a in away}
+        roots = [r for r in roots
+                 if os.path.normcase(os.path.abspath(r)) not in skip]
+        if not roots:
+            conn.close()
+            return 1
     # Files read by an older, worse extractor are read once more even though
     # they have not changed - only the cheap zip-based formats, never PDFs/OCR.
     # Recorded per location walked (extract_version:<root>) as well as for
@@ -2011,13 +2046,16 @@ def cmd_watch(args):
     include_cloud = getattr(args, "include_cloud", False)
 
     wanted = list(args.roots or [])
-    if not wanted:                        # none given: watch the remembered ones
-        try:
-            ro = open_db_ro(args.db)
-            wanted = saved_roots(ro)
-            ro.close()
-        except Exception:                                      # noqa: BLE001
-            wanted = []
+    try:    # a drive that changed letter since: follow it (see cmd_index)
+        conn = open_db(args.db, timeout=5)
+        if findex_volumes is not None:
+            moved, _away = findex_volumes.remap(conn, sys.stdout)
+            wanted = findex_volumes.translate(moved, wanted)
+        if not wanted:                    # none given: watch the remembered ones
+            wanted = saved_roots(conn)
+        conn.close()
+    except Exception:                                          # noqa: BLE001
+        pass
     roots = [os.path.abspath(r) for r in wanted if os.path.isdir(r)]
     if not roots:
         sys.stderr.write("watch: no folders given or remembered that exist "
@@ -3060,8 +3098,13 @@ def clear_index(path):
         try:
             conn = sqlite3.connect(path, timeout=5)
             try:
-                roots = conn.execute(
-                    "SELECT path, added FROM roots").fetchall()
+                try:
+                    roots = conn.execute(
+                        "SELECT path, added, volume_id, volume_label, mount "
+                        "FROM roots").fetchall()
+                except sqlite3.OperationalError:    # older table
+                    roots = [r + (None, None, None) for r in conn.execute(
+                        "SELECT path, added FROM roots").fetchall()]
             finally:
                 conn.close()
         except sqlite3.Error:
@@ -3076,8 +3119,9 @@ def clear_index(path):
                 pass
         if roots:                   # a fresh index, but the same folders
             conn = open_db(path)
-            conn.executemany("INSERT OR IGNORE INTO roots(path, added) "
-                             "VALUES (?, ?)", roots)
+            conn.executemany("INSERT OR IGNORE INTO roots(path, added, "
+                             "volume_id, volume_label, mount) "
+                             "VALUES (?, ?, ?, ?, ?)", roots)
             conn.commit()
             conn.close()
         return "index deleted - the next run starts from scratch"
@@ -3113,14 +3157,27 @@ def cmd_clear(args):
 
 
 def cmd_roots(args):
-    """Show, add to, or trim the remembered set of locations to index."""
+    """Show, add to, or trim the remembered set of locations to index.
+    Also where a drive that changed letter is followed by hand: listing
+    runs the same check an index run does."""
     conn = open_db(args.db)
     if args.add:
         remember_roots(conn, args.add)
     if args.forget:
         forget_roots(conn, args.forget)
-    rows = conn.execute(
-        "SELECT path, last_index FROM roots ORDER BY added, path").fetchall()
+    rows = []
+    if findex_volumes is not None:
+        if getattr(args, "restamp", False):
+            n = findex_volumes.stamp(conn, force=True)
+            print("Re-recorded the drive behind {} location(s).".format(n))
+        findex_volumes.remap(conn, sys.stdout)
+        try:
+            rows = findex_volumes.describe_roots(conn)
+        except Exception:                                      # noqa: BLE001
+            rows = []
+    if not rows:
+        rows = [(p, last, "", "") for p, last in conn.execute(
+            "SELECT path, last_index FROM roots ORDER BY added, path")]
     conn.close()
     if not rows:
         print("No locations remembered yet. Add some with\n"
@@ -3128,10 +3185,15 @@ def cmd_roots(args):
               "or just run  findex index <folder> ...  once.")
         return 0
     print("Remembered for indexing ({}):".format(len(rows)))
-    for path, last in rows:
+    for path, last, label, state in rows:
         when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(last))
                 if last else "not indexed yet")
-        print("  {}   [{}]".format(path, when))
+        note = ""
+        if label:
+            note += "  drive: " + label
+        if state and state != "ok":
+            note += "  (" + state + ")"
+        print("  {}   [{}]{}".format(path, when, note))
     return 0
 
 
@@ -3514,6 +3576,10 @@ def main(argv=None):
                        "indexing (used by 'index' and 'watch' when given none)")
     p.add_argument("--add", nargs="+", metavar="PATH", help="remember these")
     p.add_argument("--forget", nargs="+", metavar="PATH", help="drop these")
+    p.add_argument("--restamp", action="store_true",
+                   help="re-record which drive each location is on - after "
+                        "a drive was reformatted or replaced on purpose, so "
+                        "the index stops treating the new one as a stranger")
     p.set_defaults(func=cmd_roots)
 
     p = sub.add_parser("journal", help="what changed inside the indexed "

@@ -113,6 +113,24 @@ Nothing is installed system-wide except that optional tesseract fallback.
   run it on a machine where an external drive is missing and that drive's
   entries are left untouched. The app warns before indexing if a listed folder
   is not currently present.
+- **A drive that changes letter is followed, not re-indexed.** Windows hands
+  out letters in plug-in order, so the external drive that was `D:` last week
+  is `E:` today; the Mac does the same thing with `/Volumes/Data` becoming
+  `/Volumes/Data 1`. Each remembered location is stamped with the identity
+  of the *volume* it sits on (the filesystem's serial number on Windows,
+  the volume UUID on the Mac), and before every run - and when the app
+  opens - a location whose path has gone is looked for by that identity
+  among the drives connected now. When the same drive is simply somewhere
+  else, every path under it is rewritten in one transaction (the
+  `files` table, the journal, rename and organise history, summaries) and
+  the run then finds everything *unchanged*. A `remapped` entry in the
+  Changes tab records each move. If a *different* drive has taken the old
+  letter, that location is left alone and skipped for the run, so the
+  stranger's files never replace the real drive's entries; after
+  reformatting or replacing a drive on purpose, `findex roots --restamp`
+  tells findex the new one is the one to follow. Mapped network letters are
+  not probed (a share that has gone away blocks for a long time) and are
+  matched by path as before.
 - Launchers resolve their own location, so shortcuts and symlinks are fine.
 
 ## Incremental by default
@@ -707,8 +725,12 @@ findex that a graphics card changes from impractical to routine.
 ```
 findex index D:\ E:\Documents          build or update the index
 findex index                           ...of the remembered locations
-findex roots                           show what is remembered
+findex roots                           show what is remembered, and which
+                                       drive each is on (follows a drive
+                                       that changed letter, see above)
 findex roots --add F:\ --forget E:\Documents
+findex roots --restamp                 a drive was reformatted/replaced on
+                                       purpose: follow the new one
 findex watch D:\                       live updates until stopped (Ctrl+C)
 findex find "C: content:dan ext:pdf"   Everything-style search
 findex find "budget !draft folder:"

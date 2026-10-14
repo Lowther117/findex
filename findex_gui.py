@@ -58,6 +58,7 @@ if not getattr(sys, "frozen", False) and _SCRIPT_DIR not in sys.path:
 sys.modules.setdefault("findex_gui", sys.modules[__name__])
 
 import findex  # noqa: E402
+import findex_volumes  # noqa: E402  - follows a drive whose letter changed
 import theme   # noqa: E402  - the shared house palettes (phosphor/dark/light) + ttk styling
 import findex_tabs  # noqa: E402  - the Health / Duplicates / Rename / Verify tabs
 import findex_schedule  # noqa: E402  - the background refresh (OS scheduler)
@@ -1164,13 +1165,22 @@ class FindexApp(findex_tabs.ToolTabs):
         folders come back with it. A database that has none yet - built by an
         older findex - takes the list from the settings file once, and keeps
         it from then on."""
-        roots = []
-        try:
-            conn = findex.open_db_ro(self.var_db.get())
+        roots = None
+        try:    # read-write: a drive that changed letter is followed first
+            conn = findex.open_db(self.var_db.get(), timeout=2)
+            self._remap_with(conn)
             roots = findex.saved_roots(conn)
             conn.close()
         except Exception:                                      # noqa: BLE001
-            pass
+            pass            # an index run holds the lock: plain read below
+        if roots is None:
+            roots = []
+            try:
+                conn = findex.open_db_ro(self.var_db.get())
+                roots = findex.saved_roots(conn)
+                conn.close()
+            except Exception:                                  # noqa: BLE001
+                pass
         if not roots:
             roots = list(self.cfg.get("roots", []))
             if roots:
@@ -1178,6 +1188,41 @@ class FindexApp(findex_tabs.ToolTabs):
         self.roots_list.delete(0, "end")
         for r in roots:
             self.roots_list.insert("end", r)
+
+    def _remap_with(self, conn):
+        """Follow any drive whose letter or mount point has changed since
+        the index last saw it (findex_volumes): its entries are rewritten
+        to the new place, nothing is re-read. Says so in the Output pane.
+        Returns {old_root: new_root}."""
+        try:
+            moved, away = findex_volumes.remap(conn)
+        except Exception:                                      # noqa: BLE001
+            return {}
+        for old, new in moved.items():
+            self.log_line("-- drive moved: {} is now {} - the index followed "
+                          "it, nothing needs re-reading --".format(old, new))
+        for p in away:
+            self.log_line("-- {} is a different drive now; the one indexed "
+                          "there is not connected, so its entries are left "
+                          "alone and it is skipped --".format(p))
+        return moved
+
+    def _remap_roots(self):
+        """The same check, with the folder list updated to match. Called
+        before an index run or live updates start, so a drive re-plugged
+        under a new letter is not reported as 'not found'."""
+        try:
+            conn = findex.open_db(self.var_db.get(), timeout=2)
+            moved = self._remap_with(conn)
+            conn.close()
+        except Exception:                                      # noqa: BLE001
+            return {}
+        if moved:
+            new = findex_volumes.translate(moved, self.current_roots())
+            self.roots_list.delete(0, "end")
+            for r in new:
+                self.roots_list.insert("end", r)
+        return moved
 
     def _save_roots(self, roots=None):
         """Write the folder list into the index. A short timeout on purpose:
@@ -2533,6 +2578,8 @@ class FindexApp(findex_tabs.ToolTabs):
                 "runs and only reads files that are new or have changed.\n\n"
                 "Carry on with a full re-extract?"):
             return
+        if self._remap_roots():          # a drive came back under a new letter
+            roots = self.current_roots()
         missing = [r for r in roots if not os.path.isdir(r)]
         if missing:
             keep = [r for r in roots if os.path.isdir(r)]
@@ -2850,6 +2897,7 @@ class FindexApp(findex_tabs.ToolTabs):
             return
         if self.proc_kind == "setup":
             return          # watchdog may still be installing - retried after
+        self._remap_roots()              # a drive that changed letter
         roots = [r for r in self.current_roots() if os.path.isdir(r)]
         if not roots:
             return
