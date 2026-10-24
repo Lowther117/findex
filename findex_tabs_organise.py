@@ -769,11 +769,12 @@ class OrganiseTab:
         self._ogen += 1
         gen = self._ogen
         self.var_ostatus.set("Planning...")
+        db = self.var_db.get()
 
         def work():
             conn = None
             try:
-                conn = self._ro()
+                conn = self._ro(db)
                 plan = findex_organise.build_plan(conn, root, rules, options)
                 self.msgs.put(("call", self._organise_show, (gen, plan)))
             except Exception as exc:                           # noqa: BLE001
@@ -929,11 +930,12 @@ class OrganiseTab:
             messagebox.showwarning("No folder", "Choose the folder first.")
             return
         self.var_ostatus.set("Reading the names...")
+        db = self.var_db.get()
 
         def work():
             conn = None
             try:
-                conn = self._ro()
+                conn = self._ro(db)
                 files, folders = findex_organise.files_under(conn, root)
                 sug = findex_organise.suggest(files)
                 self.msgs.put(("call", self._organise_suggested, (sug, len(files))))

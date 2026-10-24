@@ -188,11 +188,13 @@ class ToolTabs(findex_tabs_organise.OrganiseTab,
 
     # helpers shared by the tabs ------------------------------------------
 
-    def _ro(self):
+    def _ro(self, db=None):
+        if db is None:
+            db = self.var_db.get()
         try:
-            return findex.open_db_ro(self.var_db.get())
+            return findex.open_db_ro(db)
         except sqlite3.Error:
-            return findex.open_db(self.var_db.get())
+            return findex.open_db(db)
 
     def _paths_of(self, tree, mapping):
         return [mapping[i] for i in tree.selection() if i in mapping]
@@ -278,7 +280,8 @@ class ToolTabs(findex_tabs_organise.OrganiseTab,
                     bin_name, listed)):
             return
         done, failed = g._trash_many(paths)
-        self._db_forget([p for p in paths if p not in failed])
+        failed_set = set(failed)
+        self._db_forget([p for p in paths if p not in failed_set])
         for p in failed[:5]:
             self.log_line("could not delete: " + p)
         self.var_status.set("Sent {:,} item(s) to the {}{}".format(
@@ -396,7 +399,7 @@ class ToolTabs(findex_tabs_organise.OrganiseTab,
         def work():
             conn = None
             try:
-                conn = self._ro()
+                conn = self._ro(db)
                 h = findex_report.scan(
                     conn, under=under, stale_years=stale,
                     progress=lambda d, t: self.msgs.put(
@@ -703,7 +706,7 @@ class ToolTabs(findex_tabs_organise.OrganiseTab,
         def work():
             conn = None
             try:
-                conn = self._ro()
+                conn = self._ro(db)
                 groups = []
                 if mode == "name":
                     rows = findex.dupe_rows(conn, 0, exts)
@@ -1058,11 +1061,12 @@ class ToolTabs(findex_tabs_organise.OrganiseTab,
             return
         self._rgen = getattr(self, "_rgen", 0) + 1
         gen = self._rgen
+        db = self.var_db.get()
 
         def work():
             conn = None
             try:
-                conn = self._ro()
+                conn = self._ro(db)
                 rows = (source if source is not None else
                         findex_rename.select_rows(conn, query, exts=exts,
                                                   kind=kind))

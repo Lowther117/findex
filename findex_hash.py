@@ -39,6 +39,7 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 
 import findex
@@ -581,20 +582,34 @@ def run_simhash(conn, under=None, exts=None, workers=None, progress=False,
             yield rows
 
     cur = conn.cursor()
+
+    def write(result):
+        nonlocal done
+        cur.execute("BEGIN")
+        for fid, sh in result:
+            if sh is not None:
+                cur.execute("UPDATE files SET simhash=? WHERE id=?",
+                            (sh, fid))
+                stats["fingerprinted"] += 1
+        conn.commit()
+        done += len(result)
+        if progress:
+            print("@P seen={} done={} total={} elapsed={:.1f}".format(
+                done, stats["fingerprinted"], len(ids),
+                time.time() - start), flush=True)
+
+    # Executor.map would submit every batch up front - the text of every
+    # document pulled into memory (and pickled to the workers) before the
+    # first fingerprint is written. A bounded number of batches is kept in
+    # flight instead; the results are written in the same order as before.
+    pending = deque()
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        for result in ex.map(_simhash_batch, batches()):
-            cur.execute("BEGIN")
-            for fid, sh in result:
-                if sh is not None:
-                    cur.execute("UPDATE files SET simhash=? WHERE id=?",
-                                (sh, fid))
-                    stats["fingerprinted"] += 1
-            conn.commit()
-            done += len(result)
-            if progress:
-                print("@P seen={} done={} total={} elapsed={:.1f}".format(
-                    done, stats["fingerprinted"], len(ids),
-                    time.time() - start), flush=True)
+        for batch in batches():
+            pending.append(ex.submit(_simhash_batch, batch))
+            if len(pending) >= workers * 2:
+                write(pending.popleft().result())
+        while pending:
+            write(pending.popleft().result())
     stats["elapsed"] = time.time() - start
     return stats
 

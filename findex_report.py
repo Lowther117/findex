@@ -84,6 +84,7 @@ _LEFTOVER_NAMES = {"thumbs.db", ".ds_store", "desktop.ini", "ehthumbs.db",
 _LEFTOVER_EXTS = {".tmp", ".temp", ".crdownload", ".part", ".partial",
                   ".download", ".swp", ".swo", ".lock", ".lck", ".~tmp"}
 _LEFTOVER_RE = re.compile(r"^(~\$|\.~lock\.|~wr[ldsf]\d|\._)", re.I)
+_SEPS = re.compile(r"[\\/]+")
 
 
 def _sep_for(path):
@@ -101,12 +102,12 @@ def split_path(path):
 
 
 def _depth(path):
-    return len([p for p in re.split(r"[\\/]+", path) if p])
+    return len([p for p in _SEPS.split(path) if p])
 
 
 def _top(path):
     """The root-ish part a finding belongs to: drive or first folder."""
-    parts = [p for p in re.split(r"[\\/]+", path) if p]
+    parts = [p for p in _SEPS.split(path) if p]
     if not parts:
         return path
     if len(parts[0]) == 2 and parts[0][1] == ":":       # D:
@@ -181,7 +182,7 @@ def scan(conn, under=None, stale_years=STALE_YEARS, long_path=LONG_PATH,
     h = Health()
     where, params = "", []
     if under:
-        where = " WHERE path = ? OR path LIKE ? ESCAPE '!'"
+        where = " WHERE (path = ? OR path LIKE ? ESCAPE '!')"
         params = [under, findex.like_escape(under.rstrip("\\/"))
                   + _sep_for(under) + "%"]
     total = conn.execute("SELECT COUNT(*) FROM files" + where,

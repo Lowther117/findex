@@ -1913,9 +1913,10 @@ def _cmd_index(args):
             cur = conn.cursor()
             cur.execute("BEGIN")
             now = time.time()
+            gone_ids = [(meta[0],) for _path, meta in stale]
+            cur.executemany("DELETE FROM docs WHERE rowid=?", gone_ids)
+            cur.executemany("DELETE FROM files WHERE id=?", gone_ids)
             for path, meta in stale:
-                cur.execute("DELETE FROM docs WHERE rowid=?", (meta[0],))
-                cur.execute("DELETE FROM files WHERE id=?", (meta[0],))
                 journal.append((now, "deleted", path, None, meta[1],
                                 int(meta[3] == "folder"), "index"))
             conn.commit()
@@ -2169,9 +2170,8 @@ def cmd_watch(args):
         rows = cur.execute(
             "SELECT id FROM files WHERE path = ? OR path LIKE ? ESCAPE '!'",
             (path, like_escape(path.rstrip("\\/")) + sep + "%")).fetchall()
-        for (fid,) in rows:
-            cur.execute("DELETE FROM docs WHERE rowid=?", (fid,))
-            cur.execute("DELETE FROM files WHERE id=?", (fid,))
+        cur.executemany("DELETE FROM docs WHERE rowid=?", rows)
+        cur.executemany("DELETE FROM files WHERE id=?", rows)
         return len(rows)
 
     try:

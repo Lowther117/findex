@@ -2459,7 +2459,8 @@ class FindexApp(findex_tabs.ToolTabs):
             return
         paths = [r["path"] for r in rows]
         done, failed = _trash_many(paths)
-        self._db_forget([p for p in paths if p not in failed])
+        failed_set = set(failed)
+        self._db_forget([p for p in paths if p not in failed_set])
         for p in failed[:5]:
             self.log_line("could not delete: " + p)
         self.var_status.set("Sent {:,} file(s) to the {}{}".format(
@@ -3329,18 +3330,21 @@ class FindexApp(findex_tabs.ToolTabs):
     # -- search by meaning (findex embed) -----------------------------------
 
     def _embed_refresh_note(self):
+        db = self.var_db.get()
+        embed_on = self.var_embed.get()
+
         def work():
             try:
                 import findex_embed
-                conn = findex.open_db_ro(self.var_db.get())
+                conn = findex.open_db_ro(db)
                 try:
-                    st = findex_embed.status(conn, stale=self.var_embed.get())
+                    st = findex_embed.status(conn, stale=embed_on)
                 finally:
                     conn.close()
             except Exception:                                  # noqa: BLE001
                 return
             if not st["model"] or not st["files"]:
-                note = "" if not self.var_embed.get() else "not built yet"
+                note = "" if not embed_on else "not built yet"
             else:
                 note = "{:,} of {:,} files with text".format(
                     st["files"], st["text_files"])

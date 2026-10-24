@@ -413,11 +413,12 @@ class SummaryTab:
         gen = self._sgen
         scope = self._summary_scope()
         self.var_sstatus.set("Looking...")
+        db = self.var_db.get()
 
         def work():
             conn = None
             try:
-                conn = self._ro()
+                conn = self._ro(db)
                 run, exact = fs.find_run(conn, scope)
                 secs = fs.sections(conn, run["id"],
                                    None if exact else scope) if run else []
@@ -631,11 +632,12 @@ class SummaryTab:
         gen = self._sfgen
         scope = self._summary_scope()
         exact = self._sexact
+        db = self.var_db.get()
 
         def work():
             conn = None
             try:
-                conn = self._ro()
+                conn = self._ro(db)
                 if s:
                     rows = fs.section_files(conn, s["id"],
                                             None if exact else scope, MAX_ROWS)
@@ -1096,11 +1098,12 @@ class SummaryTab:
         if not path:
             return
         run, exact = self._srun, self._sexact
+        db = self.var_db.get()
 
         def work():
             conn = None
             try:
-                conn = self._ro()
+                conn = self._ro(db)
                 fs.export(conn, run, path, None, None if exact else scope)
                 self.msgs.put(("status", "Summary written to " + path))
                 self.msgs.put(("call", _g().reveal_path, (path,)))
