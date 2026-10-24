@@ -336,11 +336,11 @@ def _decode_grey(path, max_side=DHASH_SIDE):
     if findex.HAVE_FITZ:
         try:
             return _decode_grey_fitz(p, max_side)
-        except Exception:                                      # noqa: BLE001
+        except Exception as exc:                               # noqa: BLE001
             try:
                 import PIL  # noqa: F401
             except ImportError:
-                raise
+                raise exc from None
     try:
         from PIL import Image
     except ImportError:

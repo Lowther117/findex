@@ -283,20 +283,30 @@ def compare(a, b):
         d, s, m, fh = b[key]
         by_sig.setdefault((os.path.basename(key.replace("\\", "/")), s,
                            round(m)), []).append(key)
+    # each list reversed, so its first untaken entry is popped off the end
+    # (taken ones are dropped on the way) - linear even when thousands of
+    # added files share one hash, where filtering per missing file was not
+    for lst in by_hash.values():
+        lst.reverse()
+    for lst in by_sig.values():
+        lst.reverse()
+
+    def first_free(lst):
+        while lst and lst[-1] in taken:
+            lst.pop()
+        return lst.pop() if lst else None
+
     still_missing, taken = [], set()
     for key, size in res["missing"]:
         d, s, m, fh = a[key]
-        cands = by_hash.get(fh, []) if fh else []
-        cands = [c for c in cands if c not in taken]
-        if cands:
-            new = cands.pop(0)
+        new = first_free(by_hash.get(fh, [])) if fh else None
+        if new is not None:
             taken.add(new)
             res["moved"].append((key, new, size))
             continue
         sig = (os.path.basename(key.replace("\\", "/")), s, round(m))
-        cands = [c for c in by_sig.get(sig, []) if c not in taken]
-        if cands:
-            new = cands.pop(0)
+        new = first_free(by_sig.get(sig, []))
+        if new is not None:
             taken.add(new)
             res["likely"].append((key, new, size))
             continue

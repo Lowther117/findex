@@ -3459,7 +3459,8 @@ def _headless_log(fallback, argv=None):
     """A text stream for a run that has no console: findex-refresh.log in
     the database's folder (--db is looked for in argv by hand - the parser
     has not run yet and may itself want to print). Truncated per run, so it
-    is always the last run's output. `fallback` when even that fails."""
+    is always the last run's output. `fallback` when even that fails
+    (os.devnull, opened only then, when no fallback is given)."""
     argv = list(sys.argv[1:] if argv is None else argv)
     folder = os.path.dirname(os.path.abspath(DEFAULT_DB))
     for i, a in enumerate(argv):
@@ -3471,7 +3472,7 @@ def _headless_log(fallback, argv=None):
         return open(os.path.join(folder, REFRESH_LOG), "w", encoding="utf-8",
                     errors="replace", buffering=1)
     except OSError:
-        return fallback
+        return fallback if fallback is not None else open(os.devnull, "w")
 
 
 def _machine_flags(p):
@@ -3614,7 +3615,7 @@ def main(argv=None):
     # None for its streams, and the first stderr.write would end it. Send
     # both to a log file beside the database instead; the last run is kept.
     if sys.stdout is None or sys.stderr is None:
-        log = _headless_log(open(os.devnull, "w"), argv)
+        log = _headless_log(None, argv)
         sys.stdout = sys.stdout or log
         sys.stderr = sys.stderr or log
 

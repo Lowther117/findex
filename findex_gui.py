@@ -3032,7 +3032,10 @@ class FindexApp(findex_tabs.ToolTabs):
                     self._finish(msg[1])
         except queue.Empty:
             pass
-        self.root.after(POLL_MS, self._pump)
+        finally:
+            # rescheduled even when a handler raised: one bad message must
+            # not stop every later result, progress line and log line
+            self.root.after(POLL_MS, self._pump)
 
     def _finish(self, code):
         self.proc = None

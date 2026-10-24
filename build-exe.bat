@@ -136,10 +136,12 @@ if errorlevel 1 (
     echo    Build failed.
     goto :failed
 )
-if not exist "%EXE%" (
-    echo    The build finished but %EXE% is not there.
-    goto :failed
-)
+rem Not an if ( ... ) block: a ")" in the folder name - "findex (2)" - inside
+rem %EXE% would close the block early and abort the script.
+if exist "%EXE%" goto :built
+echo    The build finished but %EXE% is not there.
+goto :failed
+:built
 
 rem ---------------------------------------------------------------------
 rem 4. Prove it runs before saying it works.

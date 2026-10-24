@@ -51,6 +51,7 @@ moves. Rule sets can be saved as templates in the index and re-run by name.
 from __future__ import annotations
 
 import csv
+import errno
 import fnmatch
 import html
 import json
@@ -1079,6 +1080,27 @@ def apply(conn, plan, log=None, progress=None):
         batch (op mkdir) and in the index, before anything moves into it."""
         if tdir in made_dirs:
             return
+        if not tdir.startswith(base):
+            # an absolute destination outside the folder: create the part of
+            # its chain that is missing (top-down), recorded the same way,
+            # so the move has somewhere to land and undo takes it away again
+            missing, d = [], tdir
+            while d and not os.path.isdir(findex.lp(d)):
+                missing.append(d)
+                up = _split(d)[0]
+                if up == d:
+                    break
+                d = up
+            for p in reversed(missing):
+                os.mkdir(findex.lp(p))
+                cur.execute("INSERT INTO renames(batch, ts, old_path, new_path, "
+                            "is_dir, op) VALUES (?, ?, '', ?, 1, 'mkdir')",
+                            (batch, now, p))
+                findex.journal_add(cur, [(now, "added", p, None, 0, 1,
+                                          "organise")])
+                made_dirs.add(p)
+            made_dirs.add(tdir)
+            return
         sep = _sep_for(tdir)
         parts = tdir.rstrip(sep).split(sep)
         for k in range(len(parts)):
@@ -1118,7 +1140,11 @@ def apply(conn, plan, log=None, progress=None):
             else:
                 try:
                     os.rename(findex.lp(path), findex.lp(target))
-                except OSError:
+                except OSError as exc:
+                    # copy + delete only across volumes: for any other refusal
+                    # (a file in use) it would leave a stray copy at the target
+                    if exc.errno != errno.EXDEV:
+                        raise
                     shutil.move(findex.lp(path), findex.lp(target))
         except OSError as exc:
             res["failed"].append((path, str(exc)))

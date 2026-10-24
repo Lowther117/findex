@@ -36,8 +36,10 @@ parents, and undone parents-first, so mixed selections stay consistent.
 
 from __future__ import annotations
 
+import errno
 import os
 import re
+import shutil
 import sys
 import time
 import unicodedata
@@ -389,7 +391,13 @@ def undo(conn, batch=None, log=None):
                     and os.path.exists(findex.lp(old))):
                 raise FileExistsError("original name is taken again: " + old)
             os.makedirs(os.path.dirname(findex.lp(old)), exist_ok=True)
-            _move(new, old)
+            try:
+                _move(new, old)
+            except OSError as exc:
+                # an Organise move to another drive comes back the way it went
+                if exc.errno != errno.EXDEV:
+                    raise
+                shutil.move(findex.lp(new), findex.lp(old))
         except OSError as exc:
             failed.append((new, str(exc)))
             if log:
