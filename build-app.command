@@ -167,9 +167,16 @@ pipget() {   # pipget <pip requirement> <friendly name> [extra pip flags...]
     printf '   %s...\n' "$name"
     "$PY" -m pip install --only-binary :all: "$@" "$req" || MISSING="$MISSING $name"
 }
-pipget "pymupdf>=1.26"                 "PDF text"
+# PyMuPDF 2.0 drags in onnxruntime, pymupdf-layout, pymupdf4llm and networkx
+# (a layout/AI add-on findex never uses) - hundreds of MB in the app, and on
+# Windows it crashes PyInstaller's dependency scan outright. Stay on 1.26 and
+# clear any 2.0 left behind by an earlier build.
+"$PY" -m pip uninstall -y pymupdf pymupdf-layout pymupdf4llm onnxruntime networkx >/dev/null 2>&1 || true
+pipget "pymupdf>=1.26,<2"              "PDF text"
 pipget "mutagen>=1.47"                 "media tags"
-pipget "extract-msg>=0.54"             "Outlook messages" --no-binary red-black-tree-mod
+# Floors on oletools / pcodedmp / beautifulsoup4 stop pip backtracking through
+# every release of them and giving up with "resolution-too-deep".
+pipget "extract-msg>=0.54"             "Outlook messages" --no-binary red-black-tree-mod "oletools>=0.60.2" "pcodedmp>=1.2.6" "beautifulsoup4>=4.13" "pyparsing>=3,<4"
 pipget "watchdog>=6.0"                 "live updates"
 # watchdog publishes wheels a little behind new Pythons (none for 3.14 at
 # the time of writing). Its source tarball builds a small C extension, which

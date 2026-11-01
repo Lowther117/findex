@@ -89,15 +89,32 @@ rem (vendor\ has these too, but a frozen build does not look there.)
 rem ---------------------------------------------------------------------
 echo.
 echo == Components to bake in
-call :pipget "pymupdf>=1.26" "PDF text"
+rem PyMuPDF 2.0 pulls in onnxruntime, pymupdf-layout, pymupdf4llm and
+rem networkx (a layout/AI add-on findex never uses). PyInstaller imports
+rem every collected package in one child process to find their DLLs, and
+rem with that lot loaded the child dies with an access violation
+rem ("Isolated subprocess crashed while importing package 'fitz'").
+rem So: stay on the 1.26 line, and clear any 2.0 install left in the venv
+rem by an earlier build so --collect-all pymupdf cannot pick it up.
+"%PY%" -m pip uninstall -y pymupdf pymupdf-layout pymupdf4llm onnxruntime networkx >> "%LOG%" 2>&1
+call :pipget "pymupdf>=1.26,<2" "PDF text"
 call :pipget "mutagen>=1.47" "media tags"
 call :pipget "watchdog>=6.0" "live updates"
 call :pipget "psutil>=6.0"   "resource monitor"
 call :pipget "numpy>=1.26"   "search by meaning"
 
 echo    Outlook messages...
-"%PY%" -m pip install --only-binary :all: --no-binary red-black-tree-mod "extract-msg>=0.54" >> "%LOG%" 2>&1
+rem extract-msg on its own still trips "resolution-too-deep": pip backtracks
+rem through every oletools / pcodedmp / beautifulsoup4 release. Floors on
+rem those three stop the backtracking. If pip still gives up, fall back to
+rem installing the known-good set with --no-deps (same packages pip was
+rem about to pick, just without asking it to prove they fit together).
+"%PY%" -m pip install --only-binary :all: --no-binary red-black-tree-mod "extract-msg>=0.54" "oletools>=0.60.2" "pcodedmp>=1.2.6" "beautifulsoup4>=4.13" "pyparsing>=3,<4" >> "%LOG%" 2>&1
+if not errorlevel 1 goto :msgok
+echo    (pip could not resolve extract-msg - installing a pinned set instead)
+"%PY%" -m pip install --only-binary :all: --no-binary red-black-tree-mod --no-deps "extract-msg>=0.54" "olefile==0.47" "tzlocal>=5,<6" "tzdata" "compressed-rtf>=1.0.6,<2" "ebcdic>=1.1.1,<3" "beautifulsoup4>=4.13,<5" "soupsieve>=1.6.1" "RTFDE>=0.1.1,<0.2" "lark>=1.3,<1.4" "oletools>=0.60.2" "pcodedmp>=1.2.6" "pyparsing>=3,<4" "easygui" "colorclass" "msoffcrypto-tool" "red-black-tree-mod>=1.20,<=1.23" "typing-extensions>=4" >> "%LOG%" 2>&1
 if errorlevel 1 set "MISSING=%MISSING% Outlook-messages"
+:msgok
 
 echo    Windows built-in OCR...
 "%PY%" -m pip install --only-binary :all: winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Globalization winrt-Windows.Graphics.Imaging winrt-Windows.Media.Ocr winrt-Windows.Storage.Streams >> "%LOG%" 2>&1
