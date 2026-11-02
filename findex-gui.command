@@ -21,7 +21,7 @@ if [ ! -x "$PY" ]; then
         exit 1
     }
     "$PY" -m pip install --upgrade pip --quiet
-    "$PY" -m pip install pymupdf --quiet \
+    "$PY" -m pip install "pymupdf>=1.26,<2" --quiet \
         || echo "WARNING: PyMuPDF install failed - PDFs will not be indexed."
 fi
 

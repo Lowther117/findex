@@ -26,7 +26,7 @@ if not exist "%PY%" (
     )
     "%PY%" -m pip install --upgrade pip --quiet
     echo Installing PyMuPDF...
-    "%PY%" -m pip install pymupdf --quiet
+    "%PY%" -m pip install "pymupdf>=1.26,<2" --quiet
     if errorlevel 1 (
         echo WARNING: PyMuPDF install failed - PDFs will not be indexed.
         pause

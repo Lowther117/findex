@@ -147,7 +147,7 @@ else
     fi
 fi
 "$PY" -m pip install --upgrade pip --quiet
-"$PY" -m pip install --upgrade --only-binary :all: pyinstaller \
+"$PY" -m pip install --upgrade --only-binary :all: "pyinstaller>=6.11,<7" \
     || fail "could not install PyInstaller"
 
 # One pip call per package, each with a lower bound. Asked for all five at
@@ -172,24 +172,27 @@ pipget() {   # pipget <pip requirement> <friendly name> [extra pip flags...]
 # Windows it crashes PyInstaller's dependency scan outright. Stay on 1.26 and
 # clear any 2.0 left behind by an earlier build.
 "$PY" -m pip uninstall -y pymupdf pymupdf-layout pymupdf4llm onnxruntime networkx >/dev/null 2>&1 || true
+# Every package gets a floor (oldest tested) and a ceiling at the next major
+# version, so a new major is opted into after a test build rather than found
+# by a routine rebuild - PyMuPDF 2.0 broke two builds that way (Nov 2026).
 pipget "pymupdf>=1.26,<2"              "PDF text"
-pipget "mutagen>=1.47"                 "media tags"
+pipget "mutagen>=1.47,<2"              "media tags"
 # Floors on oletools / pcodedmp / beautifulsoup4 stop pip backtracking through
 # every release of them and giving up with "resolution-too-deep".
-pipget "extract-msg>=0.54"             "Outlook messages" --no-binary red-black-tree-mod "oletools>=0.60.2" "pcodedmp>=1.2.6" "beautifulsoup4>=4.13" "pyparsing>=3,<4"
-pipget "watchdog>=6.0"                 "live updates"
+pipget "extract-msg>=0.54,<1"          "Outlook messages" --no-binary red-black-tree-mod "oletools>=0.60.2" "pcodedmp>=1.2.6" "beautifulsoup4>=4.13" "pyparsing>=3,<4"
+pipget "watchdog>=6.0,<8"              "live updates"
 # watchdog publishes wheels a little behind new Pythons (none for 3.14 at
 # the time of writing). Its source tarball builds a small C extension, which
 # the Xcode command line tools that Homebrew needs anyway can compile - so
 # when the wheel is missing, try that before giving up on live updates.
 if ! "$PY" -c "import watchdog" >/dev/null 2>&1; then
     printf '   live updates: no wheel for this Python - building from source...\n'
-    if "$PY" -m pip install "watchdog>=6.0"; then
+    if "$PY" -m pip install "watchdog>=6.0,<8"; then
         MISSING="${MISSING/ live updates/}"
     fi
 fi
-pipget "psutil>=6.0"                   "resource monitor"
-pipget "numpy>=1.26"                   "search by meaning"
+pipget "psutil>=6.0,<8"                "resource monitor"
+pipget "numpy>=1.26,<3"                "search by meaning"
 pipget "pyobjc-framework-Vision>=10.0" "built-in OCR"
 if [ -n "$MISSING" ]; then
     printf '\n   NOTE: these could not be installed and will be absent from\n'
@@ -201,13 +204,21 @@ fi
 # --------------------------------------------------------------------------
 say "Building"
 rm -rf build dist findex.spec
+# A --collect-* flag names a package that must be installed, so only name the
+# ones that made it in - otherwise one missing optional component (say
+# extract-msg failing to resolve) stops the whole build at PyInstaller with
+# an unrelated-looking error. build-exe.bat does the same. The pyobjc
+# modules below are hidden imports, which PyInstaller only warns about.
+COLLECT=""
+"$PY" -c "import watchdog"    >/dev/null 2>&1 && COLLECT="$COLLECT --collect-submodules watchdog"
+"$PY" -c "import numpy"       >/dev/null 2>&1 && COLLECT="$COLLECT --collect-submodules numpy"
+"$PY" -c "import mutagen"     >/dev/null 2>&1 && COLLECT="$COLLECT --collect-submodules mutagen"
+"$PY" -c "import extract_msg" >/dev/null 2>&1 && COLLECT="$COLLECT --collect-all extract_msg"
+"$PY" -c "import pymupdf"     >/dev/null 2>&1 && COLLECT="$COLLECT --collect-all pymupdf"
+# shellcheck disable=SC2086  # COLLECT is a flag list and must word-split
 "$PY" -m PyInstaller --noconfirm --clean --windowed --name findex \
     --osx-bundle-identifier com.lowther.findex \
-    --collect-submodules watchdog \
-    --collect-submodules numpy \
-    --collect-submodules mutagen \
-    --collect-all extract_msg \
-    --collect-all pymupdf \
+    $COLLECT \
     --hidden-import objc --hidden-import Foundation \
     --hidden-import Quartz --hidden-import Vision \
     findex_app.py \
