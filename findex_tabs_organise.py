@@ -20,7 +20,6 @@ import re
 
 import findex
 import findex_organise
-import findex_rename
 
 RULES_HELP = """\
 THE SIMPLE BUILDER (the default view)
@@ -1142,15 +1141,13 @@ class OrganiseTab:
         self.var_status.set(msg)
         self.refresh_results()
         self.refresh_stats()
-        if getattr(self, "_jloaded", False):
-            self.refresh_journal()
         self._organise_plan()
 
     def organise_undo(self):
         db = self.var_db.get()
         try:
             conn = self._ro()
-            rows = [r for r in findex_rename.batches(conn) if r[2]]
+            rows = [r for r in findex_organise.batches(conn) if r[2]]
             conn.close()
         except Exception:                                      # noqa: BLE001
             rows = []
@@ -1160,17 +1157,16 @@ class OrganiseTab:
         batch, ts, n = rows[0]
         if not messagebox.askyesno(
                 "Undo batch {}?".format(batch),
-                "Reverse the {:,} change(s) made at {}? (Rename and Organise "
-                "share one history - this is the most recent batch of "
-                "either.)".format(n, time.strftime("%H:%M on %d %b",
-                                                   time.localtime(ts)))):
+                "Reverse the {:,} change(s) made at {}? (This is the most "
+                "recent batch.)".format(n, time.strftime("%H:%M on %d %b",
+                                                         time.localtime(ts)))):
             return
 
         def work():
             conn = None
             try:
                 conn = findex.open_db(db, timeout=10)
-                b, done, failed = findex_rename.undo(
+                b, done, failed = findex_organise.undo(
                     conn, batch, log=lambda s: self.msgs.put(("log", s)))
                 self.msgs.put(("call", self._organise_undone, (b, done, failed)))
             except Exception as exc:                           # noqa: BLE001
@@ -1189,8 +1185,6 @@ class OrganiseTab:
         self.var_status.set(msg)
         self.refresh_results()
         self.refresh_stats()
-        if getattr(self, "_jloaded", False):
-            self.refresh_journal()
         self._organise_plan()
 
     def show_organise_help(self):

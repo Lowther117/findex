@@ -14,10 +14,9 @@ among the drives connected right now; when it has simply moved, every path
 under it is rewritten in one transaction and nothing is re-read.
 
 What is rewritten: every text column of every ordinary table in the
-database that holds a path under the old location - files, roots, the
-journal, rename and organise batches, summaries - so the tool modules need
-no knowledge of this. The full-text and trigram tables key on row ids, not
-paths, and are untouched. A journal row ("remapped") records each move.
+database that holds a path under the old location - files, roots, organise
+batches - so the tool modules need no knowledge of this. The full-text and
+trigram tables key on row ids, not paths, and are untouched.
 
 This module imports nothing from findex, so findex can import it at the
 top: PyInstaller then compiles it into the standalone builds.
@@ -28,7 +27,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import time
 
 # Columns the remap never touches even when they are text, and tables it
 # never looks at (FTS5 virtual tables and their shadow tables - their path
@@ -36,8 +34,6 @@ import time
 _SKIP_COLS = {"event", "source", "status", "kind", "ext", "name", "op",
               "error", "key", "format", "volume_id", "volume_label",
               "mount"}
-JOURNAL_EVENT = "remapped"
-
 _cache = {}      # mount point -> (volume_id, label), for this process
 
 
@@ -298,7 +294,7 @@ def _move_prefix(cur, cols, old, new):
         t, c = _q(table), _q(col)
         # a range on the column (index-friendly, case-exact) for everything
         # beneath the location, plus the location itself written without
-        # its trailing separator (how a root or a journal row names it)
+        # its trailing separator (how a root names it)
         cur.execute(
             "UPDATE {t} SET {c} = ? || substr({c}, ?) WHERE {c} >= ? AND "
             "{c} < ?".format(t=t, c=c),
@@ -426,12 +422,6 @@ def apply(conn, moves):
             n = _move_prefix(cur, cols, tmp, new)
             _fix_meta(cur, old, new)
             out[old] = (new, n, dropped[old])
-        now = time.time()
-        for old, new, _tmp in temps:
-            cur.execute(
-                "INSERT INTO journal(ts, event, path, old_path, size, is_dir, "
-                "source) VALUES (?, ?, ?, ?, NULL, 1, 'remap')",
-                (now, JOURNAL_EVENT, new, old))
         conn.commit()
     except Exception:
         conn.rollback()

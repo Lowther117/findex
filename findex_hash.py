@@ -4,7 +4,7 @@ findex_hash - content fingerprints for the findex index.
 
     findex hash                 fingerprint what exact-duplicate detection needs
     findex hash --all           quick fingerprint + detected type of EVERY file
-    findex hash --full          full hash of every file (for snapshot/verify)
+    findex hash --full          full hash of every file
     findex hash --near          text fingerprints for near-duplicate documents
     findex hash --images        picture fingerprints for look-alike images
     findex dupes --exact        byte-identical files, whatever they are named
@@ -84,7 +84,7 @@ def sniff(head, size=None):
     """Name the type of a file from its first bytes. Returns a short lower-
     case label ('pdf', 'docx', 'jpg', 'exe', 'text', 'binary', 'empty').
     Only labels that are certain are returned - anything ambiguous is
-    'binary' or 'text', which the mismatch report treats as unknown."""
+    'binary' or 'text'."""
     if not head:
         return "empty" if (size or 0) == 0 else "binary"
     h = head
@@ -188,55 +188,6 @@ def sniff(head, size=None):
     if ctrl * 20 > len(h):
         return "binary"
     return "text"
-
-
-# Extension -> the kinds a genuine file of that type sniffs as. Used by the
-# health report: a file whose name and bytes disagree is either misnamed,
-# a download that saved an error page, or damaged. Extensions not listed
-# here are never flagged; 'text' and 'binary' are treated as unknown.
-EXPECTED = {
-    ".pdf": {"pdf"},
-    ".docx": {"docx", "zip"}, ".docm": {"docx", "zip"},
-    ".xlsx": {"xlsx", "zip"}, ".xlsm": {"xlsx", "zip"},
-    ".pptx": {"pptx", "zip"}, ".pptm": {"pptx", "zip"},
-    ".odt": {"odt", "zip"}, ".ods": {"ods", "zip"}, ".odp": {"odp", "zip"},
-    ".epub": {"epub", "zip"}, ".zip": {"zip", "docx", "xlsx", "pptx", "jar",
-                                      "epub", "odt", "ods", "odp", "apk"},
-    ".jar": {"jar", "zip"}, ".apk": {"apk", "zip"}, ".cbz": {"zip"},
-    ".doc": {"ole", "rtf", "docx"}, ".xls": {"ole", "xlsx", "html"},
-    ".ppt": {"ole", "pptx"}, ".msg": {"ole"},
-    ".rtf": {"rtf"},
-    ".png": {"png"}, ".jpg": {"jpg"}, ".jpeg": {"jpg"}, ".gif": {"gif"},
-    ".webp": {"webp"}, ".bmp": {"bmp"}, ".tif": {"tiff"}, ".tiff": {"tiff"},
-    ".ico": {"ico"}, ".heic": {"heic"}, ".svg": {"svg", "xml"},
-    ".mp4": {"mp4"}, ".m4v": {"mp4"}, ".mov": {"mov", "mp4"},
-    ".m4a": {"m4a", "mp4"}, ".mp3": {"mp3"}, ".flac": {"flac"},
-    ".ogg": {"ogg"}, ".opus": {"ogg"}, ".wav": {"wav"}, ".avi": {"avi"},
-    ".mkv": {"mkv"}, ".webm": {"mkv"}, ".wma": {"wma"},
-    ".rar": {"rar"}, ".7z": {"7z"}, ".gz": {"gz"}, ".tgz": {"gz"},
-    ".bz2": {"bz2"}, ".xz": {"xz"}, ".tar": {"tar"}, ".cab": {"cab"},
-    ".exe": {"exe"}, ".dll": {"exe"}, ".sys": {"exe"}, ".ocx": {"exe"},
-    ".scr": {"exe"}, ".db": {"sqlite"}, ".sqlite": {"sqlite"},
-    ".xml": {"xml", "text", "html", "svg"}, ".html": {"html", "text", "xml"},
-    ".htm": {"html", "text", "xml"}, ".ps": {"ps"},
-}
-
-
-def mismatch(ext, kind):
-    """True when the name says one thing and the bytes another - and both
-    are known well enough to be sure."""
-    want = EXPECTED.get(ext or "")
-    if not want or not kind or kind in ("empty", "unreadable"):
-        return False
-    if kind in want:
-        return False
-    if kind in ("text", "binary"):
-        # unknown content: only a problem for types that ALWAYS carry a
-        # signature - a "PDF" or "JPEG" made of plain bytes is not one
-        return ext in (".pdf", ".docx", ".xlsx", ".pptx", ".png", ".jpg",
-                       ".jpeg", ".gif", ".zip", ".exe", ".dll", ".mp3",
-                       ".mp4", ".rar", ".7z", ".doc", ".xls", ".ppt", ".msg")
-    return True
 
 
 # ----------------------------------------------------------------------------
@@ -947,10 +898,9 @@ def add_commands(sub):
                        "fingerprints")
     p.add_argument("--all", action="store_true",
                    help="quick fingerprint + detected type of every file "
-                        "(reads 16 KB each; feeds the type-mismatch report)")
+                        "(reads 16 KB each)")
     p.add_argument("--full", action="store_true",
-                   help="full hash of every file (reads everything; needed "
-                        "for hashed snapshots and moved-file detection)")
+                   help="full hash of every file (reads everything)")
     p.add_argument("--near", action="store_true",
                    help="also text-fingerprint documents for --near dupes")
     p.add_argument("--near-only", action="store_true",

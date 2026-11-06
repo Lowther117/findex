@@ -18,9 +18,6 @@ rem
 rem The noisy output of pip and PyInstaller goes to build-win-log.txt so this
 rem window stays readable; if anything fails, the tail of that log is shown
 rem here. The finished exe is tested before this script claims success.
-rem The last step fetches the AI engine and the models the Summary tab and
-rem search by meaning use, sized to this PC's graphics card - into findex's
-rem own folder, no app installed (set FINDEX_AI_MODELS=none first to skip it).
 
 setlocal
 cd /d "%~dp0"
@@ -104,7 +101,6 @@ call :pipget "pymupdf>=1.26,<2" "PDF text"
 call :pipget "mutagen>=1.47,<2" "media tags"
 call :pipget "watchdog>=6.0,<8" "live updates"
 call :pipget "psutil>=6.0,<8" "resource monitor"
-call :pipget "numpy>=1.26,<3" "search by meaning"
 
 echo    Outlook messages...
 rem extract-msg on its own still trips "resolution-too-deep": pip backtracks
@@ -139,7 +135,6 @@ set "COLLECT="
 "%PY%" -c "import pymupdf" >nul 2>&1 && set "COLLECT=%COLLECT% --collect-all pymupdf"
 "%PY%" -c "import mutagen" >nul 2>&1 && set "COLLECT=%COLLECT% --collect-submodules mutagen"
 "%PY%" -c "import watchdog" >nul 2>&1 && set "COLLECT=%COLLECT% --collect-submodules watchdog"
-"%PY%" -c "import numpy" >nul 2>&1 && set "COLLECT=%COLLECT% --collect-submodules numpy"
 
 rem ---------------------------------------------------------------------
 rem 3. Build
@@ -188,83 +183,11 @@ type "%APPDIR%\findex-selftest.txt" >> "%LOG%"
 del /q "%APPDIR%\findex-selftest.txt" >nul 2>&1
 if not "%RC%"=="0" goto :selftestbad
 
-rem ---------------------------------------------------------------------
-rem 5. The AI models
-rem
-rem The Summary tab's written summaries come from language models run by
-rem Ollama's engine, and search by meaning (findex embed) from its embedding
-rem model. No Ollama app is installed - no installer, no tray icon: findex
-rem downloads the standalone engine (about 1.5 GB; the CUDA libraries for
-rem NVIDIA cards are in it, which is most of that size) into its own data
-rem folder (%LOCALAPPDATA%\findex\ollama) and runs it hidden, only while
-rem findex is open. Fetching it and the models here means they are simply
-rem there the first time the app is opened. They live ON THIS PC (models in
-rem %USERPROFILE%\.ollama), not inside dist\findex - far too big to carry
-rem in the app folder. Copy the app to another PC and AI summaries, Set up
-rem fetches them there.
-rem
-rem "auto" (the default) looks at this PC's graphics card and fetches what
-rem suits it: the quick CPU model (gemma3:1b, 815 MB), the biggest model
-rem the card can hold (gemma3:12b, 8.1 GB, on a 12 GB card; nothing extra
-rem on a PC with no usable GPU) and the embedding model (274 MB). It then
-rem loads the model and prints whether the engine put it on the GPU.
-rem
-rem Already-installed models are skipped, so only the first build
-rem downloads. Nothing here can fail the build - the app works without
-rem them. No admin rights are needed.
-rem
-rem   set FINDEX_AI_MODELS=none        before running this: skip the step
-rem   set FINDEX_AI_MODELS=all         every small CPU model instead
-rem   set FINDEX_AI_MODELS=gemma3:1b   just that one (or a,b,c for a list)
-rem ---------------------------------------------------------------------
-echo.
-echo == AI models
-set "AIRESULT=skipped"
-if not defined FINDEX_AI_MODELS set "FINDEX_AI_MODELS=auto"
-if /i "%FINDEX_AI_MODELS%"=="none" goto :aiskip
-if /i "%FINDEX_AI_MODELS%"=="skip" goto :aiskip
-if /i "%FINDEX_AI_MODELS%"=="auto" goto :aiauto
-if /i not "%FINDEX_AI_MODELS%"=="all" goto :ailist
-echo    Fetching the AI engine ^(no app is installed^) and all five small
-echo    models - about 10 GB the first time, nothing after that.
-echo    FINDEX_AI_MODELS=none skips this.
-goto :airun
-:aiauto
-echo    Fetching the AI engine ^(no app is installed^) and the models that
-echo    suit this PC's graphics card - up to about 11 GB the first time,
-echo    nothing after that. FINDEX_AI_MODELS=none skips this.
-goto :airun
-:ailist
-echo    Fetching the AI engine ^(no app is installed^) and: %FINDEX_AI_MODELS%
-:airun
-echo ---- ai models: %FINDEX_AI_MODELS% ---->> "%LOG%"
-"%PY%" -u "%HERE%findex.py" summarise --ai-setup --model "%FINDEX_AI_MODELS%"
-if errorlevel 1 goto :aibad
-set "AIRESULT=installed on this PC"
-echo ai models ok>> "%LOG%"
-goto :aidone
-:aibad
-set "AIRESULT=NOT all installed - see the note above"
-echo ai models: problems>> "%LOG%"
-echo    NOTE: the AI models are not all installed ^(reason above^). The app
-echo    is fine without them; AI summaries, Set up retries from inside it.
-goto :aidone
-:aiskip
-echo    Skipped: FINDEX_AI_MODELS is %FINDEX_AI_MODELS%.
-goto :aiend
-:aidone
-rem The build started the engine to do the downloading; it is not left running
-rem (one that was already running before the build is left alone). A server
-rem left behind would also keep this folder locked against deleting.
-"%PY%" -u "%HERE%findex.py" summarise --ai-stop >nul 2>&1
-:aiend
-
 echo.
 echo Done: %EXE%
 echo.
 echo   Copy the folder anywhere and double-click findex.exe.
 echo   It keeps its index in the folder, wherever the folder is.
-echo   AI models: %AIRESULT%.
 echo.
 echo Log: %LOG%
 pause

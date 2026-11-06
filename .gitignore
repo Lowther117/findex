@@ -32,8 +32,5 @@ findex-selftest.txt
 Claude outputs/
 findex-crash.log
 
-# scratch file the Verify tab writes beside the app while a comparison runs
-.findex-verify.json
-
 # index lock (findex index / background refresh)
 findex.db.lock

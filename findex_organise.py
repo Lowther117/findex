@@ -43,9 +43,9 @@ alone). Files no rule matches stay where they are unless a sweep is on.
 Nothing is overwritten: a different file already at the target is a
 collision and is skipped; an identical one (by content hash) counts as
 done when --skip-identical is set. --apply moves (or --copy copies) as one
-batch that `findex rename --undo` / `findex organise --undo` reverses,
-recorded in the journal; --remove-empty removes folders left empty by the
-moves. Rule sets can be saved as templates in the index and re-run by name.
+batch that `findex organise --undo` reverses; --remove-empty removes
+folders left empty by the moves. Rule sets can be saved as templates in the
+index and re-run by name.
 """
 
 from __future__ import annotations
@@ -62,12 +62,25 @@ import sys
 import time
 
 import findex
-import findex_rename
 
 try:
     import findex_hash
 except ImportError:
     findex_hash = None
+
+# Every move, copy, folder made and folder removed by an --apply is recorded
+# here as one batch, so --undo can reverse it in the opposite order.
+RENAMES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS renames (
+    id       INTEGER PRIMARY KEY,
+    batch    INTEGER NOT NULL,
+    ts       REAL NOT NULL,
+    old_path TEXT NOT NULL,
+    new_path TEXT NOT NULL,
+    is_dir   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_renames_batch ON renames(batch);
+"""
 
 TEMPLATES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS organise_templates (
@@ -1063,7 +1076,7 @@ def export(plan, out_path, fmt=None):
 def apply(conn, plan, log=None, progress=None):
     """Carry the plan out. Returns dict(batch, moved, copied, removed,
     failed=[(path, error)])."""
-    findex_rename.ensure_schema(conn)
+    ensure_schema(conn)
     copy = bool(plan.options.get("copy"))
     batch = conn.execute("SELECT COALESCE(MAX(batch),0)+1 FROM renames"
                          ).fetchone()[0]
@@ -1096,8 +1109,6 @@ def apply(conn, plan, log=None, progress=None):
                 cur.execute("INSERT INTO renames(batch, ts, old_path, new_path, "
                             "is_dir, op) VALUES (?, ?, '', ?, 1, 'mkdir')",
                             (batch, now, p))
-                findex.journal_add(cur, [(now, "added", p, None, 0, 1,
-                                          "organise")])
                 made_dirs.add(p)
             made_dirs.add(tdir)
             return
@@ -1113,8 +1124,6 @@ def apply(conn, plan, log=None, progress=None):
                 cur.execute("INSERT INTO renames(batch, ts, old_path, new_path, "
                             "is_dir, op) VALUES (?, ?, '', ?, 1, 'mkdir')",
                             (batch, now, p))
-                findex.journal_add(cur, [(now, "added", p, None, 0, 1,
-                                          "organise")])
             if not cur.execute("SELECT 1 FROM files WHERE path=?",
                                (p,)).fetchone():
                 try:
@@ -1169,16 +1178,12 @@ def apply(conn, plan, log=None, progress=None):
             cur.execute("INSERT INTO renames(batch, ts, old_path, new_path, "
                         "is_dir, op) VALUES (?, ?, ?, ?, 0, 'copy')",
                         (batch, now, path, target))
-            findex.journal_add(cur, [(now, "added", target, None, size, 0,
-                                      "organise")])
             res["copied"] += 1
         else:
-            findex_rename._rename_in_index(cur, path, target, False)
+            _rename_in_index(cur, path, target, False)
             cur.execute("INSERT INTO renames(batch, ts, old_path, new_path, "
                         "is_dir, op) VALUES (?, ?, ?, ?, 0, 'move')",
                         (batch, now, path, target))
-            findex.journal_add(cur, [(now, "renamed", target, path, size, 0,
-                                      "organise")])
             res["moved"] += 1
         if (res["moved"] + res["copied"]) % 200 == 0:
             conn.commit()
@@ -1194,8 +1199,6 @@ def apply(conn, plan, log=None, progress=None):
                     cur.execute("INSERT INTO renames(batch, ts, old_path, "
                                 "new_path, is_dir, op) VALUES (?, ?, ?, '', 1, "
                                 "'rmdir')", (batch, now, folder))
-                    findex.journal_add(cur, [(now, "deleted", folder, None, 0,
-                                              1, "organise")])
                     res["removed"] += 1
             except OSError as exc:
                 if log:
@@ -1235,14 +1238,182 @@ def delete_template(conn, name):
 
 
 # ----------------------------------------------------------------------------
+# Undo - the batch log (moved here from the old rename tool; the table keeps
+# its name so batches recorded by earlier versions still undo)
+# ----------------------------------------------------------------------------
+
+def ensure_schema(conn):
+    conn.executescript(RENAMES_SCHEMA)
+    # op: move (also plain renames from earlier versions), copy, mkdir, rmdir
+    have = {r[1] for r in conn.execute("PRAGMA table_info(renames)")}
+    if "op" not in have:
+        conn.execute("ALTER TABLE renames ADD COLUMN op TEXT NOT NULL "
+                     "DEFAULT 'rename'")
+        conn.commit()
+
+
+def _case_only(old, new):
+    """Is old -> new just a change of letter case of the same file? On
+    Windows normcase says so; on macOS (case-insensitive, case-preserving)
+    the two names are one file on disk, which samefile confirms - without
+    it, the file's own current name read as "already taken"."""
+    if os.path.normcase(old) == os.path.normcase(new):
+        return True
+    if old == new or old.lower() != new.lower():
+        return False
+    try:
+        return os.path.samefile(findex.lp(old), findex.lp(new))
+    except OSError:
+        return False
+
+
+def _move(old, new):
+    """os.rename, made to stick for a case-only change: a volume that takes
+    that rename as a no-op gets it via a temporary name instead."""
+    os.rename(findex.lp(old), findex.lp(new))
+    if old == new or old.lower() != new.lower():
+        return
+    folder, name = os.path.split(new)
+    try:
+        if name in os.listdir(findex.lp(folder or ".")):
+            return
+    except OSError:
+        return
+    tmp = new + ".findex-case-tmp"
+    os.rename(findex.lp(new), findex.lp(tmp))
+    try:
+        os.rename(findex.lp(tmp), findex.lp(new))
+    except OSError:
+        os.rename(findex.lp(tmp), findex.lp(old))   # put it back as it was
+        raise
+
+
+def _rename_in_index(cur, old, new, is_dir):
+    name = os.path.basename(new)
+    ext = "" if is_dir else os.path.splitext(name)[1].lower()
+    cur.execute("UPDATE files SET path=?, name=?, ext=? WHERE path=?",
+                (new, name, ext, old))
+    if is_dir:
+        sep = "\\" if "\\" in old or (len(old) > 1 and old[1] == ":") else "/"
+        like = findex.like_escape(old.rstrip("\\/")) + sep + "%"
+        cur.execute("UPDATE files SET path = ? || substr(path, ?) "
+                    "WHERE path LIKE ? ESCAPE '!'",
+                    (new, len(old) + 1, like))
+
+
+def batches(conn):
+    """[(batch, ts, count)] newest first."""
+    ensure_schema(conn)
+    return conn.execute(
+        "SELECT batch, MIN(ts), COUNT(*) FROM renames GROUP BY batch "
+        "ORDER BY batch DESC").fetchall()
+
+
+def undo(conn, batch=None, log=None):
+    """Reverse a batch (the latest by default) in the opposite order.
+    Returns (batch, done, [(path, error)]). A file that has since moved on
+    or been deleted is reported, not guessed at."""
+    ensure_schema(conn)
+    if batch is None:
+        row = conn.execute("SELECT MAX(batch) FROM renames").fetchone()
+        batch = row[0] if row else None
+    if not batch:
+        return None, 0, []
+    rows = conn.execute("SELECT id, old_path, new_path, is_dir, op FROM renames "
+                        "WHERE batch=? ORDER BY id DESC", (batch,)).fetchall()
+    done, failed = 0, []
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+    now = time.time()
+    for rid, old, new, is_dir, op in rows:
+        if op == "mkdir":
+            # a folder the batch created: take it away again if it is empty
+            try:
+                if os.path.isdir(findex.lp(new)):
+                    if os.listdir(findex.lp(new)):
+                        raise OSError("folder is not empty: " + new)
+                    os.rmdir(findex.lp(new))
+            except OSError as exc:
+                failed.append((new, str(exc)))
+                if log:
+                    log("undo failed: {}: {}".format(new, exc))
+                continue
+            cur.execute("DELETE FROM files WHERE path=?", (new,))
+            cur.execute("DELETE FROM renames WHERE id=?", (rid,))
+            done += 1
+            continue
+        if op == "rmdir":
+            # a folder the batch removed as empty: bring it back
+            try:
+                os.makedirs(findex.lp(old), exist_ok=True)
+                st = os.stat(findex.lp(old))
+            except OSError as exc:
+                failed.append((old, str(exc)))
+                continue
+            cur.execute(findex.UPSERT, (old, os.path.basename(old), "", 0,
+                                        st.st_mtime, now, 0, "folder", None, 1))
+            cur.execute("DELETE FROM renames WHERE id=?", (rid,))
+            done += 1
+            continue
+        if op == "copy":
+            # undoing a copy = removing the copy we made, provided it is still
+            # the same bytes as its source (size + timestamp); an edited copy
+            # is left alone and reported
+            try:
+                if not os.path.exists(findex.lp(new)):
+                    raise FileNotFoundError("copy no longer at " + new)
+                if os.path.exists(findex.lp(old)):
+                    a, b = os.stat(findex.lp(old)), os.stat(findex.lp(new))
+                    if a.st_size != b.st_size or abs(a.st_mtime - b.st_mtime) > 2:
+                        raise OSError("copy has been changed since: " + new)
+                os.remove(findex.lp(new))
+            except OSError as exc:
+                failed.append((new, str(exc)))
+                if log:
+                    log("undo failed: {}: {}".format(new, exc))
+                continue
+            for (fid,) in cur.execute("SELECT id FROM files WHERE path=?",
+                                      (new,)).fetchall():
+                cur.execute("DELETE FROM docs WHERE rowid=?", (fid,))
+                cur.execute("DELETE FROM files WHERE id=?", (fid,))
+            cur.execute("DELETE FROM renames WHERE id=?", (rid,))
+            done += 1
+            continue
+        try:
+            if not os.path.exists(findex.lp(new)) and not os.path.lexists(
+                    findex.lp(new)):
+                raise FileNotFoundError("no longer at " + new)
+            if (not _case_only(new, old)
+                    and os.path.exists(findex.lp(old))):
+                raise FileExistsError("original name is taken again: " + old)
+            os.makedirs(os.path.dirname(findex.lp(old)), exist_ok=True)
+            try:
+                _move(new, old)
+            except OSError as exc:
+                # a move to another drive comes back the way it went
+                if exc.errno != errno.EXDEV:
+                    raise
+                shutil.move(findex.lp(new), findex.lp(old))
+        except OSError as exc:
+            failed.append((new, str(exc)))
+            if log:
+                log("undo failed: {}: {}".format(new, exc))
+            continue
+        _rename_in_index(cur, new, old, is_dir)
+        cur.execute("DELETE FROM renames WHERE id=?", (rid,))
+        done += 1
+    conn.commit()
+    return batch, done, failed
+
+
+# ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
 
 def cmd_organise(args):
     if args.undo is not None:
         conn = findex.open_db(args.db)
-        batch, done, failed = findex_rename.undo(conn, args.undo or None,
-                                                 log=print)
+        batch, done, failed = undo(conn, args.undo or None, log=print)
         conn.close()
         print("Undid batch {}: {:,} reversed{}".format(
             batch, done, ", {:,} failed".format(len(failed)) if failed else "")

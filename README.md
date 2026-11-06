@@ -27,18 +27,12 @@ and no machine-specific path is ever stored.
 | `findex.py` | engine | engine | The indexer and search engine, and the CLI itself (`python findex.py ...`). The app runs this in the background. |
 | `findex_gui.py` | the app | the app | The Tkinter window. The launchers run it; `python findex_gui.py` works too. |
 | `findex_app.py` | build only | build only | Entry point compiled into the standalone exe/app. Not run directly. |
-| `theme.py` | the app | the app | The shared house palettes (Phosphor purple, Dark, Light) and ttk styling the window uses. Not run directly. |
-| `findex_tabs.py` | the app | the app | The Health, Duplicates, Rename and Verify tabs. Part of the app; not run directly. |
+| `theme.py` | the app | the app | The shared house palettes (Phosphor glass, Phosphor purple, Dark, Light) and ttk styling the window uses. Not run directly. |
+| `findex_tabs.py` | the app | the app | The Duplicates tab, and the wiring for the tool tabs. Part of the app; not run directly. |
 | `findex_tabs_organise.py` | the app | the app | The Organise tab. Part of the app; not run directly. |
-| `findex_tabs_summary.py` | the app | the app | The Summary tab. Part of the app; not run directly. |
-| `findex_summary.py` | engine | engine | What a folder holds: files sorted into labelled sections by subject, a card per file, optional summaries from a local AI model (GPU-aware): `findex summarise`. |
-| `findex_embed.py` | engine | engine | Search by meaning: vectors for the indexed text from a local embedding model, `~words` in a query: `findex embed`. |
 | `findex_organise.py` | engine | engine | Sort a folder into subfolders by rules, with suggestions, a rule check, preview and undo: `findex organise`. |
 | `findex_hash.py` | engine | engine | Content fingerprints and type detection: `findex hash`, `findex dupes --exact / --near / --images`. |
-| `findex_report.py` | engine | engine | The health report: `findex report`. |
-| `findex_secrets.py` | engine | engine | Passwords, keys and tokens in indexed text: `findex secrets`. |
-| `findex_verify.py` | engine | engine | Snapshots and verification: `findex snapshot`, `findex verify`. |
-| `findex_rename.py` | engine | engine | Bulk rename with preview and undo: `findex rename`. |
+| `findex_volumes.py` | engine | engine | Follows a drive whose letter or mount point changed. Imported by the engine; not run directly. |
 | `findex_schedule.py` | engine | engine | The background index refresh - registers and removes the OS scheduler job: `findex schedule`. |
 | `build-exe.bat` | optional | - | Builds `dist\findex\findex.exe` - a standalone app folder that needs no Python. Only if you want findex as an ordinary app. |
 | `build-app.command` | - | optional | Builds `dist/findex.app` - the same thing for the Mac. |
@@ -52,19 +46,15 @@ indexing run starts from scratch.
 
 ```
 Findex/
-  findex.py           engine + CLI (indexing, search, watch, journal, tree)
+  findex.py           engine + CLI (indexing, search, watch, tree)
   findex_hash.py      } tools built on the index - each adds its own
-  findex_report.py    } commands to the CLI: hash, report, secrets,
-  findex_secrets.py   } snapshot, verify, rename. findex.py imports
-  findex_verify.py    } them when present; a missing one just means
-  findex_rename.py    } its commands are absent
-  findex_organise.py  }
-  findex_schedule.py  }
-  findex_summary.py   }
-  findex_gui.py       Tkinter desktop app (Search, Index, Changes tabs)
-  findex_tabs.py      the Health, Duplicates, Rename and Verify tabs
+  findex_organise.py  } commands to the CLI: hash, dupes, organise,
+  findex_schedule.py  } schedule. findex.py imports them when present;
+                      } a missing one just means its commands are absent
+  findex_volumes.py   follows a drive whose letter changed
+  findex_gui.py       Tkinter desktop app (Search, Index tabs)
+  findex_tabs.py      the Duplicates tab
   findex_tabs_organise.py   the Organise tab
-  findex_tabs_summary.py    the Summary tab
   theme.py            phosphor/dark/light palettes + styling for the app
   findex_app.py       entry point for the optional standalone build
   findex.bat          CLI launcher (Windows)
@@ -122,9 +112,8 @@ Nothing is installed system-wide except that optional tesseract fallback.
   opens - a location whose path has gone is looked for by that identity
   among the drives connected now. When the same drive is simply somewhere
   else, every path under it is rewritten in one transaction (the
-  `files` table, the journal, rename and organise history, summaries) and
-  the run then finds everything *unchanged*. A `remapped` entry in the
-  Changes tab records each move. If a *different* drive has taken the old
+  `files` table, the organise history) and the run then finds everything
+  *unchanged*. If a *different* drive has taken the old
   letter, that location is left alone and skipped for the run, so the
   stranger's files never replace the real drive's entries; after
   reformatting or replacing a drive on purpose, `findex roots --restamp`
@@ -163,8 +152,8 @@ PDFs and OCR are not re-run for this.)
 
 Every control describes itself: hover over it and the description appears
 immediately as grey text in the status bar, with a balloon after a short pause.
-Help > Search syntax has the query cheat-sheet. The app opens in the Phosphor purple
-theme (the same look as Winnow); the Appearance menu picks Phosphor purple, Dark
+Help > Search syntax has the query cheat-sheet. The app opens in the Phosphor glass
+theme (the same look as the website and Winnow); the Appearance menu picks Phosphor glass, Phosphor purple, Dark
 or Light, Ctrl+D cycles them, and the choice is remembered in `findex_gui.json`.
 
 **Search tab**
@@ -180,12 +169,6 @@ or Light, Ctrl+D cycles them, and the choice is remembered in `findex_gui.json`.
     work; half-typed queries quietly fall back to a literal word search)
   - `C:` or `D:\Photos` or `/Users/dan` limits results to that drive/folder
   - `ext:pdf;docx` limits the type; `folder:` / `file:` limit the kind
-  - `section:insurance` limits to files in a Summary section whose name
-    contains that word (`section:#12` is one exact section), and
-    `doctype:invoice` to files the Summary pass typed as that - `letter`,
-    `cv`, `contract`, `statement`, `payslip`, `minutes`, `report`, `manual`,
-    `policy`, `form`, `certificate`, `receipt`, `email`, `code`... Both only
-    match folders that have been summarised (see the Summary tab)
   - **dates and sizes**: `before:2020` (also `2020-03`, `2020-03-15`,
     `15/03/2020`, `today`, `yesterday`), `after:2019-06` (later than the
     whole of that month), `since:2019-06` (from its start),
@@ -197,18 +180,9 @@ or Light, Ctrl+D cycles them, and the choice is remembered in `findex_gui.json`.
     `!before:2020`
   - e.g. `C: content:dan ext:pdf !draft`, or `D:\Photos before:2020` to
     line up everything old enough to clear out
-  - **`~` searches by meaning** - see *Search by meaning* below.
-    `~letter about the boiler warranty` lists the files that are *about*
-    that, however they put it, best first; the filters still apply
-    (`~mortgage offer ext:pdf D:\Docs`), and `content:word` becomes a
-    must-contain filter on the matches. `about:"a phrase"` is the same for
-    one phrase inside an ordinary query. Needs the Index tab's *Search by
-    meaning* to have run.
 - **Weighted results**: name matches come back exact-name first, then names
   starting with the term, then newest; content matches are relevance-ranked
-  (bm25). Browsing with no terms is newest-first. Meaning results carry a
-  match percentage, shown in the pane underneath with the best-matching
-  passage.
+  (bm25). Browsing with no terms is newest-first.
 - **Any size, instantly.** The list never draws more than a few hundred
   rows: it holds a window around the part you are looking at and slides it
   as you scroll, while the scrollbar describes the whole list. So the
@@ -216,11 +190,6 @@ or Light, Ctrl+D cycles them, and the choice is remembered in `findex_gui.json`.
   uses a fraction of the memory it used to, and sorting or selecting
   everything (Ctrl/Cmd+A) covers every row, drawn or not. Home / End jump
   to the ends.
-- Right-click > **Rename these...** hands the selected files to the Rename
-  tab as a hand-picked selection.
-- Right-click > **Summarise this folder** takes the selected folder (or the
-  folder of the selected file) to the Summary tab, and starts the summary
-  if that folder has never had one.
 - Right-click > **Export this list...** (also File > Export this list...)
   saves exactly what is on screen - the current search, type filter and
   sort order - to a file. Pick the type in the save dialog: `.csv` has
@@ -250,7 +219,7 @@ or Light, Ctrl+D cycles them, and the choice is remembered in `findex_gui.json`.
   highlighted.
 - **Clearing out in bulk**: type the filter (`D:\Photos before:2020`, or
   `older:3y ext:tmp`), sort if you want to check the ends, Ctrl/Cmd+A,
-  Delete. After every delete, paste, rename or index run the list is
+  Delete. After every delete, paste, organise or index run the list is
   re-read **keeping your filter, your sort order and your place in it** -
   and whatever of the selection is still there stays selected - so you
   can work down a long list in rounds. Shift-click selects a range
@@ -287,14 +256,6 @@ or Light, Ctrl+D cycles them, and the choice is remembered in `findex_gui.json`.
   current without waiting for the next run. Runs quietly alongside normal
   indexing and is shut down with the app. (Uses the OS's own change
   notifications via the `watchdog` component, installed automatically.)
-- *Search by meaning* - tick it and, after every index run, findex turns
-  the text of new and changed files into vectors with a local embedding
-  model, so `~what you mean` works in the search box (details under
-  *Search by meaning* below). **Update now** does it straight away; the
-  first time it fetches the model (274 MB) and, if findex has no AI engine
-  yet, the engine. The note beside it shows the coverage ("54,210 of
-  55,615 files with text") and how many are still to do. Progress shows on
-  this tab's bar and Stop works; what was done is kept.
 - *Export file tree...* writes everything the index knows - every folder and
   file under every indexed location - to a file, straight from the database,
   so it takes seconds even for hundreds of thousands of entries and needs no
@@ -306,275 +267,6 @@ or Light, Ctrl+D cycles them, and the choice is remembered in `findex_gui.json`.
 - *Clear index...* deletes findex's database and starts fresh - after a
   confirmation, and never touching the files on your disk. Also available as
   `findex clear` on the command line.
-
-**Changes tab**
-
-- A journal of every change findex has noticed inside the indexed
-  locations - files and folders **added, modified, renamed or deleted** -
-  with when it was seen. Filter by text, by kind of change, and by time
-  (last hour, today, 7 days, 30 days, everything). Double-click opens the
-  file, or its folder if it has since gone; right-click for Show in folder
-  and Copy path.
-- Two things write to it. An **index run** records what differs from the
-  last run: a path it had not seen is *added*, a changed size or timestamp
-  is *modified*, a path that has gone is *deleted*. A run cannot tell a
-  rename from a delete-plus-add, and records exactly that. **Live updates**
-  records changes as they happen and *does* see renames, so they appear as
-  *renamed* with the old name alongside; those rows are marked *live*.
-- The first run over a new location is not journaled - every file would be
-  "added", which is true but tells nobody anything. Recording starts from
-  the second run, or as soon as Live updates is on.
-- Live-update noise is collapsed: an editor's burst of saves is one
-  *modified*, a file created and deleted within the same two-second tick
-  (Office lock files and the like) is dropped, and a file created then
-  edited is just *added*.
-- Entries are kept for 90 days by default (`findex journal --keep-days N`,
-  0 = forever); older ones are pruned at the end of each index run.
-  **Clear journal...** empties it; the index is untouched.
-
-**Summary tab** - what a folder holds, as labelled sections
-
-Point it at a folder and it tells you what is in there without you opening
-anything. One row of controls, two lists and a card:
-
-```
-Folder [..................] [Browse...] [Go to] [Summarise] [AI summaries] [More]
-Sections                    Files in the selected section
-                            The selected section's / file's card
-```
-
-While anything runs - a summary, AI summaries, a model download - the
-status line at the bottom of the tab shows what it is doing and how far it
-has got ("Reading files: 2,400 of 60,000 (4%)", then "sorting them into
-sections...") with a progress bar and a **Stop** button beside it. Stopping
-keeps everything done so far.
-
-The three panes are divided by bars you can drag: pull the one between
-*Sections* and the file list sideways, and the one between the file list
-and the card up or down, to give whichever matters most the room. The
-positions are remembered. (The Health tab's two lists have the same
-divider, and every list's column edges drag as well.)
-
-The tab is always about ONE folder - the one in the *Folder* box - and
-everything on it covers that folder and what is below it, nothing else.
-Blank is the whole index. Get to a folder by typing or **Browse...**, from
-**Go to** (the folders inside this one, biggest first, plus *Up one
-folder*), or by right-clicking a result on the Search tab > **Summarise
-this folder**.
-
-- **Summarise** is the offline pass. It reads the text findex *already
-  extracted* - no file on disk is opened, no AI is involved - and:
-  - gives every readable file a **card**: the kind of document it is
-    (invoice, letter, CV, contract, statement, payslip, minutes, report,
-    manual, policy, form, certificate, email, spreadsheet, presentation,
-    code...), its title, its key phrases, the dates / amounts / reference
-    numbers / emails / postcodes found in it, and a two-sentence gist
-    *lifted from its own text* (chosen, not written);
-  - sorts the documents into **sections by subject**, each named from the
-    phrases its documents share and few others do ("Insurance · Policy ·
-    Renewal"). Documents that fit nowhere land in *Unsorted*, by kind;
-  - groups everything with no text (pictures, video, archives, programs)
-    and everything that is not prose (code, data, logs) by type, splitting
-    a big group by the sub-folder its files sit in.
-
-  It is word statistics, not understanding: expect the odd section that is
-  really two subjects, and an Unsorted pile. Roughly 3 ms of CPU per
-  document, spread over every core - tens of seconds for tens of thousands
-  of documents - and cards are kept, so a second run, or a run on a
-  sub-folder, only reads what changed.
-- **Sections** (left) - click one to list its files; click a file for its
-  card underneath. *Overview* describes the folder as a whole. A section's
-  (or the folder's) card is a summary of all its files, not of one: what
-  they are about, the years their text mentions, the names that recur, and
-  the few files most typical of the set with the sentences lifted from them
-  - worked out from the cards with no AI. *AI summaries > Summarise this
-  whole folder* adds a written paragraph and key points on top. A
-  double-click (or More > *Show this section in Search*) opens the section
-  in the Search tab as `section:#n`, where the files can be copied, moved,
-  renamed or narrowed further. The file list has the usual right-click menu
-  (Open / Show in folder / Copy path / Delete to the bin).
-- **A folder inside a summarised one** needs no run of its own: go into it
-  and the tab shows the parent's sections narrowed to that folder, and says
-  so. Summarise it anyway for sections worked out from its files alone -
-  each folder keeps its own, side by side.
-- **AI summaries** (optional) - a small language model running on this
-  computer writes proper summaries. Nothing is sent anywhere; no account,
-  no admin rights. The models are run by [Ollama](https://ollama.com)'s
-  engine, but **no Ollama app is installed**: findex downloads the
-  standalone engine into its own data folder
-  (`%LOCALAPPDATA%\findex\ollama` on Windows, `~/Library/Application
-  Support/findex/ollama` on a Mac), checks it against the checksum Ollama
-  publishes, and runs it hidden - no installer, no tray icon, nothing in
-  Applications or the Start menu - only while findex is open. (If you
-  already have Ollama installed yourself, findex uses that instead of
-  downloading a second copy.) The menu holds:
-  - *Summarise the selected files* (also on the right-click menu) - two or
-    three written sentences for each file, **and then one combined summary
-    of them all together**: a paragraph on what the selection as a whole
-    is about, with its key points underneath. It goes on the card as soon
-    as it is written and stays under *Overview* as the folder's latest
-    selection summary. A few seconds per file; Stop on the Index tab or
-    the tab's own Stop cancels and keeps what was done.
-  - *Summarise this whole folder* - a combined summary of **each
-    section's files** (with a plain title for the section), then **one of
-    the entire folder** built from those, shown under *Overview*. Nothing
-    is re-read for this: it works from the files' cards - their written
-    summaries where they have one, the sentences lifted from them where
-    not - condensed a batch at a time and then merged, so it scales to any
-    number of files. A section of more than 120 files is represented by
-    its 120 most typical ones, and says so to the model.
-  - **Closing findex closes it all.** If findex had to start Ollama
-    itself, it ends it - and the model processes under it - when the
-    window closes, along with any run still going, so nothing is left in
-    the background holding memory or keeping the app's folder locked. An
-    Ollama that was already running before findex (its tray app, say) is
-    left alone; findex just unloads the models it used from it. The build
-    scripts likewise stop the Ollama they started once the models are in.
-    `findex summarise --ai-stop` does the same from the command line.
-  - **The graphics card is used when there is one.** The menu's header
-    says what findex found (`NVIDIA GeForce RTX 3080 Ti - 12.0 GB for
-    models`, or *No graphics card found - models run on the CPU*) and,
-    once a model is loaded, where the engine actually put it - *loaded on
-    the GPU*, *on the CPU*, or split. That second line is the real check:
-    it comes from the engine's own account of the loaded model, not from
-    the hardware being present, so a driver too old for the engine's CUDA
-    build shows up as "on the CPU" and the Output pane says so. With no
-    model chosen, findex picks the **biggest installed model the card can
-    hold** (see the tiers below), and gives such a model more of each file
-    (14,000 characters and an 8k context instead of 5,000 and 4k) - on a
-    GPU a 12B model answers about as fast as a 1B one does on a CPU, and
-    writes far better summaries. NVIDIA cards are read through
-    `nvidia-smi`, AMD cards from the display adapter's registry entry
-    (Windows); an Apple-silicon Mac counts about two thirds of its unified
-    memory as the GPU's share; Intel Macs and integrated graphics are CPU.
-    `findex summarise --ai-check` loads the model from the command line and
-    reports where it landed; `--ai-status` shows the card.
-  - *Model* - one flat list: the models installed on this computer first
-    (tick the one to use; the header says which is in use), then the
-    rest findex knows, smallest first, each with a line on what it is
-    like. A model that has just finished downloading is in the list the
-    next time the menu opens - the menu re-checks the engine whenever it
-    is a few seconds out of date. Any other model already in Ollama is
-    listed too.
-
-    | Model | Download | What it is like |
-    |---|---|---|
-    | `gemma3:1b` | 815 MB | tiny and quick; plain sentences (the CPU default) |
-    | `qwen3.5:0.8b` | 1.2 GB | tiny; the newest of them |
-    | `llama3.2:1b` | 1.3 GB | tiny; plain summaries |
-    | `granite4:micro` | 2.1 GB | small; good on business documents |
-    | `gemma3:4b` | 3.3 GB | small; writes better, slower on a CPU (fine on a 6 GB card) |
-    | `qwen3:8b` | 5.2 GB | medium; needs a 10 GB card or a 16 GB Apple-silicon Mac |
-    | `gemma3:12b` | 8.1 GB | large; needs a 12 GB card |
-    | `gemma3:27b` | 17 GB | largest; needs a 24 GB card or a 36 GB+ Apple-silicon Mac |
-
-    The "needs" figures are the dedicated graphics memory for the weights
-    plus an 8k context and headroom; *Set up* and the build scripts use
-    them to pick the biggest one the card holds. If the engine reports a
-    model only partly on the GPU, pick the next size down - the Output
-    pane says so when it happens. Requests to the small models are kept
-    short for speed (the first ~5,000 characters of a file plus its end,
-    a 4k context, "thinking" switched off for models that have it).
-  - *Set up* (shown until a model is installed) - fetches the engine when
-    there is none (about 170 MB on a Mac, 1.5 GB on Windows - the CUDA
-    libraries for NVIDIA cards are most of that - once), starts it, and
-    downloads **what suits this computer**: `gemma3:1b` always (so the
-    index still summarises on a laptop), the biggest GPU-tier model the
-    card can hold, and the embedding model for *Search by meaning*. That
-    is `findex summarise --ai-setup --model auto`, and it is what the
-    build scripts run. It finishes by loading the model and saying where
-    it landed. `findex summarise --ai-remove` deletes findex's copy of the
-    engine again (the models, in `~/.ollama`, are kept). `FINDEX_AI_URL`
-    points findex at an Ollama running somewhere other than
-    `http://127.0.0.1:11434`.
-- **More** - *Export this summary...* (`.html` is a self-contained page of
-  sections and files with their kind, summary and key phrases; `.csv` is
-  one file per row; `.json` and `.txt` too), *fewer / balanced / more
-  sections* for the next run, and *Forget this folder's summary*.
-- Cards and sections live in the index database and follow it. A file that
-  leaves the index takes its card with it; a file that changes gets a new
-  card on the next run (and loses its AI summary, which described the old
-  text).
-
-**Search by meaning** (`~` in the search box; `findex embed`)
-
-Keyword search finds the words you remember. This finds what you *mean*:
-`~letter about the boiler warranty` lists the letter that says "Worcester
-Bosch guarantee" and never uses the word boiler. It is the one thing in
-findex that a graphics card changes from impractical to routine.
-
-- **How it works.** The text findex has already extracted is turned into
-  vectors by a local embedding model - Ollama's `nomic-embed-text` (274
-  MB), run by the same hidden engine the Summary tab uses, so nothing
-  leaves the computer. A search embeds your words the same way and ranks
-  files by how closely their vectors point the same way (cosine
-  similarity), then applies whatever else was in the query - `ext:`, a
-  drive or folder, `!word`, and `content:word` as a must-contain filter.
-  The best 300 files are listed, best first, each with its match
-  percentage and the passage that matched in the pane underneath.
-- **What is stored.** Each file with text gets pieces of about 1,200
-  characters - all of it up to 12 pieces (a few pages, which is most
-  files), otherwise 12 pieces spread evenly through the first 90,000
-  characters, start and end included. Each piece is 768 numbers at one
-  byte each plus a scale: about 780 bytes, so roughly two thirds of the
-  size of the text for short files, far less for long ones, in two tables
-  (`embeds`, `embedded`) in the same database. 55,000 documents come to a
-  few hundred MB on disk; searching holds the vectors in memory as a
-  matrix (about 120 MB for 150,000 pieces), loaded on the first `~` search
-  after the app opens (a second or so) and kept while they are unchanged.
-  Scoring 150,000 pieces takes well under a tenth of a second.
-- **Keeping it current.** A run only touches files whose text changed
-  since their vectors were made, and drops the vectors of files that have
-  gone - so with the Index tab's *Search by meaning* ticked, each index run
-  is followed by a short embedding run. The first run is the big one:
-  minutes for tens of thousands of documents on a graphics card, hours on
-  a CPU. Stop keeps what was done.
-- **Honest limits.** A long document is sampled, not read whole - what sits
-  between two pieces is invisible to meaning search (keyword search still
-  sees every word). Meaning search is ranking, not matching: there is
-  always a "best" result, which is why the percentage is shown; the list
-  stops where matches fall clearly short of the best one (20 points
-  below it, or under 35% outright), so a query nothing is about returns a
-  handful of rows, not 300. Files with no extracted text
-  (pictures, archives, names-only files) are not in it. Live typing waits
-  450 ms rather than 120 ms before searching, because each search is a
-  trip to the model.
-- **Command line.** `findex embed [FOLDER]` makes or updates the vectors
-  (`--rebuild` remakes them all; `--status` shows coverage and the model;
-  `--setup` fetches the engine and model; `--forget` drops them; `-q
-  "words"` tries a search). `findex find "~boiler warranty ext:pdf"`
-  searches, with `--json` / `--csv` as usual. Needs the `numpy` package,
-  which the app installs on its next start and the build scripts bake in.
-
-**Health tab** - what is wrong with the tree, read from the index
-
-- **Scan** works every category out from the index alone - nothing on disk
-  is opened - so a 500,000-file tree takes seconds. Pick a category on the
-  left and its files list on the right; the list works like the Search
-  list (open, show in folder, copy path, Delete to the Recycle Bin).
-  Categories: empty folders; zero-byte files; paths over the 260-character
-  Windows limit; names Windows refuses (`< > : " | ? *`, trailing spaces or
-  dots, `CON`/`NUL`/`COM1`, macOS-style non-NFC Unicode); case clashes (two
-  names in one folder differing only by case - fine on a Mac, a collision
-  on Windows, OneDrive and SharePoint); temp and lock files (`~$doc.docx`,
-  `*.tmp`, `Thumbs.db`, `.DS_Store`, `*.crdownload`...); stale files
-  (untouched for N years - the spinner sets N); the largest files; the
-  deepest paths; unreadable or corrupt files (extraction failed, or the
-  file could not be opened); type mismatches; possible secrets.
-- **Fingerprint types** reads the first 16 KB of every file to learn what it
-  actually is - a PDF, a Word document, a JPEG, an executable - so the
-  *Type does not match name* category can be filled in: the `.pdf` that is
-  really an HTML error page, the `.docx` that is 1 byte of nothing, the
-  `.jpg` that is a PNG. Runs in the background with progress; Stop on the
-  Index tab cancels; a re-run only reads files not yet fingerprinted.
-- **Possible secrets** runs the extracted text through patterns for cloud
-  API keys, private key blocks, connection strings with passwords, tokens
-  and `password = ...` lines. Values are shown masked - the point is to find
-  the file, not to copy the secret into a report.
-- **Export report...** writes the lot: `.html` is a self-contained page with
-  the summary cards, age and type breakdowns, space by location and every
-  category; `.csv` is one finding per row; `.txt` and `.json` too.
-- Scope limits the report to one folder or drive.
 
 **Duplicates tab** - four answers to "is this a copy of that?"
 
@@ -610,28 +302,6 @@ findex that a graphics card changes from impractical to routine.
   selects every copy but one in each set - then Delete sends the selection
   to the Recycle Bin. Nothing is deleted until you do that. **Use stored
   hashes only** skips reading files and lists what earlier runs proved.
-
-**Rename tab** - bulk renaming from a search, previewed first, undoable
-
-- The selection is a findex search (`D:\Photos ext:jpg`, `content:invoice
-  !draft`...) or a hand-picked set sent over from the Search tab. Every
-  result is a candidate.
-- Operations, applied in order: find/replace (plain or regex with `\1`
-  groups, optionally ignoring case); case (lower / upper / title /
-  sentence); **Normalise** - safe everywhere: NFC Unicode, illegal
-  characters to `_`, single spaces, no leading/trailing spaces or dots,
-  reserved names prefixed; a date prefix from the modified date (any
-  strftime format); a maximum length; `.EXT` to `.ext`. Folders are
-  included only when asked, and renaming one re-points everything beneath.
-- The preview shows every file's new name and whether it is safe.
-  Collisions - two files landing on one name, or a name already taken on
-  disk or in the index - are skipped, never overwritten. Nothing changes
-  until **Apply renames...**, which renames on disk and in the index as one
-  batch, recorded in the journal.
-- **Undo last batch...** reverses it in the opposite order (children were
-  renamed before parents, so they are undone parents-first). A file that
-  has since moved on is reported, not guessed at. `findex rename --history`
-  lists batches; any batch can be undone from the command line.
 
 **Organise tab** - sort a folder's files into subfolders by rules
 
@@ -685,27 +355,10 @@ findex that a graphics card changes from impractical to routine.
 - **Move N files... / Copy N files...** carries the plan out as one batch -
   moves or copies, the folders it created, the folders it removed - and
   **Undo the last run...** reverses the lot in the opposite order, folders
-  included. Rename and Organise share one batch history. **More > Save these
+  included. **More > Save these
   rules as...** keeps a rule set with its options in the index for next
   time; **More > Export the plan...** writes summary, rule check, tree and
   plan as a page, CSV, text or JSON.
-
-**Verify tab** - prove a copy or a later state matches
-
-- **Save snapshot...** writes a manifest of a folder (or the whole index):
-  relative path, type, size, timestamp and, with **Hash every file first**,
-  a content hash per file. Slow with hashing on a big tree, but it lets
-  verify prove bytes rather than sizes and dates, and recognise moved files.
-- **Verify** compares a snapshot with: *the same place as the index has it
-  now* (what changed since - run an index first); *a copy at* another
-  folder - after a server move, a SharePoint migration, a backup to USB -
-  walked and hashed directly from disk so it need not be indexed; or
-  *another snapshot*. Results: changed, missing, added, **moved** (identical
-  content at a new path), likely moved (same name, size and time), touched
-  (same bytes, new timestamp), folders missing/added. Save the result as
-  a page, CSV, text or JSON.
-- Snapshots are small gzip files (a 500,000-file tree is a few MB); a
-  `.tsv` name writes them uncompressed.
 
 **Status strip** (along the bottom, on all tabs)
 
@@ -750,59 +403,14 @@ findex hash                            fingerprints for exact duplicates
 findex hash --all                      + detected type of every file
 findex hash --full                     full hash of every file
 findex hash --images                   picture fingerprints for --images dupes
-findex report                          health summary on the console
-findex report -o health.html           the full report (.html/.csv/.txt/.json)
-findex report --list bad-names         one category in full
-findex secrets                         passwords, keys, tokens in documents
-findex snapshot --under D:\Work --hash  manifest of a tree, with hashes
-findex verify before.fxsnap            what changed since (index now)
-findex verify before.fxsnap --folder E:\Work-copy --disk   check a copy
-findex verify before.fxsnap --against after.fxsnap
-findex rename "D:\Photos ext:jpg" --find IMG_ --replace ""   dry run
-findex rename "D:\Shared" --normalise --apply
-findex rename --undo                   reverse the last batch
 findex organise D:\Downloads --suggest -o tidy.rules     draft rules
 findex organise D:\Downloads --rules tidy.rules          preview (dry run)
 findex organise D:\Downloads --rules tidy.rules --save-template tidy
 findex organise D:\Downloads --rules tidy.rules --sweep --remove-empty --apply
 findex organise D:\Downloads --template tidy --copy --apply
 findex organise --undo
-findex summarise D:\Shared             sort one folder into sections by subject
-findex summarise                       ...or everything in the index
-findex summarise D:\Shared --show      the sections found last time
-findex summarise --section 12          the files in one section, with cards
-findex summarise D:\Shared -o out.html  export (.html .csv .json .txt)
-findex summarise D:\Shared --detail high   more, narrower sections
-findex summarise D:\Shared --ai        ...then have the local model write one
-                                       summary per section and one of the folder
-findex summarise --ai-files a.pdf b.docx   a summary of each, then of them all
-findex summarise --ai-section 12 -n 20     ...of 20 files of a section
-findex summarise --ai-files a.pdf b.docx --each   each only, no combined one
-findex summarise --ai-status           is a local model available? what GPU?
-findex summarise --ai-check            load the model: did it land on the GPU?
-findex summarise --ai-models           the models findex offers, with what is installed
-findex summarise --ai-setup            fetch the engine (no app), download gemma3:1b
-findex summarise --ai-setup --model auto          ...or what suits this computer:
-                                       gemma3:1b + the biggest GPU model that fits
-                                       + the embedding model (what the builds do)
-findex summarise --ai-setup --model llama3.2:1b   ...or the one you name
-findex summarise --ai-setup --model all           ...or all five small ones (8.7 GB)
-findex summarise --ai-stop             stop the engine findex started
-findex summarise --ai-remove           delete findex's copy of the engine
-findex summarise D:\Shared --forget    drop that folder's sections
-findex embed                           search by meaning: vectorise the indexed text
-findex embed D:\Shared                 ...just one folder (new/changed files only)
-findex embed --status                  coverage and model
-findex embed --setup                   fetch the engine and nomic-embed-text
-findex embed -q "boiler warranty"      try a meaning search
-findex embed --forget                  drop the vectors
-findex find "~boiler warranty letter"  search by meaning (filters still apply)
-findex find "~mortgage offer ext:pdf D:\Docs"
 findex tree                            export the index as a tree (Downloads)
 findex tree -o C:\out.csv --under D:\Work
-findex journal                         what changed, newest first
-findex journal --since 24h --type deleted
-findex journal invoice --under D:\Work -n 50
 findex schedule --every 6h             background refresh every 6 hours
 findex schedule --status               is it registered, how often, last run
 findex schedule --off                  remove it
@@ -813,7 +421,7 @@ findex gui                             open the desktop app
 ```
 
 `--db PATH` puts the index somewhere other than next to the script.
-`findex report --help` and friends list every option; the tool modules'
+`findex organise --help` and friends list every option; the tool modules'
 docstrings (top of each `findex_*.py`) explain the reasoning.
 
 `--json` and `--csv` on `find`, `name`, `search` and `dupes` write the
@@ -823,11 +431,10 @@ for a content search and a set number for duplicates. Nothing else is
 printed, so `findex find "ext:pdf" --json | jq` and
 `findex dupes --exact --csv > dupes.csv` just work.
 
-`findex verify` exits 0 when nothing differs and 1 when something does, so it
-can end a migration script. `findex index` exits 3 when another index run
-already holds the database (see *Background refresh*). `findex rename` and `findex organise` are dry runs
-unless `--apply` is given; `organise` refuses to apply while the rules have
-errors (`--force` applies the rows that can be placed).
+`findex index` exits 3 when another index run already holds the database
+(see *Background refresh*). `findex organise` is a dry run unless `--apply`
+is given, and refuses to apply while the rules have errors (`--force`
+applies the rows that can be placed).
 
 The locations you index are remembered **in the index itself** - a `roots`
 table in `findex.db` - not in a settings file beside whichever copy of findex
@@ -888,8 +495,7 @@ the settings file the first time the app opens it, and keeps it from then on.
   and similar. Note this is by folder *name*, so a data folder that happens to
   be called e.g. `recovery` or `env` is also skipped.
 - **Fingerprints** (only when asked - `findex hash`, the Duplicates tab's
-  identical / similar modes, the Health tab's *Fingerprint types*, a hashed
-  snapshot): a quick BLAKE2b of the first 16 KB, the detected type from
+  identical / similar modes): a quick BLAKE2b of the first 16 KB, the detected type from
   those bytes, and a full-file BLAKE2b hash; plus a 64-bit text fingerprint
   (simhash) of the extracted text for near-duplicate documents, and a
   64-bit picture fingerprint (dhash) of image files for look-alike images.
@@ -973,36 +579,6 @@ Each build ends by running the built app's own self-test and says what is
 wrong rather than Done if something is missing; the full run is in
 `build-win-log.txt` / `build-mac-log.txt`.
 
-**The AI models are installed by the build too, sized to the machine.** As
-its last step each script fetches the AI engine if the machine has none -
-Ollama's standalone build, into findex's own data folder, with no app
-installed and no admin rights (see the Summary tab) - starts it, looks at
-the graphics card, and downloads what suits the computer (`findex summarise
---ai-setup --model auto`): the quick CPU model `gemma3:1b` (815 MB), the
-biggest GPU-tier model the card can hold (`gemma3:12b`, 8.1 GB, on a 12 GB
-card; nothing extra on a machine with no usable GPU) and the embedding
-model for search by meaning (`nomic-embed-text`, 274 MB). It then loads the
-model and prints whether the engine put it on the GPU - the honest check.
-Whatever is already there is skipped, so later builds download nothing. So
-after a build, AI summaries and search by meaning simply work the first
-time the app is opened.
-
-- The engine and models go onto *that machine* (the engine in findex's
-  data folder, the models in `~/.ollama`), not into `dist/`: they are far
-  too big to carry inside the app. Copy the app to another computer and *AI summaries > Set up* fetches
-  them there, sized to that computer.
-- Nothing in this step can fail the build - the app is complete without
-  the models, and says so if they are missing.
-- Choose what is fetched with `FINDEX_AI_MODELS` before running the script:
-  `none` skips the step, `all` fetches the five small CPU models instead
-  (8.7 GB), `gemma3:1b` fetches just that one (815 MB), and
-  `gemma3:1b,llama3.2:1b` a list. Windows: `set FINDEX_AI_MODELS=none`
-  then `build-exe.bat`; Mac: `FINDEX_AI_MODELS=none ./build-app.command`.
-- The Windows engine download (1.5 GB) carries Ollama's CUDA libraries,
-  which is why it is big - that is what makes an NVIDIA card usable
-  without installing anything else. The Mac build uses Metal on Apple
-  silicon as it is.
-
 ### The exe on a managed PC
 
 `findex.exe` is unsigned - PyInstaller builds are - and a PC under a security
@@ -1030,8 +606,7 @@ so under `--only-binary` pip declares the whole thing impossible. Both builds
 allow an sdist for that one package - it is pure Python, so nothing compiles.
 
 Everything with compiled parts - PyMuPDF for PDF text, watchdog for live
-updates, numpy for search by meaning, the WinRT or Vision OCR bindings - is
-pip-installed at build time,
+updates, the WinRT or Vision OCR bindings - is pip-installed at build time,
 **one package per call, each with a lower bound**. Asked for together with no
 floors, pip walks backwards through dozens of releases re-checking every other
 package against each, and on Python 3.14 gives up with `resolution-too-deep`
@@ -1065,23 +640,6 @@ Explorer, which has its own opinions about long paths.)
   on stop.
 - The index stores absolute file paths, so results from a machine you are not
   currently on will not open until you are back on it.
-- The Summary tab's sections come from word statistics over the text already
-  in the index: files with no extracted text (most images without OCR, video,
-  archives) can only be grouped by type and folder, and a folder of very
-  short or very mixed documents leaves more in *Unsorted*. Document kinds and
-  dates are read the British/English way (`03/04/2024` is 3 April). Written
-  summaries need the local AI engine running and take seconds per file on a
-  CPU - on a graphics card a much bigger model runs at the same speed, and
-  findex picks it automatically.
-- Search by meaning samples long documents (12 pieces of ~1,200 characters)
-  rather than reading them whole, needs the AI engine running to embed the
-  query, and holds the vectors in memory while searching (about 120 MB per
-  150,000 pieces). It is ranking, not matching - the percentage says how
-  close a result is.
-- Whether a model runs on the GPU is the engine's decision: an old graphics
-  driver, or a card the engine's build does not support (AMD on Windows
-  without ROCm, Intel Macs), leaves it on the CPU. The AI summaries menu
-  and `findex summarise --ai-check` say which happened.
 
 ## Licence
 

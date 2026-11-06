@@ -12,16 +12,10 @@ Search tab  one Everything-style box, live as you type: names by default,
 Index tab   pick folders, run an index, watch progress, auto re-index on a
             timer, a background refresh the OS scheduler runs even when the
             app is closed, or live updates (real-time watching).
-Changes     the journal of everything that changed in the indexed folders.
-Health      what is wrong with the tree: empty folders, bad names, long
-            paths, stale/zero-byte/temp files, corrupt files, mismatched
-            types, secrets in documents - and an exportable report.
 Duplicates  same name+size, byte-identical, near-identical text, or
             look-alike images.
-Rename      bulk renaming from a search, with a preview and an undo.
 Organise    sort a folder's files into subfolders by rules - suggested,
             checked, previewed as the resulting tree, applied, undoable.
-Verify      snapshots of a tree and proof that a copy or later state matches.
 The tool tabs live in findex_tabs.py and findex_tabs_organise.py.
 
 Settings are kept in findex_gui.json next to this script. Indexing runs as a
@@ -60,7 +54,7 @@ sys.modules.setdefault("findex_gui", sys.modules[__name__])
 import findex  # noqa: E402
 import findex_volumes  # noqa: E402  - follows a drive whose letter changed
 import theme   # noqa: E402  - the shared house palettes (phosphor/dark/light) + ttk styling
-import findex_tabs  # noqa: E402  - the Health / Duplicates / Rename / Verify tabs
+import findex_tabs  # noqa: E402  - the Duplicates / Organise tabs
 import findex_schedule  # noqa: E402  - the background refresh (OS scheduler)
 
 # One source of truth for "the folder findex owns" - beside the scripts, or
@@ -73,7 +67,6 @@ DEFAULT_DB = os.path.join(HERE, "findex.db")
 
 POLL_MS = 100            # queue drain interval
 LIVE_SEARCH_MS = 120     # debounce for search-as-you-type
-MEANING_SEARCH_MS = 450  # ...when the query has a ~meaning part
 AUTO_CHECK_MS = 20000    # how often the auto re-index timer is checked
 RES_TICK_MS = 2000       # how often the CPU / memory readout refreshes
 MAX_LOG_LINES = 500
@@ -98,9 +91,6 @@ DEFAULTS = {
     "exts": "",
     "save_dir": "",
     "geometry": "1060x700",
-    "ai_model": "",
-    "summary_detail": "normal",
-    "summary_sash": [],
 }
 
 
@@ -150,7 +140,7 @@ def load_settings():
     except (OSError, ValueError):
         pass
     data["dark"] = bool(data.get("dark", True))
-    data["theme"] = theme.from_settings(data)   # phosphor purple by default
+    data["theme"] = theme.from_settings(data)   # phosphor glass by default
     # Relative paths resolve against this folder. An absolute one that no longer
     # exists - the folder was moved, or the index was pointed somewhere else on
     # another machine - falls back to the index next to this script rather than
@@ -207,7 +197,6 @@ PIP_PINS = {
     "extract-msg": "extract-msg>=0.54",
     "watchdog": "watchdog>=6.0",
     "psutil": "psutil>=6.0",
-    "numpy": "numpy>=1.26",
     "pyobjc-framework-Vision": "pyobjc-framework-Vision>=10.0",
 }
 
@@ -329,8 +318,6 @@ def missing_packages():
         missing.append("watchdog")         # live index updates
     if iu.find_spec("psutil") is None:
         missing.append("psutil")           # CPU / memory readout
-    if iu.find_spec("numpy") is None:
-        missing.append("numpy")            # search by meaning (vectors)
     if sys.platform == "darwin" and iu.find_spec("Vision") is None:
         missing.append("pyobjc-framework-Vision")   # macOS built-in OCR
     if os.name == "nt":
@@ -702,16 +689,14 @@ class Row:
     is drawn rather than stored twice. Reads like a dict (row["path"],
     row.get("is_dir")) so the code that consumes results did not change."""
 
-    __slots__ = ("path", "size", "mtime", "snippet", "is_dir", "score")
+    __slots__ = ("path", "size", "mtime", "snippet", "is_dir")
 
-    def __init__(self, path, size=0, mtime=0.0, snippet="", is_dir=False,
-                 score=None):
+    def __init__(self, path, size=0, mtime=0.0, snippet="", is_dir=False):
         self.path = path
         self.size = size
         self.mtime = mtime
         self.snippet = snippet or ""
         self.is_dir = bool(is_dir)
-        self.score = score          # search-by-meaning similarity, or None
 
     @property
     def name(self):
@@ -1130,7 +1115,7 @@ class FindexApp(findex_tabs.ToolTabs):
         self._build_layout()
         self.apply_theme()
         self._fit_window()
-        # Ctrl+D cycles the theme (Phosphor -> Dark -> Light). Entry/Text widgets have an emacs-style
+        # Ctrl+D cycles the theme (Glass -> Phosphor -> Dark -> Light). Entry/Text widgets have an emacs-style
         # Ctrl+D (delete a character) class binding, which is replaced so the
         # toggle is the only thing that happens.
         toggle = lambda e: (self.toggle_dark(), "break")[1]   # noqa: E731
@@ -1264,8 +1249,6 @@ class FindexApp(findex_tabs.ToolTabs):
         self.var_bg_note = tk.StringVar(value="")
         self.var_watch = tk.BooleanVar(value=bool(c.get("watch", False)))
         self.var_watch_note = tk.StringVar(value="")
-        self.var_embed = tk.BooleanVar(value=bool(c.get("embed", False)))
-        self.var_embed_note = tk.StringVar(value="")
         self.var_counts = tk.StringVar(value="Idle")
         self.var_stats = tk.StringVar(value="")
 
@@ -1306,14 +1289,6 @@ class FindexApp(findex_tabs.ToolTabs):
                       command=self.select_all)
         m.add_command(label="Delete...", accelerator="Del",
                       command=self.delete_files)
-        m.add_separator()
-        m.add_command(label="Rename selected...",
-                      command=self.rename_from_search)
-        m.add_command(label="Undo last rename batch...",
-                      command=self.rename_undo)
-        m.add_separator()
-        m.add_command(label="Summarise this folder",
-                      command=self.summary_from_search)
         bar.add_cascade(label="Edit", menu=m)
 
         m = tk.Menu(bar, tearoff=0)
@@ -1343,7 +1318,7 @@ class FindexApp(findex_tabs.ToolTabs):
 
     def apply_theme(self):
         """One coherent, high-contrast look drawn entirely from the shared
-        palette (theme.py) - Phosphor purple by default, Dark and Light on
+        palette (theme.py) - Phosphor glass by default, Phosphor purple, Dark and Light on
         request (Ctrl+D cycles them), remembered between runs. The ttk styles come from theme.apply; everything that
         is a classic tk widget is recoloured here to match."""
         c = theme.apply(self.root, self.var_theme.get())
@@ -1553,13 +1528,10 @@ class FindexApp(findex_tabs.ToolTabs):
         self.tab_index = ttk.Frame(self.nb)
         self.nb.add(self.tab_search, text="  Search  ")
         self.nb.add(self.tab_index, text="  Index  ")
-        self.tab_changes = ttk.Frame(self.nb)
-        self.nb.add(self.tab_changes, text="  Changes  ")
 
         self._build_search_tab()
         self._build_index_tab()
-        self._build_changes_tab()
-        self._build_tool_tabs()          # Summary, Health, Duplicates...
+        self._build_tool_tabs()          # Duplicates, Organise
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         # Right-hand end first, packed right to left: bar, its percentage,
@@ -1648,7 +1620,7 @@ class FindexApp(findex_tabs.ToolTabs):
         hint = ttk.Label(opts, style="Dim.TLabel",
                          text="names as you type  ·  content:word  ·  C:\\  ·"
                               "  ext:pdf  ·  before:2020  ·  older:3y  ·"
-                              "  size:>10mb  ·  !leave-out  ·  ~by meaning")
+                              "  size:>10mb  ·  !leave-out")
         hint.pack(side="left", padx=(0, 20))
         self.tip(hint, "The search understands Everything-style filters, "
                        "combined freely - e.g.  C: content:dan ext:pdf "
@@ -1739,217 +1711,17 @@ class FindexApp(findex_tabs.ToolTabs):
         self.ctx.add_command(label="Copy full path", command=self.copy_selected)
         self.ctx.add_command(label="Select all", command=self.select_all)
         self.ctx.add_separator()
-        self.ctx.add_command(label="Rename these...",
-                             command=self.rename_from_search)
-        self.ctx.add_command(label="Summarise this folder",
-                             command=self.summary_from_search)
         self.ctx.add_command(label="Export this list...",
                              command=self.export_results_ui)
         self.ctx.add_separator()
         self.ctx.add_command(label="Delete...", command=self.delete_files)
-
-    # -- Changes tab: the journal ------------------------------------------
-
-    JOURNAL_SINCE = (("Last hour", "1h"), ("Today", "today"),
-                     ("Last 7 days", "7d"), ("Last 30 days", "30d"),
-                     ("Everything", None))
-    JOURNAL_LIMIT = 2000
-
-    def _build_changes_tab(self):
-        top = ttk.Frame(self.tab_changes)
-        top.pack(fill="x", padx=12, pady=(10, 4))
-
-        self.var_jtext = tk.StringVar()
-        self.var_jtext.trace_add("write", lambda *_: self._journal_debounce())
-        e = ttk.Entry(top, textvariable=self.var_jtext, font=self.search_font)
-        e.pack(side="left", fill="x", expand=True)
-        self.tip(e, "Show only changes whose path contains this.")
-
-        self.var_jtype = tk.StringVar(value="all")
-        cb = ttk.Combobox(top, textvariable=self.var_jtype, width=10,
-                          state="readonly",
-                          values=("all",) + findex.JOURNAL_EVENTS)
-        cb.pack(side="left", padx=(8, 0))
-        cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_journal())
-
-        self.var_jsince = tk.StringVar(value=self.JOURNAL_SINCE[2][0])
-        cb = ttk.Combobox(top, textvariable=self.var_jsince, width=13,
-                          state="readonly",
-                          values=[k for k, _ in self.JOURNAL_SINCE])
-        cb.pack(side="left", padx=(8, 0))
-        cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_journal())
-
-        b = ttk.Button(top, text="Refresh", width=9,
-                       command=self.refresh_journal)
-        b.pack(side="left", padx=(8, 0))
-        b = ttk.Button(top, text="Clear journal...", width=15,
-                       command=self.clear_journal_ui)
-        b.pack(side="left", padx=(8, 0))
-        self.tip(b, "Empty the journal. The index itself is untouched.")
-
-        hint = ttk.Label(self.tab_changes, style="Dim.TLabel", text=(
-            "Every change findex has noticed inside the indexed folders: "
-            "files and folders added, modified, renamed or deleted. Index "
-            "runs record what differs since the last run; Live updates "
-            "records changes as they happen, including renames. The first "
-            "run over a new location is not journaled."))
-        hint.pack(fill="x", padx=12, pady=(0, 6))
-
-        holder = ttk.Frame(self.tab_changes)
-        holder.pack(fill="both", expand=True, padx=12, pady=(0, 10))
-        cols = ("when", "change", "name", "folder", "size", "detail")
-        self.jtree = ttk.Treeview(holder, columns=cols, show="headings",
-                                  selectmode="extended")
-        for key, text, width, anchor, stretch in (
-                ("when", "When", 140, "w", False),
-                ("change", "Change", 80, "w", False),
-                ("name", "Name", 240, "w", False),
-                ("folder", "Folder", 360, "w", True),
-                ("size", "Size", 80, "e", False),
-                ("detail", "Detail", 260, "w", False)):
-            self.jtree.heading(key, text=text)
-            self.jtree.column(key, width=width, anchor=anchor, stretch=stretch)
-        vsb = ttk.Scrollbar(holder, orient="vertical", command=self.jtree.yview)
-        self.jtree.configure(yscrollcommand=vsb.set)
-        self.jtree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-        self.jtree.bind("<Double-1>", lambda e: self._journal_open())
-        self.jtree.bind("<Return>", lambda e: self._journal_open())
-        self.jtree.bind("<Button-3>", self._journal_popup)
-        self.jtree.bind("<Button-2>", self._journal_popup)
-        if sys.platform == "darwin":
-            self.jtree.bind("<Control-Button-1>", self._journal_popup)
-        self.jctx = tk.Menu(self.root, tearoff=0)
-        self._menus.append(self.jctx)
-        self.jctx.add_command(label="Open", command=self._journal_open)
-        self.jctx.add_command(label="Show in folder",
-                              command=self._journal_reveal)
-        self.jctx.add_command(label="Copy path", command=self._journal_copy)
-
-        self.var_jstatus = tk.StringVar(value="")
-        ttk.Label(self.tab_changes, textvariable=self.var_jstatus,
-                  style="Dim.TLabel").pack(fill="x", padx=12, pady=(0, 8))
-        self._jpaths = {}                  # tree iid -> path
-        self._jafter = None
-        self._jloaded = False
 
     def _on_tab_changed(self, _event=None):
         try:
             name = self.nb.tab(self.nb.select(), "text").strip()
         except tk.TclError:
             return
-        if name == "Changes":
-            self.refresh_journal()
-        else:
-            self._tool_tab_shown(name)
-
-    def _journal_debounce(self):
-        if self._jafter:
-            self.root.after_cancel(self._jafter)
-        self._jafter = self.root.after(200, self.refresh_journal)
-
-    def _journal_since(self):
-        label = self.var_jsince.get()
-        code = dict(self.JOURNAL_SINCE).get(label)
-        if code is None:
-            return None
-        if code == "today":
-            t = time.localtime()
-            return time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0,
-                                0, 0, -1))
-        return findex.parse_since(code)
-
-    def refresh_journal(self):
-        """Fill the Changes list from the journal (read-only connection, so
-        it never waits behind an index run)."""
-        self._jafter = None
-        try:
-            conn = findex.open_db_ro(self.var_db.get())
-            rows = findex.journal_rows(
-                conn, since=self._journal_since(),
-                event=self.var_jtype.get(),
-                text=self.var_jtext.get().strip() or None,
-                limit=self.JOURNAL_LIMIT)
-            conn.close()
-        except Exception:                                      # noqa: BLE001
-            rows = []
-        self.jtree.delete(*self.jtree.get_children())
-        self._jpaths = {}
-        for _, ts, event, path, old_path, size, is_dir, source in rows:
-            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-            change = event + ("  (folder)" if is_dir else "")
-            detail = ""
-            if old_path:
-                detail = "was " + (os.path.basename(old_path)
-                                   if os.path.dirname(old_path)
-                                   == os.path.dirname(path) else old_path)
-            if source == "watch":
-                detail = (detail + "   " if detail else "") + "live"
-            iid = self.jtree.insert("", "end", values=(
-                when, change, os.path.basename(path) or path,
-                os.path.dirname(path),
-                "" if is_dir or size is None else findex.human(size),
-                detail))
-            self._jpaths[iid] = path
-        self._jloaded = True
-        n = len(rows)
-        self.var_jstatus.set(
-            "{:,} change(s){}".format(
-                n, " - showing the newest {:,}".format(self.JOURNAL_LIMIT)
-                if n >= self.JOURNAL_LIMIT else "")
-            if n else "No changes recorded for that.")
-
-    def _journal_selected_path(self):
-        sel = self.jtree.selection()
-        return self._jpaths.get(sel[0]) if sel else None
-
-    def _journal_popup(self, event):
-        iid = self.jtree.identify_row(event.y)
-        if not iid:
-            return
-        if iid not in self.jtree.selection():
-            self.jtree.selection_set(iid)
-        self.jctx.tk_popup(event.x_root, event.y_root)
-
-    def _journal_open(self):
-        path = self._journal_selected_path()
-        if not path:
-            return
-        if os.path.exists(path):
-            open_path(path)
-        else:                       # deleted or moved on: show where it was
-            reveal_path(os.path.dirname(path))
-            self.var_status.set("No longer there - opened its folder")
-
-    def _journal_reveal(self):
-        path = self._journal_selected_path()
-        if path:
-            reveal_path(path if os.path.exists(path)
-                        else os.path.dirname(path))
-
-    def _journal_copy(self):
-        paths = [self._jpaths[i] for i in self.jtree.selection()
-                 if i in self._jpaths]
-        if paths:
-            self.root.clipboard_clear()
-            self.root.clipboard_append("\n".join(paths))
-            self.var_status.set("Path copied" if len(paths) == 1
-                                else "{:,} paths copied".format(len(paths)))
-
-    def clear_journal_ui(self):
-        if not messagebox.askyesno(
-                "Clear the journal?",
-                "Forget every recorded change? The index and your files are "
-                "untouched - only the history of what changed is emptied."):
-            return
-        try:
-            conn = findex.open_db(self.var_db.get(), timeout=5)
-            findex.journal_clear(conn)
-            conn.close()
-        except Exception as exc:                               # noqa: BLE001
-            messagebox.showerror("Could not clear", str(exc))
-            return
-        self.refresh_journal()
+        self._tool_tab_shown(name)
 
     def _build_index_tab(self):
         left = ttk.LabelFrame(self.tab_index, text="Folders to index")
@@ -2106,31 +1878,6 @@ class FindexApp(findex_tabs.ToolTabs):
         ttk.Label(live, textvariable=self.var_watch_note,
                   style="Accent.TLabel").pack(side="left", padx=12)
 
-        emb = ttk.Frame(opts)
-        emb.pack(fill="x", padx=8, pady=(0, 8))
-        chk = ttk.Checkbutton(emb, text="Search by meaning - after each run, "
-                                        "vectorise new and changed text "
-                                        "with the local AI",
-                              variable=self.var_embed,
-                              command=self._embed_toggled)
-        chk.pack(side="left")
-        self.tip(chk, "Find files by what they are ABOUT, not just the words "
-                      "in them: type ~ then a description in the search "
-                      "box (~letter about the boiler warranty). A small "
-                      "local embedding model (274 MB, nothing leaves this "
-                      "computer) turns the text findex extracted into "
-                      "vectors; with this ticked that happens on its own "
-                      "after every index run, for new and changed files "
-                      "only. Minutes on a graphics card, hours on a CPU "
-                      "the first time.")
-        b = ttk.Button(emb, text="Update now", command=self.embed_now)
-        b.pack(side="left", padx=(10, 0))
-        self.tip(b, "Vectorise everything with text that has not been done "
-                    "yet, right now. The first time this fetches the "
-                    "embedding model (and the AI engine, if findex has none).")
-        ttk.Label(emb, textvariable=self.var_embed_note,
-                  style="Accent.TLabel").pack(side="left", padx=12)
-
         run = ttk.Frame(self.tab_index)
         run.pack(fill="x", padx=8, pady=8)
         self.btn_start = ttk.Button(run, text="Start indexing", width=16,
@@ -2199,10 +1946,6 @@ class FindexApp(findex_tabs.ToolTabs):
 
         self.update_auto_label()
         self.root.after(1200, self.refresh_bg_state)
-        # the GPU lookup runs a helper program once; do it before any menu
-        # or dialog needs the answer on the UI thread
-        import findex_summary as _fs
-        threading.Thread(target=_fs.gpu_info, daemon=True).start()
 
     # -- searching ---------------------------------------------------------
 
@@ -2210,11 +1953,7 @@ class FindexApp(findex_tabs.ToolTabs):
         if self.search_after:
             self.root.after_cancel(self.search_after)
             self.search_after = None
-        text = self.var_query.get()
-        wait = LIVE_SEARCH_MS
-        if "~" in text or "about:" in text.lower():
-            wait = MEANING_SEARCH_MS    # each one is a trip to the model
-        self.search_after = self.root.after(wait,
+        self.search_after = self.root.after(LIVE_SEARCH_MS,
                                             lambda: self.run_search(live=True))
 
     def _type_filter(self):
@@ -2237,7 +1976,7 @@ class FindexApp(findex_tabs.ToolTabs):
 
     def refresh_results(self):
         """Re-read the list after something changed on disk or in the
-        index (a delete, a paste, a rename, an index run) - keeping the
+        index (a delete, a paste, an organise run, an index run) - keeping the
         filter, the sort order, the scroll position and whatever of the
         selection is still there, so a long clear-out can be worked down
         in rounds."""
@@ -2274,17 +2013,13 @@ class FindexApp(findex_tabs.ToolTabs):
                     "SELECT COUNT(*) FROM files").fetchone()[0]
             raw = findex.query_rows(conn, text, limit, exts=exts, kind=kind,
                                     live=live)
-            rows = [Row(r[0], r[1], r[2], r[3], r[4],
-                        r[5] if len(r) > 5 else None) for r in raw]
+            rows = [Row(r[0], r[1], r[2], r[3], r[4]) for r in raw]
             self.msgs.put(("results", gen, rows, total, keep))
         except sqlite3.OperationalError as exc:
             self.msgs.put(("search_error", gen, str(exc)))
         except Exception as exc:                               # noqa: BLE001
-            if type(exc).__name__ == "EmbedError":
-                self.msgs.put(("search_error", gen, str(exc)))
-            else:
-                self.msgs.put(("search_error", gen,
-                               "{}: {}".format(type(exc).__name__, exc)))
+            self.msgs.put(("search_error", gen,
+                           "{}: {}".format(type(exc).__name__, exc)))
         finally:
             if conn is not None:
                 conn.close()
@@ -2328,11 +2063,7 @@ class FindexApp(findex_tabs.ToolTabs):
         row = self.selected_row()
         if not row:
             return
-        snippet = row.snippet
-        if row.score is not None:
-            snippet = "match {:.0f}%{}".format(
-                row.score * 100, "  ·  " + snippet if snippet else "")
-        self.set_preview(snippet, row.path)
+        self.set_preview(row.snippet, row.path)
 
     def set_preview(self, snippet, path=""):
         self.preview.configure(state="normal")
@@ -2785,7 +2516,7 @@ class FindexApp(findex_tabs.ToolTabs):
         fmt = os.path.splitext(path)[1].lstrip(".").lower() or "csv"
         # the snippet column only means something in a content: or ~ search
         q = findex.parse_query(self.var_query.get())
-        with_snip = bool(q["content"] or q["meaning"])
+        with_snip = bool(q["content"])
         records = [findex.result_record(
             r["path"], r["size"], r["mtime"], r.get("is_dir", False),
             r.get("snippet", "") if with_snip else None) for r in self.rows]
@@ -2961,13 +2692,8 @@ class FindexApp(findex_tabs.ToolTabs):
                             self.sort_col = None
                         self.render_rows(keep_view=keep)
                         if total is None:
-                            if rows and rows[0].score is not None:
-                                self.var_status.set(
-                                    "{:,} closest match(es) by meaning - "
-                                    "best first".format(len(rows)))
-                            else:
-                                self.var_status.set(
-                                    "{:,} result(s)".format(len(rows)))
+                            self.var_status.set(
+                                "{:,} result(s)".format(len(rows)))
                         elif total > len(rows):
                             self.var_status.set(
                                 "Showing the {:,} most recent of {:,} indexed "
@@ -2999,8 +2725,6 @@ class FindexApp(findex_tabs.ToolTabs):
                         self._watch_refresh = time.time()
                         self.refresh_stats()
                         self.run_search(live=True)
-                        if getattr(self, "_jloaded", False):
-                            self.refresh_journal()
                 elif kind == "watch_end":
                     _, proc, code = msg
                     if self.watch_proc is proc:
@@ -3011,8 +2735,7 @@ class FindexApp(findex_tabs.ToolTabs):
                                       "(exit {}) --".format(code))
                 elif kind == "progress":
                     p = msg[1]
-                    if self.proc_kind in findex_tabs.TOOL_KINDS \
-                            or self.proc_kind == "embed":
+                    if self.proc_kind in findex_tabs.TOOL_KINDS:
                         self._tool_progress(p)
                         continue
                     pct_txt = ""
@@ -3072,14 +2795,8 @@ class FindexApp(findex_tabs.ToolTabs):
         self.proc_kind = ""
         self.refresh_stats()
         self.refresh_results()           # same filter, sort and place
-        if getattr(self, "_jloaded", False):
-            self.refresh_journal()
         if kind in findex_tabs.TOOL_KINDS:
             self._tool_finished(kind, code)
-        elif kind == "embed":
-            self._embed_finished(code)
-        elif kind == "index" and code == 0 and self.var_embed.get():
-            self.embed_now(auto=True)    # vectorise what the run changed
         self._maybe_start_watch()        # live updates waiting on setup/run
 
     def log_line(self, text):
@@ -3328,83 +3045,6 @@ class FindexApp(findex_tabs.ToolTabs):
             self.var_stats.set(text)
         except Exception as exc:                               # noqa: BLE001
             self.var_stats.set("Index not readable: {}".format(exc))
-        self._embed_refresh_note()
-
-    # -- search by meaning (findex embed) -----------------------------------
-
-    def _embed_refresh_note(self):
-        db = self.var_db.get()
-        embed_on = self.var_embed.get()
-
-        def work():
-            try:
-                import findex_embed
-                conn = findex.open_db_ro(db)
-                try:
-                    st = findex_embed.status(conn, stale=embed_on)
-                finally:
-                    conn.close()
-            except Exception:                                  # noqa: BLE001
-                return
-            if not st["model"] or not st["files"]:
-                note = "" if not embed_on else "not built yet"
-            else:
-                note = "{:,} of {:,} files with text".format(
-                    st["files"], st["text_files"])
-                if st["stale"]:
-                    note += "  ({:,} to do)".format(st["stale"])
-            err = getattr(self, "_embed_err", "")
-            if err:
-                note = err + ("  -  " + note if note else "")
-            self.msgs.put(("call", self.var_embed_note.set, (note,)))
-        threading.Thread(target=work, daemon=True).start()
-
-    def _embed_toggled(self):
-        self.cfg["embed"] = bool(self.var_embed.get())
-        self._embed_refresh_note()
-
-    def embed_now(self, auto=False):
-        """Run findex embed as an engine child. auto=True is the follow-on
-        after an index run: silent, and skipped if anything is running."""
-        if self.proc is not None:
-            if not auto:
-                messagebox.showinfo("Busy", "Something is already running - "
-                                            "wait for it to finish.")
-            return
-        import findex_embed
-        import findex_summary as fs
-        if auto and not (fs.find_ollama() or self._sai.get("ok")):
-            # never fetch a 1.5 GB engine behind the user's back - Update
-            # now (which asks first) or a build puts it there
-            self._embed_err = "needs the AI engine - press Update now"
-            self._embed_refresh_note()
-            return
-        if not auto and not (fs.find_ollama() or fs.ai_status()["ok"]):
-            if not messagebox.askyesno(
-                    "Set up search by meaning?",
-                    "This downloads the embedding model {} ({}) and the AI "
-                    "engine that runs it ({}) into findex's own folder - no "
-                    "app is installed, nothing leaves this computer.\n\n"
-                    "{}\n\nGo ahead?".format(
-                        findex_embed.MODEL, findex_embed.MODEL_SIZE,
-                        fs.engine_size() or "about 170 MB", fs.gpu_line())):
-                return
-        try:
-            self._sused.add(findex_embed.MODEL)   # unloaded when we close
-        except AttributeError:
-            pass
-        self._embed_err = ""
-        cmd = engine_command() + ["--db", self.var_db.get(), "embed",
-                                  "--progress"]
-        self._progress_est = 0
-        self.launch(cmd, "embed", "Vectorising text for search by meaning...")
-
-    def _embed_finished(self, code):
-        self._embed_err = ("the AI engine is not available - see Output"
-                           if code == 2 else
-                           "stopped early - Update now carries on"
-                           if code else "")
-        self._embed_refresh_note()
 
     def choose_db(self):
         path = filedialog.asksaveasfilename(
@@ -3464,17 +3104,8 @@ class FindexApp(findex_tabs.ToolTabs):
             "                    its start; modified:2018..2020 within\n"
             "  older:3y  newer:30d   by age (y w d h m)\n"
             "  size:>10mb        also size:<1kb, size:1mb..100mb\n"
-            "  section:insurance files in a Summary section named so\n"
-            "  doctype:invoice   files the Summary pass typed as that\n"
-            "                    (letter, cv, contract, statement, minutes,\n"
-            "                     report, manual, email, code...)\n"
             "  !draft            leave out names containing draft\n"
-            "  !ext:tmp  !C:\\Windows   ...works on filters too\n"
-            "  ~boiler warranty letter   search by MEANING: files about\n"
-            "                    that, however they put it (needs the\n"
-            "                    Index tab's Search by meaning); filters\n"
-            "                    still apply:  ~mortgage offer ext:pdf D:\\\n"
-            '  about:"a phrase"  the same, for one phrase\n\n'
+            "  !ext:tmp  !C:\\Windows   ...works on filters too\n\n"
             "Example:  C: content:dan ext:pdf !draft\n"
             "Clearing out:  D:\\Photos before:2020  then Ctrl+A, Delete\n\n"
             "content: accepts full FTS5 syntax when quoted at the box level:\n"
@@ -3507,7 +3138,6 @@ class FindexApp(findex_tabs.ToolTabs):
         if self.watch_proc is not None:
             self._kill_proc_tree(self.watch_proc)
             self.watch_proc = None
-        self._summary_shutdown()     # Ollama, if findex started it
         self._bg_sync_on_close()
         self.cfg.update({
             "db": portable(self.var_db.get()),
@@ -3521,14 +3151,10 @@ class FindexApp(findex_tabs.ToolTabs):
             "auto_minutes": int_of(self.var_auto_mins, 60) or 60,
             "bg_hours": int_of(self.var_bg_hours, 6) or 6,
             "watch": bool(self.var_watch.get()),
-            "embed": bool(self.var_embed.get()),
             "limit": max(0, int_of(self.var_limit)),
             "exts": self.var_exts.get(),
             "save_dir": portable(self.cfg.get("save_dir") or ""),
             "geometry": self.root.geometry(),
-            "ai_model": self.var_smodel.get().strip(),
-            "summary_detail": self._summary_detail(),
-            "summary_sash": self._summary_sash(),
         })
         save_settings(self.cfg)
         self.root.destroy()

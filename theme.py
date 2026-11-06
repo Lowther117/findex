@@ -4,15 +4,20 @@ This is the shared theme module, identical in every one of Dan's Python apps.
 The palettes and their key names match Winnow (Theme/Palette.cs), so the whole
 family looks like one set:
 
+    glass    - phosphor glass: the website's default look, flattened for a
+               native window. The same violet, lifted onto a purple haze,
+               with panels a shade lighter than the ground and softer
+               borders, so it reads as the site's frosted panels do.
+               The default everywhere.
     phosphor - violet phosphor on near-black, like an old vector display.
-               Winnow's look, and the default everywhere.
+               Winnow's original look.
     dark     - the original graphite-and-blue dark.
     light    - light.
 
-Ctrl+D (Cmd+D on a Mac where an app uses it) cycles phosphor -> dark -> light,
-the same order as Winnow, and each app remembers the choice as "theme" in its
-settings file. Older settings files only held "dark": true/false; true now
-opens in phosphor (the new dark default) and false stays light.
+Ctrl+D (Cmd+D on a Mac where an app uses it) cycles glass -> phosphor ->
+dark -> light, the same order as Winnow, and each app remembers the choice as
+"theme" in its settings file. Older settings files only held "dark":
+true/false; true now opens in glass (the dark default) and false stays light.
 
 The house rule for all three palettes: anything you can type in or click is a
 different shade from the surface behind it, carries a visible border, and
@@ -26,7 +31,18 @@ it.
 from __future__ import annotations
 
 # --------------------------------------------------------------- palettes
-# Winnow's default. Inputs still get their own darker shade, a visible border
+# The website's Phosphor glass theme (body.theme-gp in index.html), with its
+# translucent panels and purple haze flattened to solid colours: bg is the
+# haze's average, panel is rgba(201,140,255,.055) over it, border is the
+# .22 line, text/dim/accent are the site's own values.
+GLASS = dict(
+    bg="#100a1f", panel="#1a1130", sidebar="#0b0616", text="#e6ccff",
+    dim="#b596e8", border="#3a2659", accent="#c79bff", accent_text="#15082a",
+    field="#0d0818", field_text="#f3ebff", field_border="#7a56c4",
+    sel="#2f1d52", good="#7de3a6", warn="#ffc56b", bad="#ff6b8e",
+    code="#0b0614", hint="#241740",
+)
+# Winnow's original. Inputs still get their own darker shade, a visible border
 # and an accent ring.
 PHOSPHOR = dict(
     bg="#0b0812", panel="#130e1e", sidebar="#08060d", text="#eadcff",
@@ -50,21 +66,23 @@ LIGHT = dict(
     code="#f5f7fa", hint="#eef4ff",
 )
 
-THEMES = {"phosphor": PHOSPHOR, "dark": DARK, "light": LIGHT}
-ORDER = ("phosphor", "dark", "light")          # the Ctrl+D cycle, as in Winnow
-DEFAULT = "phosphor"
-LABELS = {"phosphor": "Phosphor purple", "dark": "Dark", "light": "Light"}
-SHORT = {"phosphor": "Phosphor", "dark": "Dark", "light": "Light"}
+THEMES = {"glass": GLASS, "phosphor": PHOSPHOR, "dark": DARK, "light": LIGHT}
+ORDER = ("glass", "phosphor", "dark", "light")  # the Ctrl+D cycle, as in Winnow
+DEFAULT = "glass"
+LABELS = {"glass": "Phosphor glass", "phosphor": "Phosphor purple", "dark": "Dark", "light": "Light"}
+SHORT = {"glass": "Glass", "phosphor": "Phosphor", "dark": "Dark", "light": "Light"}
 
 
 # ---------------------------------------------------------- name helpers
 def resolve(mode=None) -> str:
     """A theme name from whatever an app holds: a name, None, or the old
-    dark flag (True = the dark default, now phosphor; False = light)."""
+    dark flag (True = the dark default, now glass; False = light)."""
     if isinstance(mode, str):
         m = mode.strip().lower()
         if m in THEMES:
             return m
+        if m in ("phosphor glass", "phosphor-glass", "gp"):
+            return "glass"
         if m.startswith("phosphor") or m == "purple":
             return "phosphor"
         return DEFAULT
@@ -75,7 +93,7 @@ def resolve(mode=None) -> str:
 
 def from_settings(settings) -> str:
     """The theme name stored in a settings dict. "theme" wins; failing that
-    the old "dark" flag decides (false = light, anything else = phosphor)."""
+    the old "dark" flag decides (false = light, anything else = glass)."""
     if not isinstance(settings, dict):
         return DEFAULT
     t = settings.get("theme")
@@ -130,7 +148,7 @@ def palette(mode=None) -> dict:
     return c
 
 
-COLOUR_KEYS = tuple(PHOSPHOR) + ("hover", "accent_hover")
+COLOUR_KEYS = tuple(GLASS) + ("hover", "accent_hover")
 
 
 def css_vars(mode=None) -> str:
@@ -185,8 +203,8 @@ def _recolour_menus(root, c):
 def apply(root, mode=None) -> dict:
     """Style a Tk root with a theme and return its palette.
 
-    `mode` is a theme name ("phosphor", "dark", "light") or, for older
-    callers, the dark flag (True = phosphor, False = light)."""
+    `mode` is a theme name ("glass", "phosphor", "dark", "light") or, for
+    older callers, the dark flag (True = glass, False = light)."""
     import tkinter as tk
     from tkinter import ttk
 

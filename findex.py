@@ -6,7 +6,7 @@ Commands:
     findex index [ROOT ...]     Build or update the index
     findex watch [ROOT ...]     Live updates: index changes as they happen
     findex find "QUERY"         Everything-style search (content:, C:\\, ext:,
-                                before:/older:/size:, !, ~)
+                                before:/older:/size:, !)
     findex search "QUERY"       Full-text search of file contents
     findex name "PATTERN"       Filename search (substring or *wildcard*)
     findex dupes                Duplicate files (name+size, --exact, --near, --images)
@@ -16,17 +16,8 @@ Commands:
     findex gui                  Open the desktop app (findex_gui.py)
 
 Tools built on the index (each lives in its own module beside this one):
-    findex hash                 Hash files for exact duplicates / verification
-    findex report               Health report: empty folders, bad names, stale...
-    findex secrets              Passwords, keys and tokens sitting in files
-    findex snapshot / verify    Manifest of a tree; later prove nothing changed
-    findex rename               Bulk rename with a dry-run preview and undo
+    findex hash                 Hash files for exact duplicates
     findex organise             Sort a folder's files into subfolders by rules
-    findex summarise            What a folder holds: files grouped into labelled
-                                sections by subject, a card per file, and
-                                optional summaries written by a local AI model
-    findex embed                Search by meaning: vectors for the indexed text,
-                                then  findex find "~what you mean"
     findex schedule             Background index refresh (Task Scheduler / launchd)
 
 EVERY file AND folder under the indexed roots is recorded by name, size and
@@ -163,7 +154,7 @@ TEXT_EXTS = {
 INDEXABLE = DOC_EXTS | TEXT_EXTS | MSG_EXTS | AUDIO_EXTS
 
 # Type groups - "images" covers every extension in the family. Used by the
-# app's Type dropdown, the Organise tool's type: rules and the health report.
+# app's Type dropdown and the Organise tool's type: rules.
 TYPE_GROUPS = {
     "images": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif",
                ".tiff", ".heic", ".heif", ".svg", ".ico", ".raw", ".cr2",
@@ -665,8 +656,7 @@ def _pdf(path):
 
 
 # Formats MuPDF is not built for: a picture it cannot open is not a broken
-# file, it just stays name-only (and never lands in the Health tab as
-# "unreadable"). WebP and HEIC/HEIF are the usual ones; the phrases catch
+# file, it just stays name-only (not recorded as "unreadable"). WebP and HEIC/HEIF are the usual ones; the phrases catch
 # any other "no decoder for this" answer, in either PyMuPDF generation.
 _IMAGE_UNSUPPORTED_EXTS = (".webp", ".heic", ".heif")
 _IMAGE_UNSUPPORTED_MSGS = ("document handler", "unknown file type",
@@ -1048,19 +1038,6 @@ CREATE TABLE IF NOT EXISTS roots (
     mount        TEXT      -- mount point changes
 );
 
-CREATE TABLE IF NOT EXISTS journal (
-    id       INTEGER PRIMARY KEY,
-    ts       REAL NOT NULL,
-    event    TEXT NOT NULL,
-    path     TEXT NOT NULL,
-    old_path TEXT,
-    size     INTEGER,
-    is_dir   INTEGER NOT NULL DEFAULT 0,
-    source   TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_journal_ts   ON journal(ts);
-CREATE INDEX IF NOT EXISTS idx_journal_path ON journal(path);
-
 CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
     body,
     tokenize = "unicode61 remove_diacritics 2",
@@ -1192,98 +1169,6 @@ def forget_paths(conn, paths):
         conn.rollback()
         raise
     return len(ids)
-
-
-# The journal: every change findex notices inside the indexed locations -
-# a file or folder added, modified, renamed or deleted - with when it was
-# seen and by what (an index run, or live updates). Renames are only known
-# as renames when live updates saw them happen; an index run sees a rename
-# as one path gone and another arrived, and records exactly that.
-#
-# The first time a location is indexed nothing is journaled: every file
-# would be "added", which is true but useless. From the second run on, and
-# whenever live updates are on, changes are recorded.
-
-JOURNAL_EVENTS = ("added", "modified", "renamed", "deleted",
-                  "remapped")        # a drive followed to a new letter
-JOURNAL_DAYS = 90             # default retention; "journal_days" in meta
-
-
-def journal_add(cur, rows):
-    """rows: (ts, event, path, old_path, size, is_dir, source)."""
-    cur.executemany(
-        "INSERT INTO journal(ts, event, path, old_path, size, is_dir, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
-
-
-def journal_rows(conn, since=None, event=None, text=None, limit=500,
-                 under=None):
-    """Newest first. since = epoch seconds; text matches path or old path;
-    under = only paths beneath this folder."""
-    where, params = [], []
-    if since:
-        where.append("ts >= ?")
-        params.append(float(since))
-    if event and event != "all":
-        where.append("event = ?")
-        params.append(event)
-    if text:
-        like = "%" + like_escape(text) + "%"
-        where.append("(path LIKE ? ESCAPE '!' OR old_path LIKE ? ESCAPE '!')")
-        params += [like, like]
-    if under:
-        sep = "\\" if "\\" in under or (len(under) > 1 and under[1] == ":") \
-            else "/"
-        where.append("path LIKE ? ESCAPE '!'")
-        params.append(like_escape(under.rstrip("\\/")) + sep + "%")
-    sql = ("SELECT id, ts, event, path, old_path, size, is_dir, source "
-           "FROM journal")
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY ts DESC, id DESC"
-    if limit:
-        sql += " LIMIT {:d}".format(int(limit))
-    try:
-        return conn.execute(sql, params).fetchall()
-    except sqlite3.OperationalError:      # database predates the journal
-        return []
-
-
-def journal_prune(conn, days=None):
-    """Drop entries older than the retention period. Returns rows removed."""
-    if days is None:
-        try:
-            days = float(get_meta(conn, "journal_days", JOURNAL_DAYS))
-        except (TypeError, ValueError):
-            days = JOURNAL_DAYS
-    if days <= 0:                          # 0 = keep forever
-        return 0
-    cur = conn.execute("DELETE FROM journal WHERE ts < ?",
-                       (time.time() - days * 86400,))
-    conn.commit()
-    return cur.rowcount
-
-
-def journal_clear(conn):
-    conn.execute("DELETE FROM journal")
-    conn.commit()
-
-
-def parse_since(text):
-    """'30m', '6h', '7d', '2w', or a date 'YYYY-MM-DD' -> epoch seconds."""
-    if not text:
-        return None
-    text = str(text).strip().lower()
-    units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
-    if text[-1] in units and text[:-1].replace(".", "", 1).isdigit():
-        return time.time() - float(text[:-1]) * units[text[-1]]
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            return time.mktime(time.strptime(text, fmt))
-        except ValueError:
-            continue
-    raise ValueError("cannot read a time from {!r} - try 7d, 12h, 30m, "
-                     "or 2026-09-01".format(text))
 
 
 def open_db_ro(path):
@@ -1590,7 +1475,7 @@ def emit_progress(stats, start):
 
 
 # Only one index run per database at a time. Two runs over the same roots
-# would each see the other's writes as changes, journal them twice and fight
+# would each see the other's writes as changes and fight
 # over the write lock; with a background refresh (findex schedule) it is
 # easy to have one start while a manual run is still going. The lock is a
 # small file beside the database holding the owner's pid: a run that
@@ -1752,7 +1637,7 @@ def _cmd_index(args):
             return 1
 
     # A root inside another root would be walked twice: the second pass saw
-    # every file as new, so each run re-read them and journaled them "added".
+    # every file as new, so each run re-read them all.
     all_roots, roots, seen_pfx = roots, [], []
     for r in sorted(all_roots, key=lambda r: len(os.path.abspath(r))):
         pfx = os.path.normcase(os.path.abspath(r)).rstrip(os.sep) + os.sep
@@ -1787,20 +1672,8 @@ def _cmd_index(args):
         known[path] = (fid, size, mtime, status, retry)
     print("  {:,} files already indexed".format(len(known)))
 
-    # Journal only for locations the index already knew about: the first
-    # run over a location would log every file as "added", which is true
-    # but tells nobody anything.
     prefixes = [os.path.normcase(os.path.abspath(r)).rstrip(os.sep) + os.sep
                 for r in roots]
-    seeded = set()
-    for kpath in known:
-        nk = os.path.normcase(kpath)
-        for pfx in prefixes:
-            if nk.startswith(pfx):
-                seeded.add(pfx)
-                break
-        if len(seeded) == len(prefixes):
-            break
 
     def root_of(path):
         n = os.path.normcase(path)
@@ -1813,8 +1686,6 @@ def _cmd_index(args):
                  if max(index_version, meta_version("extract_version:" + pfx))
                  < EXTRACT_VERSION}
     stale_exts = REEXTRACT_EXTS if stale_pfx else frozenset()
-
-    journal = []          # (ts, event, path, old_path, size, is_dir, source)
 
     workers = args.workers or max(1, (os.cpu_count() or 4))
     print("Scanning {} with {} workers...\n".format(", ".join(roots), workers),
@@ -1842,13 +1713,6 @@ def _cmd_index(args):
                           and (args.include_cloud or not cloud))
 
             prev = known.pop(path, None)
-            if prev is None:
-                if root_of(path) in seeded:
-                    journal.append((time.time(), "added", path, None,
-                                    size, int(is_dir), "index"))
-            elif prev[1] != size or abs(prev[2] - mtime) >= 1e-6:
-                journal.append((time.time(), "modified", path, None,
-                                size, int(is_dir), "index"))
             if (prev and not args.rebuild
                     and prev[1] == size and abs(prev[2] - mtime) < 1e-6
                     and not (wants_text and prev[3] == "listed")
@@ -1912,26 +1776,15 @@ def _cmd_index(args):
         if stale:
             cur = conn.cursor()
             cur.execute("BEGIN")
-            now = time.time()
             gone_ids = [(meta[0],) for _path, meta in stale]
             cur.executemany("DELETE FROM docs WHERE rowid=?", gone_ids)
             cur.executemany("DELETE FROM files WHERE id=?", gone_ids)
-            for path, meta in stale:
-                journal.append((now, "deleted", path, None, meta[1],
-                                int(meta[3] == "folder"), "index"))
             conn.commit()
         print("\nPruned {:,} files that no longer exist".format(len(stale)))
         kept = len(known) - len(stale)
         if kept:
             print("Kept   {:,} indexed files outside the folders scanned{}"
                   .format(kept, " or listed" if unlistable else ""))
-
-    if journal:
-        cur = conn.cursor()
-        cur.execute("BEGIN")
-        journal_add(cur, journal)
-        conn.commit()
-    pruned = journal_prune(conn)
 
     elapsed = time.time() - start
     set_meta(conn, "last_index", int(time.time()))
@@ -1959,15 +1812,6 @@ def _cmd_index(args):
     print("  no text    {:,}".format(stats.get("empty", 0)))
     print("  errors     {:,}".format(stats.get("error", 0)))
     print("  too big    {:,}".format(stats["skipped"]))
-    if journal:
-        counts = {}
-        for row in journal:
-            counts[row[1]] = counts.get(row[1], 0) + 1
-        print("  journal    " + ", ".join(
-            "{:,} {}".format(counts[k], k) for k in JOURNAL_EVENTS
-            if k in counts))
-    if pruned:
-        print("  journal    {:,} old entries pruned".format(pruned))
     conn.close()
     return 0
 
@@ -1975,44 +1819,6 @@ def _cmd_index(args):
 # ----------------------------------------------------------------------------
 # Watch command - live index updates
 # ----------------------------------------------------------------------------
-
-def journal_from_events(raw):
-    """Collapse one tick's raw events into journal rows.
-
-    Editors save through a burst of modified events, and many write a
-    temp file then rename it over the original; Office drops lock files
-    that live for seconds. So per path: one row for the tick, the LAST
-    thing that happened to it wins, an added-then-modified is just
-    added, and something created and deleted inside the same tick is
-    noise and dropped altogether.
-    """
-    last = {}                      # path -> (ts, kind, src, dest, is_dir)
-    born = set()
-    for ts, kind, src, dest, is_dir in raw:
-        if _watch_skip(src) or (dest and _watch_skip(dest)):
-            continue
-        if kind == "added":
-            born.add(src)
-        if kind == "modified" and src in last and last[src][1] == "added":
-            continue               # still just "added"
-        if kind == "renamed":
-            last.pop(dest, None)
-        last[src] = (ts, kind, src, dest, is_dir)
-    rows = []
-    for ts, kind, src, dest, is_dir in last.values():
-        if kind == "deleted" and src in born:
-            continue               # came and went inside one tick
-        size = None
-        if kind != "deleted":
-            try:
-                size = 0 if is_dir else os.path.getsize(lp(src))
-            except OSError:
-                pass
-        rows.append((ts, kind, src, dest, size, int(bool(is_dir)),
-                     "watch"))
-    rows.sort()
-    return rows
-
 
 def _watch_skip(path):
     """Is this path inside a folder that indexing skips (SKIP_DIRS)?"""
@@ -2068,34 +1874,25 @@ def cmd_watch(args):
     lock = threading.Lock()
     pending = {}          # path -> arrived-as-directory (walk it if so)
     gone = set()
-    events = []           # (ts, kind, src, dest, is_dir) for the journal
 
     class Handler(FileSystemEventHandler):
         def on_created(self, e):
             with lock:
                 pending[e.src_path] = e.is_directory
-                events.append((time.time(), "added", e.src_path, None,
-                               e.is_directory))
 
         def on_modified(self, e):
             if not e.is_directory:      # folders "modify" constantly - noise
                 with lock:
                     pending[e.src_path] = False
-                    events.append((time.time(), "modified", e.src_path,
-                                   None, False))
 
         def on_moved(self, e):
             with lock:
                 gone.add(e.src_path)
                 pending[e.dest_path] = e.is_directory
-                events.append((time.time(), "renamed", e.dest_path,
-                               e.src_path, e.is_directory))
 
         def on_deleted(self, e):
             with lock:
                 gone.add(e.src_path)
-                events.append((time.time(), "deleted", e.src_path, None,
-                               e.is_directory))
 
 
     handler = Handler()
@@ -2182,11 +1979,8 @@ def cmd_watch(args):
                 pending.clear()
                 dead = set(gone)
                 gone.clear()
-                raw = list(events)
-                events.clear()
             if not todo and not dead:
                 continue
-            rows = journal_from_events(raw)
             updated = removed = 0
             try:
                 cur = conn.cursor()
@@ -2206,8 +2000,6 @@ def cmd_watch(args):
                             updated += upsert_one(cur, tup[0])
                     else:
                         updated += upsert_one(cur, path)
-                if rows:
-                    journal_add(cur, rows)
                 conn.commit()
             except sqlite3.OperationalError:
                 # database busy (an index run is writing): put everything
@@ -2220,7 +2012,6 @@ def cmd_watch(args):
                     for k, v in todo.items():
                         pending.setdefault(k, v)
                     gone.update(dead)
-                    events[:0] = raw
                 continue
             if updated or removed:
                 try:
@@ -2418,12 +2209,6 @@ def parse_query(text):
         C:   C:\\Users     only results under that drive/folder
         ext:pdf;docx      only those types
         file:  folder:    only files / only folders
-        section:word      only files in a Summary section whose name has
-                          that word (section:#12 = that exact section)
-        doctype:invoice   only files the Summary pass typed as that
-        ~what it is about   search by MEANING (findex embed): the words
-                          after ~ that are not filters describe the file;
-                          about:"a phrase" does the same for one phrase
         before:2020       modified before then (2020-03, 2020-03-15 and
                           15/03/2020 work too); after:2019-06 = later than
                           the whole of June 2019; since:2019-06 = from the
@@ -2440,30 +2225,14 @@ def parse_query(text):
     """
     q = {"name": [], "name_not": [], "content": [], "content_not": [],
          "paths": [], "paths_not": [], "exts": [], "exts_not": [],
-         "sections": [], "sections_not": [], "doctypes": [],
-         "doctypes_not": [], "kind": None, "meaning": [],
-         "when": [], "sizes": []}
-    meaning = False         # after a ~, bare words describe rather than match
-    for n, tok in enumerate(_TOKEN.findall(text or "")):
-        if tok.startswith("~") and tok[1:2] not in ("/", "\\") \
-                and (tok != "~" or n == 0):
-            # ~words (or a leading "~ words") = by meaning; ~/Documents and
-            # a ~ on its own later in the query stay the home-folder scope
-            meaning = True
-            tok = tok[1:]
-            if not tok:
-                continue
+         "kind": None, "when": [], "sizes": []}
+    for tok in _TOKEN.findall(text or ""):
         neg = tok.startswith("!")
         if neg:
             tok = tok[1:]
         if not tok:
             continue
         low = tok.lower()
-        if low.startswith("about:"):
-            rest = tok[6:].strip('"').strip()
-            if rest:
-                q["meaning"].append(rest)
-            continue
         if low.startswith("content:"):
             term = tok[8:].strip()
             if term:
@@ -2488,12 +2257,6 @@ def parse_query(text):
             if rest:
                 q["paths_not" if neg else "paths"].append(rest)
             continue
-        if low.startswith(("section:", "doctype:")):
-            key = "sections" if low.startswith("section:") else "doctypes"
-            rest = tok[8:].strip('"').strip()
-            if rest:
-                q[key + ("_not" if neg else "")].append(rest)
-            continue
         if low.startswith(("file:", "folder:", "folders:", "dir:")):
             q["kind"] = "file" if low.startswith("file:") else "folder"
             tok = tok.split(":", 1)[1]
@@ -2501,9 +2264,6 @@ def parse_query(text):
                 continue
         if _is_pathish(tok.strip('"')):     # "C:\My Docs" is a scope too
             q["paths_not" if neg else "paths"].append(tok.strip('"'))
-            continue
-        if meaning and not neg:
-            q["meaning"].append(tok.strip('"'))
             continue
         q["name_not" if neg else "name"].append(tok.strip('"'))
     return q
@@ -2702,10 +2462,6 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
     query has content: terms. Results are weighted: content matches come back
     best-first (bm25), name matches exact-name first, then names starting
     with the term, then newest; a browse (no terms) is newest-first.
-
-    A query with a meaning part (~words, about:"phrase") returns six
-    columns - (path, size, mtime, snippet, is_dir, score) - best match
-    first, with the other terms and filters applied to those matches.
     """
     q = parse_query(text)
     if exts:
@@ -2745,13 +2501,6 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
         conds.append("f.is_dir=1")
     _range_conds("f.mtime", q["when"], conds, params)
     _range_conds("f.size", q["sizes"], conds, params)
-    if q["sections"] or q["sections_not"] or q["doctypes"] \
-            or q["doctypes_not"]:
-        try:
-            import findex_summary
-            findex_summary.search_conds(conn, q, conds, params)
-        except ImportError:
-            conds.append("0")       # the summary module is not installed
 
     not_params = []
     if q["content_not"]:
@@ -2769,10 +2518,6 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
     if int(limit) > 0:
         lim = " LIMIT ?"
         lim_params = [int(limit)]
-
-    if q["meaning"]:
-        return _meaning_rows(conn, q, conds, params + not_params, limit,
-                             live)
 
     if q["content"]:
         # content search: join through the FTS table for snippets and rank
@@ -2827,67 +2572,6 @@ def query_rows(conn, text, limit=0, exts=None, kind=None, live=False,
     if conds:
         sql += " WHERE " + " AND ".join(conds)
     return conn.execute(sql + order + lim, tail_params).fetchall()
-
-
-MEANING_LIVE_MIN = 4        # characters typed before a live meaning search
-
-
-def _meaning_rows(conn, q, conds, params, limit, live):
-    """Search by meaning (findex_embed), then the ordinary filters on top.
-    content: terms become a filter too - the words must be in the file and
-    it must be about the thing described."""
-    text = " ".join(q["meaning"]).strip()
-    if live and len(text) < MEANING_LIVE_MIN:
-        return []
-    import findex_embed
-    top = max(int(limit) if int(limit) > 0 else 0, findex_embed.MEANING_TOP)
-    hits = findex_embed.search(conn, text, top, db_key=_db_key(conn))
-    if not hits:
-        return []
-    conds = list(conds)
-    params = list(params)
-    if q["content"]:
-        conds.append("f.id IN (SELECT rowid FROM docs WHERE docs MATCH ?)")
-        match = " ".join(q["content"])
-        try:
-            conn.execute("SELECT rowid FROM docs WHERE docs MATCH ? LIMIT 1",
-                         [match]).fetchone()
-        except sqlite3.OperationalError:
-            match = _safe_content(q["content"]) or '"findex0nomatch0"'
-        params.append(match)
-    by_id = {fid: (sc, pos, ln) for fid, sc, pos, ln in hits}
-    out = []
-    ids = list(by_id)
-    for s in range(0, len(ids), 500):
-        chunk = ids[s:s + 500]
-        sql = ("SELECT f.id, f.path, f.size, f.mtime, f.is_dir FROM files f "
-               "WHERE f.id IN ({})".format(",".join("?" * len(chunk))))
-        if conds:
-            sql += " AND " + " AND ".join(conds)
-        for fid, path, size, mtime, is_dir in conn.execute(
-                sql, chunk + params).fetchall():
-            sc, pos, ln = by_id[fid]
-            out.append((fid, path, size, mtime, is_dir, sc, pos, ln))
-    out.sort(key=lambda r: -r[5])
-    if int(limit) > 0:
-        out = out[:int(limit)]
-    rows = []
-    for i, (fid, path, size, mtime, is_dir, sc, pos, ln) in enumerate(out):
-        snip = findex_embed.snippet(conn, fid, pos, ln) if i < 60 else ""
-        rows.append((path, size, mtime, snip, is_dir, sc))
-    return rows
-
-
-def _db_key(conn):
-    """Something that identifies the database a connection is on, for the
-    meaning index's per-process cache."""
-    try:
-        for _seq, name, path in conn.execute("PRAGMA database_list"):
-            if name == "main":
-                return path or "main"
-    except sqlite3.Error:
-        pass
-    return "main"
 
 
 def dupe_rows(conn, limit=0, exts=None):
@@ -2983,15 +2667,10 @@ def cmd_find(args):
     except sqlite3.OperationalError as exc:
         sys.stderr.write("Query error: {}\n".format(exc))
         return 1
-    except Exception as exc:                                   # noqa: BLE001
-        if type(exc).__name__ != "EmbedError":
-            raise
-        sys.stderr.write("{}\n".format(exc))        # search by meaning
-        return 1
     q = parse_query(args.query)
     fmt = _machine_out(args)
     if fmt:
-        with_snip = bool(q["content"] or q["meaning"])
+        with_snip = bool(q["content"])
         write_results((result_record(r[0], r[1], r[2], bool(r[4]),
                                      r[3] if with_snip else None)
                        for r in rows), sys.stdout, fmt)
@@ -3133,12 +2812,6 @@ def clear_index(path):
     cur.execute("DELETE FROM docs")
     cur.execute("DELETE FROM files")
     cur.execute("DELETE FROM meta")
-    for table in ("summary", "summary_members", "summary_sections",
-                  "summary_runs", "summary_digests"):
-        try:
-            cur.execute("DELETE FROM " + table)
-        except sqlite3.OperationalError:
-            pass                    # never summarised: no such table
     conn.commit()
     conn.execute("VACUUM")
     conn.close()
@@ -3343,43 +3016,6 @@ def cmd_tree(args):
     return 0
 
 
-def cmd_journal(args):
-    """Show what has changed inside the indexed locations."""
-    conn = open_db(args.db)
-    if args.clear:
-        journal_clear(conn)
-        print("Journal cleared.")
-        return 0
-    if args.keep_days is not None:
-        set_meta(conn, "journal_days", args.keep_days)
-        print("Keeping journal entries for {} days{}.".format(
-            args.keep_days, " (0 = forever)" if not args.keep_days else ""))
-    try:
-        since = parse_since(args.since)
-    except ValueError as exc:
-        sys.stderr.write(str(exc) + "\n")
-        return 2
-    rows = journal_rows(conn, since=since, event=args.type, text=args.text,
-                        limit=args.limit, under=args.under)
-    conn.close()
-    if not rows:
-        print("Nothing in the journal for that.")
-        return 0
-    for _, ts, event, path, old_path, size, is_dir, source in rows:
-        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-        what = event + ("/" if is_dir else "")
-        line = "{}  {:<9} {}".format(when, what, path)
-        if old_path:
-            line += "   (was {})".format(old_path)
-        if size and not is_dir:
-            line += "   {}".format(human(size))
-        print(line)
-    print("{:,} change(s){}".format(
-        len(rows), " - newest first, use -n for more" if len(rows) == args.limit
-        else ""))
-    return 0
-
-
 def cmd_vacuum(args):
     conn = open_db(args.db)
     print("Optimising FTS index...")
@@ -3410,26 +3046,6 @@ def tool_modules():
     except ImportError:
         pass
     try:
-        import findex_report
-        mods.append(findex_report)
-    except ImportError:
-        pass
-    try:
-        import findex_secrets
-        mods.append(findex_secrets)
-    except ImportError:
-        pass
-    try:
-        import findex_verify
-        mods.append(findex_verify)
-    except ImportError:
-        pass
-    try:
-        import findex_rename
-        mods.append(findex_rename)
-    except ImportError:
-        pass
-    try:
         import findex_organise
         mods.append(findex_organise)
     except ImportError:
@@ -3437,16 +3053,6 @@ def tool_modules():
     try:
         import findex_schedule
         mods.append(findex_schedule)
-    except ImportError:
-        pass
-    try:
-        import findex_summary
-        mods.append(findex_summary)
-    except ImportError:
-        pass
-    try:
-        import findex_embed
-        mods.append(findex_embed)
     except ImportError:
         pass
     return mods
@@ -3582,18 +3188,6 @@ def main(argv=None):
                         "a drive was reformatted or replaced on purpose, so "
                         "the index stops treating the new one as a stranger")
     p.set_defaults(func=cmd_roots)
-
-    p = sub.add_parser("journal", help="what changed inside the indexed "
-                       "locations: files added, modified, renamed, deleted")
-    p.add_argument("text", nargs="?", help="only paths containing this")
-    p.add_argument("--since", help="7d, 12h, 30m, or 2026-09-01")
-    p.add_argument("--type", choices=("all",) + JOURNAL_EVENTS, default="all")
-    p.add_argument("--under", metavar="FOLDER", help="only beneath this folder")
-    p.add_argument("-n", "--limit", type=int, default=200)
-    p.add_argument("--keep-days", type=float, metavar="DAYS",
-                   help="set how long entries are kept (0 = forever)")
-    p.add_argument("--clear", action="store_true", help="empty the journal")
-    p.set_defaults(func=cmd_journal)
 
     p = sub.add_parser("tree", help="export the whole index as a file tree")
     p.add_argument("-o", "--out", help="file to write (default: Downloads/"
