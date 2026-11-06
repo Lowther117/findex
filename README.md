@@ -28,9 +28,7 @@ and no machine-specific path is ever stored.
 | `findex_gui.py` | the app | the app | The Tkinter window. The launchers run it; `python findex_gui.py` works too. |
 | `findex_app.py` | build only | build only | Entry point compiled into the standalone exe/app. Not run directly. |
 | `theme.py` | the app | the app | The shared house palettes (Phosphor glass, Phosphor purple, Dark, Light) and ttk styling the window uses. Not run directly. |
-| `findex_tabs.py` | the app | the app | The Duplicates tab, and the wiring for the tool tabs. Part of the app; not run directly. |
-| `findex_tabs_organise.py` | the app | the app | The Organise tab. Part of the app; not run directly. |
-| `findex_organise.py` | engine | engine | Sort a folder into subfolders by rules, with suggestions, a rule check, preview and undo: `findex organise`. |
+| `findex_tabs.py` | the app | the app | The Duplicates tab. Part of the app; not run directly. |
 | `findex_hash.py` | engine | engine | Content fingerprints and type detection: `findex hash`, `findex dupes --exact / --near / --images`. |
 | `findex_volumes.py` | engine | engine | Follows a drive whose letter or mount point changed. Imported by the engine; not run directly. |
 | `findex_schedule.py` | engine | engine | The background index refresh - registers and removes the OS scheduler job: `findex schedule`. |
@@ -48,13 +46,12 @@ indexing run starts from scratch.
 Findex/
   findex.py           engine + CLI (indexing, search, watch, tree)
   findex_hash.py      } tools built on the index - each adds its own
-  findex_organise.py  } commands to the CLI: hash, dupes, organise,
-  findex_schedule.py  } schedule. findex.py imports them when present;
-                      } a missing one just means its commands are absent
+  findex_schedule.py  } commands to the CLI: hash, dupes, schedule.
+                      } findex.py imports them when present; a missing
+                      } one just means its commands are absent
   findex_volumes.py   follows a drive whose letter changed
   findex_gui.py       Tkinter desktop app (Search, Index tabs)
   findex_tabs.py      the Duplicates tab
-  findex_tabs_organise.py   the Organise tab
   theme.py            phosphor/dark/light palettes + styling for the app
   findex_app.py       entry point for the optional standalone build
   findex.bat          CLI launcher (Windows)
@@ -111,8 +108,8 @@ Nothing is installed system-wide except that optional tesseract fallback.
   the volume UUID on the Mac), and before every run - and when the app
   opens - a location whose path has gone is looked for by that identity
   among the drives connected now. When the same drive is simply somewhere
-  else, every path under it is rewritten in one transaction (the
-  `files` table, the organise history) and the run then finds everything
+  else, every path under it is rewritten in one transaction and the
+  run then finds everything
   *unchanged*. If a *different* drive has taken the old
   letter, that location is left alone and skipped for the run, so the
   stranger's files never replace the real drive's entries; after
@@ -219,7 +216,7 @@ or Light, Ctrl+D cycles them, and the choice is remembered in `findex_gui.json`.
   highlighted.
 - **Clearing out in bulk**: type the filter (`D:\Photos before:2020`, or
   `older:3y ext:tmp`), sort if you want to check the ends, Ctrl/Cmd+A,
-  Delete. After every delete, paste, organise or index run the list is
+  Delete. After every delete, paste or index run the list is
   re-read **keeping your filter, your sort order and your place in it** -
   and whatever of the selection is still there stays selected - so you
   can work down a long list in rounds. Shift-click selects a range
@@ -303,63 +300,6 @@ or Light, Ctrl+D cycles them, and the choice is remembered in `findex_gui.json`.
   to the Recycle Bin. Nothing is deleted until you do that. **Use stored
   hashes only** skips reading files and lists what earlier runs proved.
 
-**Organise tab** - sort a folder's files into subfolders by rules
-
-- Point it at a folder. Everything beneath it, subfolders included, is
-  considered and re-sorted against the rules into subfolders *of that
-  folder* - a Downloads tidy, a shared drive that grew by accretion, a
-  project handover. **Move** or **Copy**; unmatched files stay where they
-  are unless **Files no rule fits go into** is ticked (default `_Unsorted`).
-- **Rules** are built in plain English, one row each: *name starts with* /
-  *contains* / *ends with* / *is exactly* + the text, *file type is*
-  (Pictures, Videos, Music, Documents, Zip & archives, Programs, Emails,
-  Code), *extension is* (`pdf, docx`), *older than* / *newer than* (`3
-  years`, `30 days`), or *anything else*; then "go into folder" (`Finance/
-  Invoices` nests) and optionally "then by" year / year and month / file
-  type / first word / extension. Up / Down reorder the rows - the first
-  that fits wins - Remove takes one out, and a row that is missing
-  something says so underneath. The plan updates as you type. Saved rule
-  sets, the problem check, plan export and the text editor live under
-  **More**.
-- **More > Advanced** shows and edits the same rules as text, one per line:
-  a pattern is a glob (`Invoice*`, quoted if it has spaces), a regex
-  (`re:^([A-Z]{3})-\d+`, groups come back as `{1}`), `ext:pdf;docx`,
-  `type:images`, `year:2019-2021`, `older:3y` / `newer:30d` or `*`; several
-  on one line must all match. The destination is a folder path with tokens:
-  `{1}`.., `{name}`, `{stem}`, `{ext}`, `{type}`, `{first}`, `{year}`
-  `{month}` `{day}` `{date}` `{yyyymm}`, `{parent}`, and `|upper` /
-  `|lower` / `|title` filters. A text rule the builder has no boxes for
-  (a regex) shows in the builder as an "advanced rule" row and still works.
-  Help > Organise rules has the full sheet with examples.
-- **Suggest rules** reads the names and drafts a rule set with a count and
-  examples against each: recurring leading words (`invoice*` -> Invoices,
-  `"board minutes*"` -> Board/Minutes - it knows common kinds and nests
-  pairs that share a first word), reference codes (`ACM-0042` -> one folder
-  per prefix), date-named files (by year then month), and type groups for
-  what is left, with a `{year}` split when a set spans several years. It
-  appends below any rules already written; edit freely.
-- **More > Check the rules** / the **Problems** list: bad patterns, unknown tokens,
-  `{2}` where the pattern has one group, a rule that matches nothing, a
-  rule an earlier rule shadows completely, a catch-all that is not last,
-  two destinations that differ only by case, collisions. Double-click an
-  issue to jump to its line; error lines are highlighted.
-- **What will happen** lists every file with its action and destination;
-  **Folders afterwards** shows how the folder would look with counts per
-  folder; **Summary** has the numbers - files and bytes to move or copy,
-  swept, already in place, identical copies skipped, collisions,
-  destination folders, folders that would be left empty.
-- Nothing is overwritten. A different file already at a target is a
-  **collision** and is skipped; with **Skip a file if an identical copy is
-  already there** a byte-identical one (by content hash) counts as placed.
-  **Tidy away folders left empty** removes the folders the moves emptied.
-- **Move N files... / Copy N files...** carries the plan out as one batch -
-  moves or copies, the folders it created, the folders it removed - and
-  **Undo the last run...** reverses the lot in the opposite order, folders
-  included. **More > Save these
-  rules as...** keeps a rule set with its options in the index for next
-  time; **More > Export the plan...** writes summary, rule check, tree and
-  plan as a page, CSV, text or JSON.
-
 **Status strip** (along the bottom, on all tabs)
 
 - The progress bar mirrors the one on the Index tab, so you can start a run,
@@ -403,12 +343,6 @@ findex hash                            fingerprints for exact duplicates
 findex hash --all                      + detected type of every file
 findex hash --full                     full hash of every file
 findex hash --images                   picture fingerprints for --images dupes
-findex organise D:\Downloads --suggest -o tidy.rules     draft rules
-findex organise D:\Downloads --rules tidy.rules          preview (dry run)
-findex organise D:\Downloads --rules tidy.rules --save-template tidy
-findex organise D:\Downloads --rules tidy.rules --sweep --remove-empty --apply
-findex organise D:\Downloads --template tidy --copy --apply
-findex organise --undo
 findex tree                            export the index as a tree (Downloads)
 findex tree -o C:\out.csv --under D:\Work
 findex schedule --every 6h             background refresh every 6 hours
@@ -421,7 +355,7 @@ findex gui                             open the desktop app
 ```
 
 `--db PATH` puts the index somewhere other than next to the script.
-`findex organise --help` and friends list every option; the tool modules'
+`findex hash --help` and friends list every option; the tool modules'
 docstrings (top of each `findex_*.py`) explain the reasoning.
 
 `--json` and `--csv` on `find`, `name`, `search` and `dupes` write the
@@ -432,9 +366,7 @@ printed, so `findex find "ext:pdf" --json | jq` and
 `findex dupes --exact --csv > dupes.csv` just work.
 
 `findex index` exits 3 when another index run already holds the database
-(see *Background refresh*). `findex organise` is a dry run unless `--apply`
-is given, and refuses to apply while the rules have errors (`--force`
-applies the rows that can be placed).
+(see *Background refresh*).
 
 The locations you index are remembered **in the index itself** - a `roots`
 table in `findex.db` - not in a settings file beside whichever copy of findex

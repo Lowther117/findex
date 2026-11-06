@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-findex_tabs - the tool tabs of the desktop app: Duplicates and Organise
-(Organise lives in its own module and is mixed in here). A mixin that
-findex_gui.FindexApp inherits; each tab drives one of the engine's tool
-modules (findex_hash, findex_organise) and reuses the app's own machinery -
-launch() for engine child processes with progress, the message queue,
-tooltips, the palette.
+findex_tabs - the tool tab of the desktop app: Duplicates. A mixin that
+findex_gui.FindexApp inherits; the tab drives the engine's findex_hash
+module and reuses the app's own machinery - launch() for engine child
+processes with progress, the message queue, tooltips, the palette.
 
 Long jobs (hashing) run as engine children so Stop always works and the
-window never freezes; quick ones (an organise plan) run in a thread on a
-read-only connection.
+window never freezes; the instant checks run in a thread on a read-only
+connection.
 """
 
 from __future__ import annotations
@@ -23,7 +21,6 @@ from tkinter import filedialog, messagebox, ttk
 
 import findex
 import findex_hash
-import findex_tabs_organise
 
 TOOL_KINDS = ("hash", "hash-near", "hash-images")
 
@@ -50,7 +47,7 @@ def _folder_row(parent, var, tip_fn, tip_text, label="Folder:"):
     return row
 
 
-class ToolTabs(findex_tabs_organise.OrganiseTab):
+class ToolTabs:
     """Mixin for findex_gui.FindexApp. Expects the app's usual attributes
     (root, nb, tip, launch, msgs, var_db, var_status, pal, log_line...)."""
 
@@ -62,11 +59,8 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
         self._tool_trees = []
         self._tool_after = None
         self.tab_dupes = ttk.Frame(self.nb)
-        self.tab_organise = ttk.Frame(self.nb)
         self.nb.add(self.tab_dupes, text="  Duplicates  ")
-        self.nb.add(self.tab_organise, text="  Organise  ")
         self._build_dupes_tab()
-        self._build_organise_tab()
 
     def _tool_tree(self, parent, cols, spec, height=None):
         """A results Treeview with scrollbar, remembered for theming.
@@ -105,12 +99,6 @@ class ToolTabs(findex_tabs_organise.OrganiseTab):
             tree.tag_configure("good", foreground=c["good"])
             tree.tag_configure("head", font=(self.ui_family, self.ui_size,
                                              "bold"))
-        self._theme_organise(c, pal)
-
-    def _tool_tab_shown(self, name):
-        if name == "Organise":
-            self._organise_templates()
-            self._organise_debounce()
 
     def _tool_progress(self, p):
         """A @P line from a tool child: 'seen', 'done', 'total', 'elapsed'."""

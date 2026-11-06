@@ -17,7 +17,6 @@ Commands:
 
 Tools built on the index (each lives in its own module beside this one):
     findex hash                 Hash files for exact duplicates
-    findex organise             Sort a folder's files into subfolders by rules
     findex schedule             Background index refresh (Task Scheduler / launchd)
 
 EVERY file AND folder under the indexed roots is recorded by name, size and
@@ -154,7 +153,7 @@ TEXT_EXTS = {
 INDEXABLE = DOC_EXTS | TEXT_EXTS | MSG_EXTS | AUDIO_EXTS
 
 # Type groups - "images" covers every extension in the family. Used by the
-# app's Type dropdown and the Organise tool's type: rules.
+# app's Type dropdown.
 TYPE_GROUPS = {
     "images": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif",
                ".tiff", ".heic", ".heif", ".svg", ".ico", ".raw", ".cr2",
@@ -3043,11 +3042,6 @@ def tool_modules():
     try:
         import findex_hash
         mods.append(findex_hash)
-    except ImportError:
-        pass
-    try:
-        import findex_organise
-        mods.append(findex_organise)
     except ImportError:
         pass
     try:

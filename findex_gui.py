@@ -14,9 +14,7 @@ Index tab   pick folders, run an index, watch progress, auto re-index on a
             app is closed, or live updates (real-time watching).
 Duplicates  same name+size, byte-identical, near-identical text, or
             look-alike images.
-Organise    sort a folder's files into subfolders by rules - suggested,
-            checked, previewed as the resulting tree, applied, undoable.
-The tool tabs live in findex_tabs.py and findex_tabs_organise.py.
+The Duplicates tab lives in findex_tabs.py.
 
 Settings are kept in findex_gui.json next to this script. Indexing runs as a
 separate findex.py process so the window never freezes and Stop always works.
@@ -54,7 +52,7 @@ sys.modules.setdefault("findex_gui", sys.modules[__name__])
 import findex  # noqa: E402
 import findex_volumes  # noqa: E402  - follows a drive whose letter changed
 import theme   # noqa: E402  - the shared house palettes (phosphor/dark/light) + ttk styling
-import findex_tabs  # noqa: E402  - the Duplicates / Organise tabs
+import findex_tabs  # noqa: E402  - the Duplicates tab
 import findex_schedule  # noqa: E402  - the background refresh (OS scheduler)
 
 # One source of truth for "the folder findex owns" - beside the scripts, or
@@ -1304,7 +1302,6 @@ class FindexApp(findex_tabs.ToolTabs):
         m = tk.Menu(bar, tearoff=0)
         self._menus.append(m)
         m.add_command(label="Search syntax", command=self.show_syntax)
-        m.add_command(label="Organise rules", command=self.show_organise_help)
         m.add_command(label="About findex", command=self.show_about)
         bar.add_cascade(label="Help", menu=m)
 
@@ -1531,8 +1528,7 @@ class FindexApp(findex_tabs.ToolTabs):
 
         self._build_search_tab()
         self._build_index_tab()
-        self._build_tool_tabs()          # Duplicates, Organise
-        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self._build_tool_tabs()          # Duplicates
 
         # Right-hand end first, packed right to left: bar, its percentage,
         # then the resource readout - so the status text on the left is
@@ -1715,13 +1711,6 @@ class FindexApp(findex_tabs.ToolTabs):
                              command=self.export_results_ui)
         self.ctx.add_separator()
         self.ctx.add_command(label="Delete...", command=self.delete_files)
-
-    def _on_tab_changed(self, _event=None):
-        try:
-            name = self.nb.tab(self.nb.select(), "text").strip()
-        except tk.TclError:
-            return
-        self._tool_tab_shown(name)
 
     def _build_index_tab(self):
         left = ttk.LabelFrame(self.tab_index, text="Folders to index")
@@ -1976,7 +1965,7 @@ class FindexApp(findex_tabs.ToolTabs):
 
     def refresh_results(self):
         """Re-read the list after something changed on disk or in the
-        index (a delete, a paste, an organise run, an index run) - keeping the
+        index (a delete, a paste, an index run) - keeping the
         filter, the sort order, the scroll position and whatever of the
         selection is still there, so a long clear-out can be worked down
         in rounds."""

@@ -44,7 +44,6 @@ if "%~1"=="" (
     echo   findex search "invoice" -e pdf docx -n 50
     echo   findex name "*budget*"
     echo   findex dupes --exact
-    echo   findex organise D:\Downloads --suggest
     echo   findex stats
     echo   findex gui
     echo.

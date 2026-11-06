@@ -14,8 +14,8 @@ among the drives connected right now; when it has simply moved, every path
 under it is rewritten in one transaction and nothing is re-read.
 
 What is rewritten: every text column of every ordinary table in the
-database that holds a path under the old location - files, roots, organise
-batches - so the tool modules need no knowledge of this. The full-text and
+database that holds a path under the old location - files, roots - so
+the tool modules need no knowledge of this. The full-text and
 trigram tables key on row ids, not paths, and are untouched.
 
 This module imports nothing from findex, so findex can import it at the
