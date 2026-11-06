@@ -1,4 +1,4 @@
-"""The house theme: three palettes and the ttk styling that goes with them.
+"""The house theme: four palettes and the ttk styling that goes with them.
 
 This is the shared theme module, identical in every one of Dan's Python apps.
 The palettes and their key names match Winnow (Theme/Palette.cs), so the whole
@@ -19,7 +19,7 @@ dark -> light, the same order as Winnow, and each app remembers the choice as
 "theme" in its settings file. Older settings files only held "dark":
 true/false; true now opens in glass (the dark default) and false stays light.
 
-The house rule for all three palettes: anything you can type in or click is a
+The house rule for all four palettes: anything you can type in or click is a
 different shade from the surface behind it, carries a visible border, and
 shows an accent ring when focused, so an input never looks like a label.
 
